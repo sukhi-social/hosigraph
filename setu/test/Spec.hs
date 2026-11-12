@@ -1,5 +1,5 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
--- setu tests.  Plain executable like hosigraph's, QuickCheck where "for every input" is the point.
+-- setu tests.  A plain executable, QuickCheck where "for every input" is the point.
 -- Nothing here needs a database; the one check that wants a C compiler is skipped without one.
 module Main (main) where
 
@@ -19,8 +19,9 @@ import           System.IO
 import           System.Process (readProcessWithExitCode)
 import           Test.QuickCheck
 
-import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           AbiTests
+import           CodecTests
 import           DispatchTests
 import           Harness
 import           TicketTests
@@ -43,7 +44,7 @@ main = do
   when (failed > 0) exitFailure
 
 tests :: [Test]
-tests = specTests ++ validateTests ++ wireTests ++ headerTests ++ ticketTests ++ dispatchTests ++ abiTests
+tests = specTests ++ validateTests ++ wireTests ++ codecTests ++ headerTests ++ ticketTests ++ dispatchTests ++ abiTests
 
 -- ---------------------------------------------------------------------------
 -- Fixtures: two APIs.  dtlv is the second customer (the requirements' section 6.1 is its header).
@@ -63,9 +64,9 @@ dtlvApi = Api
       ]
   }
 
-hosiApi :: Api
-hosiApi = dtlvApi
-  { apiName = "hosi", apiAppErr = "APP", apiAppErrDoc = "the library refused or failed (HosiError; the body is EDN)"
+demoApi :: Api
+demoApi = dtlvApi
+  { apiName = "demo", apiAppErr = "APP", apiAppErrDoc = "the library refused or failed (the body is EDN)"
   , apiOps  = [ Op "write" "Write events." (TMap [Field "ops" (TVec (TTag [Variant "create" [TInt, TKw, TAny], Variant "delete" [TInt]]))]) TAny ]
   }
 
@@ -79,7 +80,7 @@ specTests :: [Test]
 specTests =
   [ ("spec: the example APIs are well formed", do
       checkEq "dtlv" [] (checkApi dtlvApi)
-      checkEq "hosi" [] (checkApi hosiApi))
+      checkEq "demo" [] (checkApi demoApi))
   , ("spec: reserved operations are in every API, in front", do
       checkEq "names" ["ping", "abi", "list-databases", "q", "transact"] (map opName (allOps dtlvApi))
       -- :abi names the API; its answer must have the shape it promises
@@ -222,19 +223,19 @@ validateTests =
 
 wireTests :: [Test]
 wireTests =
-  [ ("wire: a string is written as it is, in UTF-8, and read back", do
-      checkEq "text" "\"日本語\\n\\\"q\\\"\"" (writeEdn (EStr "日本語\n\"q\""))
-      checkEq "read back" (Right (EStr "日本語\n\"q\"")) (readEdn (writeEdn (EStr "日本語\n\"q\""))))
-  , ("wire: control characters are written as \\uXXXX", do
-      checkEq "nul" "\"\\u0000\"" (writeEdn (EStr "\NUL"))
-      checkEq "del" "\"\\u007f\"" (writeEdn (EStr "\DEL"))
-      checkEq "read back" (Right (EStr "\NUL\DEL\ESC")) (readEdn (writeEdn (EStr "\NUL\DEL\ESC"))))
-  , ("wire: a float that is not finite is written the way Clojure does", do
-      checkEq "nan" "##NaN" (writeEdn (EFloat (0 / 0)))
-      checkEq "inf" "##Inf" (writeEdn (EFloat (1 / 0)))
-      checkEq "-inf" "##-Inf" (writeEdn (EFloat (-1 / 0))))
-  , ("wire: reading back what was written (any EDN, 500 values)",
-      prop 500 $ forAll (genEdnAny 3) $ \e -> readEdn (writeEdn e) === Right e)
+  [ ("edn: a string is written as it is, in UTF-8, and read back", do
+      checkEq "text" "\"日本語\\n\\\"q\\\"\"" (renderEdn (EStr "日本語\n\"q\""))
+      checkEq "read back" (Right (EStr "日本語\n\"q\"")) (readEdn (renderEdn (EStr "日本語\n\"q\""))))
+  , ("edn: control characters are written as \\uXXXX", do
+      checkEq "nul" "\"\\u0000\"" (renderEdn (EStr "\NUL"))
+      checkEq "del" "\"\\u007f\"" (renderEdn (EStr "\DEL"))
+      checkEq "read back" (Right (EStr "\NUL\DEL\ESC")) (readEdn (renderEdn (EStr "\NUL\DEL\ESC"))))
+  , ("edn: a float that is not finite is written the way Clojure does", do
+      checkEq "nan" "##NaN" (renderEdn (EFloat (0 / 0)))
+      checkEq "inf" "##Inf" (renderEdn (EFloat (1 / 0)))
+      checkEq "-inf" "##-Inf" (renderEdn (EFloat (-1 / 0))))
+  , ("edn: reading back what was written (any EDN, 500 values)",
+      prop 500 $ forAll (genEdnAny 3) $ \e -> readEdn (renderEdn e) === Right e)
   , ("wire: a request goes through bytes and comes back (300)",
       prop 300 $ forAll genName $ \op -> forAll (genEdnAny 2) $ \a ->
         let r = Request op a in decodeRequest (encodeRequest r) === Right r)
@@ -293,12 +294,12 @@ headerTests =
       check "c++" ("extern \"C\" {" `T.isInfixOf` h))
   , ("header: adding an operation does not change it", do
       checkEq "no ops" (cHeader dtlvApi) (cHeader dtlvApi { apiOps = [] })
-      checkEq "other ops" (cHeader dtlvApi) (cHeader dtlvApi { apiOps = apiOps hosiApi }))
+      checkEq "other ops" (cHeader dtlvApi) (cHeader dtlvApi { apiOps = apiOps demoApi }))
   , ("header: the prefix, the version and the app error are the API's", do
-      let h = cHeader hosiApi { apiVersion = 3 }
-      check "app error" ("HOSI_ERR_APP," `T.isInfixOf` h)
-      check "function" ("hosi_submit(hosi_conn *c, hosi_id id," `T.isInfixOf` h)
-      check "version" ("#define HOSI_ABI_VERSION 3\n" `T.isInfixOf` h)
+      let h = cHeader demoApi { apiVersion = 3 }
+      check "app error" ("DEMO_ERR_APP," `T.isInfixOf` h)
+      check "function" ("demo_submit(demo_conn *c, demo_id id," `T.isInfixOf` h)
+      check "version" ("#define DEMO_ABI_VERSION 3\n" `T.isInfixOf` h)
       check "nothing of the other API" (not ("dtlv" `T.isInfixOf` T.toLower h) && not ("SERVER" `T.isInfixOf` h)))
   , ("header: the status numbers are in the order of the ABI, and the header is C and C++", headerCompiles)
   ]

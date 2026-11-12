@@ -13,17 +13,14 @@ module Setu.Wire
   , WireError(..), renderWireError
   , encodeRequest, decodeRequest
   , encodeReply, decodeReply
-  , writeEdn
   ) where
 
 import           Data.ByteString (ByteString)
-import           Data.Char (ord)
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import           Numeric (showHex)
 
-import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Edn (Edn(..), readEdn, renderEdn)
 
 data Request = Request
   { reqOp   :: Text   -- ^ the operation's name, without the colon
@@ -49,7 +46,7 @@ renderWireError e = case e of
   BadEnvelope m -> m
 
 encodeRequest :: Request -> ByteString
-encodeRequest (Request op args) = TE.encodeUtf8 . writeEdn . EMap $
+encodeRequest (Request op args) = TE.encodeUtf8 . renderEdn . EMap $
   (EKw "op", EKw op) : [(EKw "args", args) | args /= ENil]
 
 decodeRequest :: ByteString -> Either WireError Request
@@ -64,7 +61,7 @@ decodeRequest bs = do
   Right (Request op (maybe ENil id (lookupKw "args" ps)))
 
 encodeReply :: Reply -> ByteString
-encodeReply r = TE.encodeUtf8 . writeEdn . EMap $ case r of
+encodeReply r = TE.encodeUtf8 . renderEdn . EMap $ case r of
   ReplyOk v        -> [(EKw "ok", v)]
   ReplyErr kind m  -> [(EKw "error", EKw kind), (EKw "message", EStr m)]
 
@@ -111,41 +108,3 @@ checkKeys what allowed ps = mapM_ one (zip [0 :: Int ..] (map fst ps))
         | n `elem` [m | EKw m <- take i (map fst ps)] -> Left (BadEnvelope (what <> ": key :" <> n <> " is given twice"))
         | otherwise -> Right ()
       _ -> Left (BadEnvelope (what <> ": keys must be keywords"))
-
--- | EDN as text that 'Takka.Edn.readEdn' reads back to the same value.
---
--- (Not 'Takka.Edn.renderEdn': that one is for diagnostics and writes strings the way Haskell's
--- 'show' does, so a non-ASCII character comes out as @\\26085@, which no EDN reader understands.)
--- Characters are written as they are, UTF-8 being the encoding of the body; only @"@, @\\@ and
--- control characters are escaped.  A float that is not finite is written the way Clojure writes
--- it (@##NaN@, @##Inf@, @##-Inf@); takka's reader does not read those, which is why
--- "Setu.Validate" refuses them for 'Setu.Spec.TDouble'.
-writeEdn :: Edn -> Text
-writeEdn e = case e of
-  ENil      -> "nil"
-  EBool b   -> if b then "true" else "false"
-  EInt n    -> T.pack (show n)
-  EFloat d
-    | isNaN d      -> "##NaN"
-    | isInfinite d -> if d > 0 then "##Inf" else "##-Inf"
-    | otherwise    -> T.pack (show d)
-  EStr s    -> "\"" <> T.concatMap escape s <> "\""
-  EKw k     -> T.cons ':' k
-  ESym s    -> s
-  EVec xs   -> wrap "[" "]" xs
-  EList xs  -> wrap "(" ")" xs
-  ESet xs   -> wrap "#{" "}" xs
-  EMap ps   -> wrap "{" "}" (concat [[k, v] | (k, v) <- ps])
-  where
-    wrap o c xs = o <> T.unwords (map writeEdn xs) <> c
-
-escape :: Char -> Text
-escape c = case c of
-  '"'  -> "\\\""
-  '\\' -> "\\\\"
-  '\n' -> "\\n"
-  '\r' -> "\\r"
-  '\t' -> "\\t"
-  _ | c < ' ' || c == '\DEL' -> T.pack ("\\u" ++ pad (showHex (ord c) ""))
-    | otherwise              -> T.singleton c
-  where pad s = replicate (4 - length s) '0' ++ s

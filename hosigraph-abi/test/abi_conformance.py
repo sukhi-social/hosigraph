@@ -207,7 +207,9 @@ def t_abi_op():
     rec.once([1])
     expect_eq(rec.status(1), OK, "status")
     b = rec.body(1)
-    expect(b.startswith(b'{:ok {:name "hosi" :version %d :ops [:ping :abi :write ' % header_version()), b)
+    # a comma is whitespace in EDN, and the writer puts one between the pairs of a map
+    head = rb'\{:ok \{:name "hosi"[,\s]+:version %d[,\s]+:ops \[:ping :abi :write ' % header_version()
+    expect(re.match(head, b), b)
     for op in (b":write-many", b":get-entities", b":query-many", b":history-trace", b":rebuild-khana"):
         expect(op in b, f"{op!r} is not listed in {b!r}")
     call(LIB.hosi_close, c)

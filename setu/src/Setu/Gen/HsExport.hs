@@ -22,8 +22,8 @@ import qualified Data.Text as T
 import           Setu.Spec
 
 data HsExportConfig = HsExportConfig
-  { hsModule        :: Text   -- ^ the name of the module written, @"Hosigraph.Abi.Generated"@
-  , hsLibraryModule :: Text   -- ^ the module that holds the library, @"Hosigraph.Abi.Library"@
+  { hsModule        :: Text   -- ^ the name of the module written, @"Demo.Abi.Generated"@
+  , hsLibraryModule :: Text   -- ^ the module that holds the library, @"Demo.Abi.Library"@
   , hsLibraryValue  :: Text   -- ^ the 'Setu.Abi.Library' in it, @"library"@
   } deriving (Eq, Show)
 

@@ -3,7 +3,7 @@
 -- Module      : Setu.Gen
 -- Description : The @main@ of a generator program: write the files, or check that they are as they should be.
 --
--- > main = runMain [("include/hosi.h", cHeader api), ("cbits/hosi_abi.c", cAbi defaultCAbiConfig api), ...]
+-- > main = runMain [("include/demo.h", cHeader api), ("cbits/demo_abi.c", cAbi defaultCAbiConfig api), ...]
 --
 -- > prog --out DIR     write the files under DIR
 -- > prog --check DIR   write nothing; exit 1 if a file under DIR differs from what would be written

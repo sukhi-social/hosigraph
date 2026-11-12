@@ -33,6 +33,7 @@ import           Hosigraph.Abi.Files (generatedFiles)
 import           Hosigraph.Abi.Handlers
 import           Hosigraph.Abi.Library
 import           Hosigraph.Manifest (ChunkEntry(..))
+import           Setu.Codec (ToEdn(..), FromEdn(..))
 import           Setu.Abi (Library(..))
 import           Setu.Dispatch
 import           Setu.Gen (checkFiles)
@@ -194,16 +195,16 @@ apiTests =
 
   , ("api: what the encoders write fits the shapes the description promises", do
       let fits name ty e = either (\err -> throwIO (userError (name ++ ": " ++ T.unpack (renderTyError err)))) pure (validate ty e)
-      fits "write report" tyWriteReport (encWriteReport report1)
-      fits "seal report" tySealReport (encSealReport (Just sealed))
-      fits "seal report (nothing)" tySealReport (encSealReport Nothing)
-      fits "entities" (TVec tyEntity) (encEntities [entity1, M.empty])
-      fits "event" tyEvent (encEvent ev1)
+      fits "write report" tyWriteReport (toEdn report1)
+      fits "seal report" tySealReport (toEdn (Just sealed))
+      fits "seal report (nothing)" tySealReport (toEdn (Nothing :: Maybe SealReport))
+      fits "entities" (TVec tyEntity) (toEdn [entity1, M.empty])
+      fits "event" tyEvent (toEdn ev1)
       case encTrace ([ev1], trace1) of
         EMap ps | Just t <- lookup (EKw "trace") ps -> fits "trace" tyTrace t
         other -> throwIO (userError ("encTrace: " ++ show other))
-      fits "stats" tyStats (encStats stats1)
-      fits "cell: a pulled tree" tyCell (encCell (CPull (PEntity [("a", PMany [PScalar (VInt 1)])])))
+      fits "stats" tyStats (toEdn stats1)
+      fits "cell: a pulled tree" tyCell (toEdn (CPull (PEntity [("a", PMany [PScalar (VInt 1)])])))
       fits "val: a reference" tyVal (EVec [EKw "ref", EVec [EKw "tmp", EInt 1]])
       fits "op" tyOp (EVec [EKw "create", EVec [EKw "tmp", EInt 1], EKw "person/name", EStr "x"])
       fits "input" tyInput (EVec [EKw "rel", EVec [EVec [EInt 1, EStr "a"]]]))
@@ -222,23 +223,23 @@ genValue = oneof
 
 codecTests :: [Test]
 codecTests =
-  [ ("codec: a value goes out and comes back", prop 500 $ forAll genValue $ \v -> decValue (encValue v) == Right v)
+  [ ("codec: a value goes out and comes back", prop 500 $ forAll genValue $ \v -> fromEdn (toEdn v) == Right v)
 
   , ("codec: an op is read as written", do
-      checkEq "create" (Right (Create (Tmp 1) "person/name" (Lit (VStr "Frege")))) (decOp (edn "[:create [:tmp 1] :person/name \"Frege\"]"))
-      checkEq "delete a reference" (Right (Delete (Id 7) "person/friend" (RefTo (Tmp 2)))) (decOp (edn "[:delete 7 :person/friend [:ref [:tmp 2]]]"))
-      checkEq "a bare integer is a literal" (Right (Create (Id 7) "a" (Lit (VInt 5)))) (decOp (edn "[:create 7 :a 5]"))
-      checkEq "a reference to an existing entity" (Right (Create (Id 7) "a" (RefTo (Id 5)))) (decOp (edn "[:create 7 :a [:ref 5]]")))
+      checkEq "create" (Right (Create (Tmp 1) "person/name" (Lit (VStr "Frege")))) (fromEdn (edn "[:create [:tmp 1] :person/name \"Frege\"]"))
+      checkEq "delete a reference" (Right (Delete (Id 7) "person/friend" (RefTo (Tmp 2)))) (fromEdn (edn "[:delete 7 :person/friend [:ref [:tmp 2]]]"))
+      checkEq "a bare integer is a literal" (Right (Create (Id 7) "a" (Lit (VInt 5)))) (fromEdn (edn "[:create 7 :a 5]"))
+      checkEq "a reference to an existing entity" (Right (Create (Id 7) "a" (RefTo (Id 5)))) (fromEdn (edn "[:create 7 :a [:ref 5]]")))
 
   , ("codec: inputs", do
-      checkEq "scalar" (Right (InScalar (VStr "x"))) (decInput (edn "[:scalar \"x\"]"))
-      checkEq "coll" (Right (InColl [VInt 1, VInt 2])) (decInput (edn "[:coll [1 2]]"))
-      checkEq "rel" (Right (InRel [[VInt 1, VStr "a"], [VInt 2, VStr "b"]])) (decInput (edn "[:rel [[1 \"a\"] [2 \"b\"]]]")))
+      checkEq "scalar" (Right (InScalar (VStr "x"))) (fromEdn (edn "[:scalar \"x\"]"))
+      checkEq "coll" (Right (InColl [VInt 1, VInt 2])) (fromEdn (edn "[:coll [1 2]]"))
+      checkEq "rel" (Right (InRel [[VInt 1, VStr "a"], [VInt 2, VStr "b"]])) (fromEdn (edn "[:rel [[1 \"a\"] [2 \"b\"]]]")))
 
   , ("codec: a pulled tree keeps its order, and a scalar is not a vector", do
       checkEq "tree" (canon (edn "[:pull {:person/name \"Frege\" :person/tag [\"a\" \"b\"]}]"))
-        (canon (encCell (CPull (PEntity [("person/name", PScalar (VStr "Frege")), ("person/tag", PMany [PScalar (VStr "a"), PScalar (VStr "b")])]))))
-      checkEq "value" (EInt 3) (encCell (CVal (VInt 3))))
+        (canon (toEdn (CPull (PEntity [("person/name", PScalar (VStr "Frege")), ("person/tag", PMany [PScalar (VStr "a"), PScalar (VStr "b")])]))))
+      checkEq "value" (EInt 3) (toEdn (CVal (VInt 3))))
 
   , ("codec: what a failed batch of write-many is told as", do
       checkEq "rejected" (edn "[:error :write-rejected \"no\"]") (encWriteResult (Left (WriteRejected "no")))

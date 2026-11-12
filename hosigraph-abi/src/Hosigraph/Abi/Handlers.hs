@@ -20,6 +20,7 @@ import qualified Data.Text as T
 
 import           Hosigraph
 import           Hosigraph.Abi.Codec
+import           Setu.Codec (ToEdn(..))
 import           Setu.Dispatch (Failure(..), Handler)
 import           Setu.Ticket (Status(..))
 import           Takka.Edn (Edn(..))
@@ -63,16 +64,16 @@ unattached = Backend
 -- | The handlers, by the names of the operations in the 'Hosigraph.Abi.Api.api'.
 handlers :: Backend -> [(Text, Handler)]
 handlers b =
-  [ ("write",            run decOps      (bWrite b)          encWriteReport)
-  , ("write-many",       run decBatches  (bWriteMany b)      (\rs -> EVec (map encWriteResult rs)))
-  , ("seal",             run none        (const (bSeal b))   encSealReport)
-  , ("get-entities",     run decIds      (bGetEntities b)    encEntities)
-  , ("query-many",       run decQueries  (bQueryMany b)      encRows)
-  , ("query-cells-many", run decQueries  (bQueryCellsMany b) encCellRows)
-  , ("history",          run decId       (bHistory b)        encEvents)
+  [ ("write",            run decOps      (bWrite b)          toEdn)
+  , ("write-many",       run decBatches  (bWriteMany b)      (EVec . map encWriteResult))
+  , ("seal",             run none        (const (bSeal b))   toEdn)
+  , ("get-entities",     run decIds      (bGetEntities b)    toEdn)
+  , ("query-many",       run decQueries  (bQueryMany b)      toEdn)
+  , ("query-cells-many", run decQueries  (bQueryCellsMany b) toEdn)
+  , ("history",          run decId       (bHistory b)        toEdn)
   , ("history-trace",    run decId       (bHistoryTrace b)   encTrace)
-  , ("verify",           run none        (const (bVerify b)) encStrings)
-  , ("stats",            run none        (const (bStats b))  encStats)
+  , ("verify",           run none        (const (bVerify b)) toEdn)
+  , ("stats",            run none        (const (bStats b))  toEdn)
   , ("rebuild-khana",    run none        (const (bRebuildKhana b)) (const ENil))
   ]
   where none _ = Right ()

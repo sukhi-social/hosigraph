@@ -1,14 +1,22 @@
 cabal-version:      2.4
 name:               setu
 version:            0.0.1.0
-synopsis:           Say once what an API offers; write its C header (and more) from that
+synopsis:           Say once what a Haskell API offers; write the doors other languages use
 description:
   setu (Pali: bridge). An 'Api' lists the operations a Haskell library offers and the shape of what
-  goes in and out of each. Generators read it and write the doors other languages use.
-  v0 writes a C header; bodies on the wire are EDN (through takka).
+  goes in and out of each. Generators read it and write, as text, a C header, the Haskell
+  foreign exports, and a small C layer that starts the Haskell runtime and guards the calls.
+  The door is thin and does not change when an operation is added: a request is handed in with
+  a number and a body, and is answered once, through a callback ("tickets"). Bodies are EDN (through takka).
+  What every door shares is here too: the table of waiting requests, the table of operations,
+  and instances of ToEdn / FromEdn that Generic writes.
   There is no C in this package: the C it writes is text.
 category:           Development
 build-type:         Simple
+tested-with:        GHC == 9.6.7
+extra-doc-files:
+  README.md
+  CHANGELOG.md
 extra-source-files:
   test/golden/*.h
 
@@ -23,6 +31,7 @@ library
     Setu.Spec
     Setu.Validate
     Setu.Wire
+    Setu.Codec
     Setu.Ticket
     Setu.Dispatch
     Setu.Abi
@@ -32,7 +41,7 @@ library
     Setu.Gen.HsExport
   build-depends:
       base        >=4.14 && <5
-    , takka
+    , takka       >=0.1.0.1 && <0.2
     , bytestring  >=0.10 && <0.13
     , containers  >=0.6  && <0.8
     , directory   >=1.3  && <1.4
@@ -45,7 +54,7 @@ test-suite spec
   type:             exitcode-stdio-1.0
   hs-source-dirs:   test
   main-is:          Spec.hs
-  other-modules:    Harness, TicketTests, DispatchTests, AbiTests
+  other-modules:    Harness, TicketTests, DispatchTests, AbiTests, CodecTests
   build-depends:    base, setu, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, stm, text
   -- several capabilities, so that the races are real races
   ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4"

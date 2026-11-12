@@ -1,5 +1,5 @@
 {-# LANGUAGE ScopedTypeVariables #-}
--- | A very small harness (the same shape as hosigraph's), shared by the test modules.
+-- | A very small harness, shared by the test modules.
 module Harness
   ( Test, check, checkEq, prop, patiently
   ) where
