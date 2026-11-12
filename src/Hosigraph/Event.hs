@@ -14,9 +14,9 @@ import           Data.Word
 import           GHC.Float (castDoubleToWord64, castWord64ToDouble)
 
 import           Hosigraph.Bin
-import           Native.Types (Keyword(..), Value(..))
+import           Takka.Types (Keyword(..), Value(..))
 
--- | A time-sortable internal id (see "Hosigraph.Id").  Same width as the khana's 'Native.Types.EntityId',
+-- | A time-sortable internal id (see "Hosigraph.Id").  Same width as the khana's 'Takka.Types.EntityId',
 -- so a hosigraph id /is/ the entity id inside the khana.
 type HosiId = Int64
 

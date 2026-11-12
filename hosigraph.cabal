@@ -5,14 +5,14 @@ synopsis:           hosigraph Phase 1 prototype (events, khana, MPHF)
 description:
   A prototype of the hosigraph design (formerly hosiDB, v0.2.0-draft): an embedded database that keeps the
   past as frozen chunks of Create/Delete events and "now" (the khana) as a rebuildable instant.
-  The khana ("now") is a Datalevin database (through dtlv or a resident JVM) or, for now, an in-process
-  Haskell engine, reached through the separate package native-bridge (its path is given in cabal.project.local).
+  The khana ("now") is a Datalevin database (through dtlv or a resident JVM). The words it speaks
+  (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
+  There is no C in the package.
 category:           Database
 build-type:         Simple
 extra-source-files:
   README.md
   docs/*.md
-  cbits/hosi_sync.c
 
 common shared
   default-language: Haskell2010
@@ -42,7 +42,7 @@ library
     Hosigraph.Tail
   build-depends:
       base        >=4.14 && <5
-    , native-bridge
+    , takka
     , aeson       >=2.0  && <2.3
     , array       >=0.5  && <0.6
     , bytestring  >=0.10 && <0.13
@@ -53,17 +53,14 @@ library
     , scientific  >=0.3  && <0.4
     , text        >=1.2  && <2.2
     , time        >=1.9  && <1.14
+    , unix        >=2.8  && <2.9
     , vector      >=0.12 && <0.14
-  c-sources:
-    cbits/hosi_sync.c
-  cc-options:       -pthread -fPIC -w
-  ld-options:       -pthread
 
 executable hosigraph-demo
   import:           shared
   hs-source-dirs:   app
   main-is:          Main.hs
-  build-depends:    base, hosigraph, native-bridge, containers, directory, filepath, text, bytestring
+  build-depends:    base, hosigraph, takka, containers, directory, filepath, text, bytestring
   ghc-options:      -threaded -rtsopts
 
 test-suite spec
@@ -71,5 +68,5 @@ test-suite spec
   type:             exitcode-stdio-1.0
   hs-source-dirs:   test
   main-is:          Spec.hs
-  build-depends:    base, hosigraph, native-bridge, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text, time
+  build-depends:    base, hosigraph, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text, time
   ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4"

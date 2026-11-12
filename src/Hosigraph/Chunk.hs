@@ -49,7 +49,7 @@ import           Hosigraph.Mphf
 import           Hosigraph.Probe
 import           Hosigraph.Sha256 (sha256Hex)
 import           Hosigraph.Sync
-import           Native.Types (Keyword(..))
+import           Takka.Types (Keyword(..))
 
 chunkDataFile, chunkMphfFile :: FilePath
 chunkDataFile = "chunk.hosi"

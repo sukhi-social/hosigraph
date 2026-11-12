@@ -1,25 +1,25 @@
-{-# LANGUAGE ForeignFunctionInterface #-}
 -- |
 -- Module      : Hosigraph.Sync
 -- Description : fsync for files and directories (durability, not just flushing).
 module Hosigraph.Sync (syncFile, syncDir, atomicReplace) where
 
-import Foreign.C.Error (throwErrnoIfMinus1_)
-import Foreign.C.String (CString, withCString)
-import Foreign.C.Types (CInt(..))
+import Control.Exception (bracket)
 import System.Directory (renameFile)
 import System.FilePath (takeDirectory)
-
-foreign import ccall unsafe "hosi_fsync_path" c_fsync_path :: CString -> IO CInt
-foreign import ccall unsafe "hosi_fsync_dir"  c_fsync_dir  :: CString -> IO CInt
+import System.Posix.IO (OpenMode(ReadOnly), closeFd, defaultFileFlags, openFd)
+import System.Posix.Unistd (fileSynchronise)
 
 -- | Make a file's bytes durable.
 syncFile :: FilePath -> IO ()
-syncFile p = withCString p $ \c -> throwErrnoIfMinus1_ ("fsync " ++ p) (c_fsync_path c)
+syncFile = fsyncPath
 
 -- | Make a directory's entries (creates, renames) durable.
+-- (A directory is opened read-only like a file; POSIX lets fsync work on that descriptor.)
 syncDir :: FilePath -> IO ()
-syncDir p = withCString p $ \c -> throwErrnoIfMinus1_ ("fsync dir " ++ p) (c_fsync_dir c)
+syncDir = fsyncPath
+
+fsyncPath :: FilePath -> IO ()
+fsyncPath p = bracket (openFd p ReadOnly defaultFileFlags) closeFd fileSynchronise
 
 -- | The "write new, then swap" step: @tmp@ must already be fully written.
 -- fsync the new file, rename it over the target (atomic on POSIX), fsync the directory.

@@ -28,8 +28,8 @@ import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 import           Hosigraph
 import           Hosigraph.Bin
 import           Hosigraph.Chunk
-import           Native.Edn (Edn(..), readEdn)
-import           Native.Query (Pulled(..))
+import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, makeId)
 import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
@@ -82,7 +82,7 @@ main = do
       dtlvRun = nativeRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
-  results <- forM (pureTests ++ hosiTests KhanaDatalevinNative ++ dtlvRun) $ \(name, act) -> do
+  results <- forM (pureTests ++ dtlvRun) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -787,7 +787,7 @@ diffQueries =
 pullQuery :: T.Text
 pullQuery = "[:find (pull ?e [:person/name :person/age {:person/friend [:person/name]}]) :where [?e :person/name _]]"
 
--- | A pull's attributes are a list in the in-process engine and a map in Datalevin: compare them as sets of attributes.
+-- | A pull's attributes come back as a map from Datalevin: compare them as sets of attributes (their order means nothing).
 normCell :: Cell -> Cell
 normCell c = case c of CPull p -> CPull (go p); _ -> c
   where go p = case p of
@@ -795,86 +795,13 @@ normCell c = case c of CPull p -> CPull (go p); _ -> c
           PMany xs    -> PMany (map go xs)
           _           -> p
 
--- | What "now" looks like from the outside.
-nowOf :: Hosi -> [HosiId] -> IO ([M.Map Keyword [Value]], [[[Value]]], [[Cell]], Word64)
-nowOf h ids = do
-  es <- getEntities h ids
-  qs <- map sort <$> queryMany h [ (qt, []) | qt <- diffQueries ]
-  cs <- sortOn show . map (map normCell) <$> queryCells h pullQuery []
-  n  <- stKhanaDatoms <$> stats h
-  pure (es, qs, cs, n)
-
-sameNow :: Hosi -> Hosi -> String -> [HosiId] -> IO ()
-sameNow a b label ids = do
-  x <- nowOf a ids
-  y <- nowOf b ids
-  checkEq label x y
-
 -- | The checks that hold for every way of reaching Datalevin.
 dtlvTests :: KhanaBackend -> [Test]
 dtlvTests be =
-  [ ("dtlv vs the in-process engine: the same writes give the same \"now\" (also after seal, reopen, rebuild)", withTmp $ \dir -> do
-      (clk, clock) <- newClock nov11
-      let cfg be = (backendCfg be) { hcClock = clock }
-          openB be sub = openHosiWith (cfg be) (dir </> sub) schema
-      hv <- openB KhanaDatalevinNative "native"
-      hd <- openB be "dtlv"
-      let twice act = (,) <$> act hv <*> act hd
-          first = [ Create (Tmp 1) "person/name" (Lit (VStr "Frege")), Create (Tmp 1) "person/age" (Lit (VInt 70))
-                  , Create (Tmp 1) "person/score" (Lit (VDouble 1.5))
-                  , Create (Tmp 1) "person/tag" (Lit (VStr "a")), Create (Tmp 1) "person/tag" (Lit (VStr "b"))
-                  , Create (Tmp 2) "person/name" (Lit (VStr "Peirce")), Create (Tmp 2) "person/age" (Lit (VInt 75))
-                  , Create (Tmp 1) "person/friend" (RefTo (Tmp 2)) ]
-      (r1, r1') <- twice (\h -> write h first)
-      checkEq "the same ids" (wrTemps r1) (wrTemps r1')
-      let frege = wrTemps r1 M.! 1; peirce = wrTemps r1 M.! 2
-      sameNow hv hd "after the first write" [frege, peirce]
-      _ <- twice seal
-      sameNow hv hd "after seal" [frege, peirce]
-      modifyIORef' clk (+ 86400000)
-      _ <- twice $ \h -> write h [ Create (Id frege) "person/age" (Lit (VInt 71)), Delete (Id frege) "person/tag" (Lit (VStr "a"))
-                                 , Delete (Id peirce) "person/age" (Lit (VInt 75)) ]
-      (r3, _) <- twice $ \h -> write h [ Create (Tmp 1) "person/name" (Lit (VStr "Boole")), Create (Tmp 1) "person/age" (Lit (VInt 49))
-                                       , Create (Tmp 1) "person/friend" (RefTo (Id frege)) ]
-      let boole = wrTemps r3 M.! 1
-          ids = [frege, peirce, boole]
-      sameNow hv hd "after an update, deletes and a third person" ids
-      checkEq "the in-process khana verifies" [] =<< verify hv
-      checkEq "dtlv verifies" [] =<< verify hd
-      closeHosi hv >> closeHosi hd
-      hv2 <- openB KhanaDatalevinNative "native"
-      hd2 <- openB be "dtlv"
-      sameNow hv2 hd2 "after reopen" ids
-      rebuildKhana hv2 >> rebuildKhana hd2
-      sameNow hv2 hd2 "after rebuildKhana" ids
-      closeHosi hv2 >> closeHosi hd2)
-
-  , ("dtlv: the khana can change backend; the events stay the one truth", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      let cfg be = (backendCfg be) { hcClock = clock }
-      h <- openHosiWith (cfg KhanaDatalevinNative) dir schema
-      a <- person h "Frege" 70
-      _ <- seal h
-      b <- person h "Peirce" 75
-      closeHosi h
-      h2 <- openHosiWith (cfg be) dir schema          -- no khana-dtlv/ yet: it is folded from the events
-      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
-      checkEq "Peirce" (Just [VInt 75]) =<< ageOf h2 b
-      c <- person h2 "Boole" 49
-      checkEq "verify (dtlv)" [] =<< verify h2
-      closeHosi h2
-      h3 <- openHosiWith (cfg KhanaDatalevinNative) dir schema               -- and back: the in-process khana is behind and catches up
-      checkEq "Boole, after going back" (Just [VInt 49]) =<< ageOf h3 c
-      checkEq "verify (in-process)" [] =<< verify h3
-      closeHosi h3
-      checkEq "two khanas, side by side" [True, True] =<< mapM (doesDirectoryExist . (dir </>)) ["khana", "khana-dtlv"])
-
-  , ("dtlv: what it cannot do says so, and a missing dtlv is found before anything is touched", withTmp $ \dir -> do
+  [ ("dtlv: what it cannot do says so, and a missing dtlv is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       h <- openHosiWith ((backendCfg be) { hcClock = clock }) dir schema
       _ <- person h "Frege" 70
-      r1 <- try (withKhana h (\_ -> pure ())) :: IO (Either HosiError ())
-      check "withKhana is refused" (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r1)
       r2 <- try (query h "[:find ?n :in $ % :where [?e :person/name ?n]]" [InRules []]) :: IO (Either SomeException [[Value]])
       check "InRules is refused" (either (const True) (const False) r2)
       checkEq "...and the khana is still good" [] =<< verify h

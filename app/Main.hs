@@ -9,6 +9,7 @@ import qualified Data.Map.Strict as M
 import qualified Data.Text as T
 import           System.Directory
 import           System.Environment (getArgs, lookupEnv)
+import           System.Exit (exitFailure)
 import           System.FilePath ((</>))
 import           System.IO
 
@@ -16,7 +17,7 @@ import           Hosigraph
 import           Hosigraph.Id (epochMs, idMs, makeId)
 import           Hosigraph.Manifest
 import           Hosigraph.Tail (tailFile)
-import           Native.Types (renderValue)
+import           Takka.Types (renderValue)
 
 schema :: Schema
 schema = M.fromList
@@ -51,11 +52,14 @@ main = do
   let dir = case args of (d : _) -> d; _ -> "/tmp/hosigraph-demo"
   removePathForcibly dir
   clk <- newIORef (epochMs + 314 * 86400000)          -- 2026-11-11 00:00 UTC
-  -- The khana: a resident Datalevin JVM if HOSIGRAPH_DATALEVIN_JAR is set, else the in-process engine.
-  mjar <- lookupEnv "HOSIGRAPH_DATALEVIN_JAR"
+  -- The khana is Datalevin in a resident JVM: HOSIGRAPH_DATALEVIN_JAR is the standalone jar,
+  -- HOSIGRAPH_JAVA the java command ("java" if unset).
+  mjar <- (>>= \j -> if null j then Nothing else Just j) <$> lookupEnv "HOSIGRAPH_DATALEVIN_JAR"
   java <- maybe "java" id <$> lookupEnv "HOSIGRAPH_JAVA"
-  let be = maybe KhanaDatalevinNative (KhanaDatalevinJvm java) (mjar >>= \j -> if null j then Nothing else Just j)
-      cfg = defaultConfig { hcClock = readIORef clk, hcKhanaBackend = be }
+  jar <- case mjar of
+    Just j  -> pure j
+    Nothing -> hPutStrLn stderr "set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar (and HOSIGRAPH_JAVA to java)" >> exitFailure
+  let cfg = defaultConfig { hcClock = readIORef clk, hcKhanaBackend = KhanaDatalevinJvm java jar }
       tickMin n = modifyIORef' clk (+ n * 60000)
 
   step "write: three logicians in November (Tmp 1.. become IDs with a time in them when written)"
@@ -124,7 +128,7 @@ main = do
 
   step "the khana (now) always rises again from the events (setsuna-metsu)"
   closeHosi h3
-  mapM_ (removePathForcibly . (dir </>)) ["khana", "khana-dtlv"]
+  mapM_ (removePathForcibly . (dir </>)) ["khana-dtlv"]
   say "removed the whole khana (all the events stay in events/)"
   h4 <- openHosiWith cfg dir schema
   getEntity h4 frege >>= say . ("Frege (now): " ++) . showEntity

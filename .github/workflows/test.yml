@@ -1,0 +1,72 @@
+# The tests, on every change.
+#
+# hosigraph, with its khana on Datalevin in a resident JVM: the standalone jar, checked against a
+# pinned sha256. The native `dtlv` is not used here, so the tests that need it print that they
+# skipped them (see "Run the tests against Datalevin" in the README).
+# takka/ (the words hosigraph shares with Datalevin) is built along with it.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHC_VERSION: "9.6.7"
+  CABAL_VERSION: "3.10.3.0"
+  DATALEVIN_VERSION: "1.2.10"
+  # sha256 of datalevin-1.2.10-standalone.jar, from the release page of datalevin/datalevin
+  DATALEVIN_JAR_SHA256: "0e8aba6d4022e63e9b34eafc39e257d1efa8ec2a920f089836c459e987605513"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Fetch the Datalevin jar
+        run: |
+          jar="$RUNNER_TEMP/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          curl -fsSL -o "$jar" \
+            "https://github.com/datalevin/datalevin/releases/download/${DATALEVIN_VERSION}/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          echo "${DATALEVIN_JAR_SHA256}  ${jar}" | sha256sum -c -
+          echo "HOSIGRAPH_DATALEVIN_JAR=${jar}" >> "$GITHUB_ENV"
+          echo "HOSIGRAPH_JAVA=${JAVA_HOME}/bin/java" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cabal update
+          cabal build all --enable-tests
+
+      - name: Test
+        run: cabal test hosigraph:spec --test-show-details=direct

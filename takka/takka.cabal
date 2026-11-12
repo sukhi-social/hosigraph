@@ -1,0 +1,26 @@
+cabal-version:      2.4
+name:               takka
+version:            0.1.0.0
+synopsis:           Values, EDN, and the syntax of Datalog queries and pull patterns
+description:
+  The words hosigraph and Datalevin share, in plain Haskell (no database, no C): the value and
+  schema types (Takka.Types), EDN (Takka.Edn), and the shapes and parsers of Datalog queries and
+  pull patterns (Takka.Syntax).
+category:           Database
+build-type:         Simple
+
+common shared
+  default-language: Haskell2010
+  ghc-options:      -Wall -Wno-name-shadowing
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:
+    Takka.Types
+    Takka.Edn
+    Takka.Syntax
+  build-depends:
+      base        >=4.14 && <5
+    , containers  >=0.6  && <0.8
+    , text        >=1.2  && <2.2
