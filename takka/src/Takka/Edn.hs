@@ -17,9 +17,10 @@ module Takka.Edn
   , ednToValue
   ) where
 
-import           Data.Char (chr, isDigit, isHexDigit, isSpace, digitToInt)
+import           Data.Char (chr, isDigit, isHexDigit, isSpace, digitToInt, ord)
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Numeric (showHex)
 import           Text.Read (readMaybe)
 
 import           Takka.Types (Keyword(..), Value(..))
@@ -138,14 +139,24 @@ str = go []
         _   -> Left ("bad string escape: \\" ++ [c])
       (c : cs)      -> go (c : acc) cs
 
--- | Render back to EDN text (used for diagnostics).
+-- | Write EDN text that 'readEdn' reads back to the same value (for diagnostics, and for bodies
+-- that are sent on).
+--
+-- A string is written as it is: its characters stay what they are (the text is UTF-8 on the wire),
+-- and only @"@, @\\@ and control characters are escaped.  (Haskell's @show@ would write a
+-- non-ASCII character as @\\26085@, which no EDN reader understands.)  A float that is not
+-- finite is written the way Clojure writes it (@##NaN@, @##Inf@, @##-Inf@); 'readEdn' does not
+-- read those.  A map is written with a comma between its pairs, as Clojure prints it.
 renderEdn :: Edn -> Text
 renderEdn e = case e of
   ENil      -> "nil"
   EBool b   -> if b then "true" else "false"
   EInt n    -> T.pack (show n)
-  EFloat d  -> T.pack (show d)
-  EStr s    -> T.pack (show (T.unpack s))
+  EFloat d
+    | isNaN d      -> "##NaN"
+    | isInfinite d -> if d > 0 then "##Inf" else "##-Inf"
+    | otherwise    -> T.pack (show d)
+  EStr s    -> "\"" <> T.concatMap escapeChar s <> "\""
   EKw k     -> T.cons ':' k
   ESym s    -> s
   EVec xs   -> wrap "[" "]" xs
@@ -153,6 +164,17 @@ renderEdn e = case e of
   ESet xs   -> wrap "#{" "}" xs
   EMap ps   -> "{" <> T.intercalate ", " [renderEdn k <> " " <> renderEdn v | (k, v) <- ps] <> "}"
   where wrap o c xs = o <> T.unwords (map renderEdn xs) <> c
+
+escapeChar :: Char -> Text
+escapeChar c = case c of
+  '"'  -> "\\\""
+  '\\' -> "\\\\"
+  '\n' -> "\\n"
+  '\r' -> "\\r"
+  '\t' -> "\\t"
+  _ | c < ' ' || c == '\DEL' -> T.pack ("\\u" ++ pad (showHex (ord c) ""))
+    | otherwise              -> T.singleton c
+  where pad s = replicate (4 - length s) '0' ++ s
 
 -- | Scalars that can be stored in a datom.  @nil@ and collections are rejected.
 ednToValue :: Edn -> Either String Value

@@ -29,7 +29,7 @@ import           Hosigraph
 import           Hosigraph.Bin
 import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
-import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, makeId)
 import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
@@ -475,6 +475,13 @@ pureTests =
       _ <- pure s2
       pure ())
 
+  , ("takka edn: renderEdn keeps the characters of a string, escapes the rest, and is read back", do
+      checkEq "non-ASCII stays as it is" "\"日本語 é 😀\"" (renderEdn (EStr "日本語 é 😀"))
+      checkEq "quote, backslash and control characters" "\"a\\\"b\\\\c\\nd\\u0001\"" (renderEdn (EStr "a\"b\\c\nd\SOH"))
+      checkEq "read back" (Right (EStr "日本語 é 😀\n\"\\\SOH")) (readEdn (renderEdn (EStr "日本語 é 😀\n\"\\\SOH")))
+      checkEq "a map has a comma between its pairs" "{:a 1, :b [2 3]}"
+        (renderEdn (EMap [(EKw "a", EInt 1), (EKw "b", EVec [EInt 2, EInt 3])]))
+      checkEq "a float that is not finite" "##NaN" (renderEdn (EFloat (0 / 0))))
   , ("dtlv edn: a string is written so that a reader gives the same text back (QuickCheck)", prop 300 $
       forAll (listOf (frequency [(8, arbitrary), (2, elements ("\"\\\n\r\t\0\DEL\f\b é日本😀" :: String))])) $ \s ->
         let t = T.pack s in readEdn (ednStr t) === Right (EStr t))
