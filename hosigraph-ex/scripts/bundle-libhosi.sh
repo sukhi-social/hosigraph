@@ -44,7 +44,13 @@ case "$(uname -s)" in
     ;;
   Linux)
     command -v patchelf >/dev/null || { echo "bundle: patchelf is needed" >&2; exit 1; }
-    system='^(linux-vdso|ld-linux.*|libc|libm|libdl|libpthread|librt|libutil|libresolv|libgcc_s)\.so'
+    # What the system always has.  On musl the C library is one file under two names
+    # (libc.musl-ARCH.so.1, ld-musl-ARCH.so.1) and libgcc_s is not a given, so it travels with us.
+    if ldd --version 2>&1 | grep -qi musl; then
+      system='^(libc\.musl-[^.]+|ld-musl-[^.]+)\.so'
+    else
+      system='^(linux-vdso|ld-linux.*|libc|libm|libdl|libpthread|librt|libutil|libresolv|libgcc_s)\.so'
+    fi
     todo=("$lib")
     i=0
     while [ "$i" -lt "${#todo[@]}" ]; do

@@ -8,6 +8,10 @@
 # every library it needs but the system's, all looking for each other next to themselves.
 # A bundle is tried before it is shipped: it is unpacked where the source tree cannot help, and
 # the Elixir tests run on it.
+#
+# Two kinds of Linux: `bundle` is glibc (built on Ubuntu 24.04, so glibc 2.39 or newer is needed to
+# run it), `bundle-musl` is musl (Alpine; built inside an Alpine container).  Both put their files
+# in artifacts named bundle-*, and the one `release` job makes the one checksum.txt of all of them.
 name: precompile-hosi-ex
 
 on:
@@ -121,8 +125,68 @@ jobs:
             ${{ steps.v.outputs.asset }}.sha256
           if-no-files-found: error
 
+  # Alpine (musl).  The steps run inside the container by hand (docker run), not with `container:`,
+  # because GitHub's own actions want a glibc node.  Alpine 3.20 has OTP 26 (NIF API 2.17).
+  bundle-musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     target: x86_64-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-musl }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version (the tag must say what mix.exs says)
+        id: v
+        shell: bash
+        run: |
+          version=$(sed -n 's/^  @version "\(.*\)"$/\1/p' hosigraph-ex/mix.exs)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "hosi-ex-v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} but hosigraph-ex/mix.exs says ${version}" >&2; exit 1
+          fi
+          echo "asset=hosi-nif-v${version}-nif2.17-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # ghcup, the cabal store and what was built, kept between runs
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/musl-cache
+            dist-newstyle
+          key: musl-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
+          restore-keys: |
+            musl-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-
+
+      - name: Build, bundle and try it, in Alpine
+        run: |
+          mkdir -p "$HOME/musl-cache/ghcup" "$HOME/musl-cache/cabal"
+          docker run --rm -v "$PWD:/w" -w /w \
+            -v "$HOME/musl-cache/ghcup:/root/.ghcup" -v "$HOME/musl-cache/cabal:/root/.cabal" \
+            -e GHC_VERSION="$GHC_VERSION" -e CABAL_VERSION="$CABAL_VERSION" \
+            alpine:3.20 \
+            sh -c 'apk add --no-cache bash >/dev/null && exec bash hosigraph-ex/scripts/ci-musl-bundle.sh "$0"' \
+            "${{ steps.v.outputs.asset }}"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          asset="${{ steps.v.outputs.asset }}"
+          sum=$(sha256sum "$asset")
+          echo "${sum%% *}  ${asset}" > "${asset}.sha256"
+          cat "${asset}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            ${{ steps.v.outputs.asset }}
+            ${{ steps.v.outputs.asset }}.sha256
+          if-no-files-found: error
+
   release:
-    needs: bundle
+    needs: [bundle, bundle-musl]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
