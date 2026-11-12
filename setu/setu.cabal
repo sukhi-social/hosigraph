@@ -1,0 +1,40 @@
+cabal-version:      2.4
+name:               setu
+version:            0.0.1.0
+synopsis:           Say once what an API offers; write its C header (and more) from that
+description:
+  setu (Pali: bridge). An 'Api' lists the operations a Haskell library offers and the shape of what
+  goes in and out of each. Generators read it and write the doors other languages use.
+  v0 writes a C header; bodies on the wire are EDN (through takka).
+  There is no C in this package: the C it writes is text.
+category:           Development
+build-type:         Simple
+extra-source-files:
+  test/golden/*.h
+
+common shared
+  default-language: Haskell2010
+  ghc-options:      -Wall -Wno-name-shadowing
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:
+    Setu.Spec
+    Setu.Validate
+    Setu.Wire
+    Setu.Gen.CHeader
+  build-depends:
+      base        >=4.14 && <5
+    , takka
+    , bytestring  >=0.10 && <0.13
+    , containers  >=0.6  && <0.8
+    , text        >=1.2  && <2.2
+
+test-suite spec
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Spec.hs
+  build-depends:    base, setu, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text
+  ghc-options:      -threaded -rtsopts
