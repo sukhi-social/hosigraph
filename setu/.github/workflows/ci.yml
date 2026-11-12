@@ -1,0 +1,56 @@
+# The tests, on every change.
+#
+# This file is for the repository that setu will have of its own.  While setu is a directory of the
+# hosigraph repository GitHub does not read it (only the .github at the top of a repository counts);
+# after `git subtree split --prefix=setu` it is at the top, where it belongs.  It asks for no more
+# than a cabal.project there: see docs/split-setu.md in the hosigraph repository (the file to rename
+# is cabal.project.standalone).
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHC_VERSION: "9.6.7"
+  CABAL_VERSION: "3.10.3.0"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('setu.cabal', 'cabal.project') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
+
+      - name: Build
+        run: |
+          cabal update
+          cabal build --enable-tests
+
+      - name: Test
+        run: cabal test --test-show-details=direct

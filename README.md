@@ -304,6 +304,9 @@ Neither touches `hosigraph` or `takka`, and `hosigraph`, `takka` and `setu` stil
   `include/hosi.h`, the Haskell `foreign export`s, and a small C file that starts the Haskell runtime and guards the calls.
   The shared library is `libhosi`.
 
+`setu/` is made to be moved into a repository of its own (it has its own README, changelog, CI file and a `cabal.project.standalone`);
+[`docs/split-setu.md`](docs/split-setu.md) says how, what was tried, and what is still to be decided.
+
 The C interface is thin and does not change when an operation is added: `hosi_runtime_init`, `hosi_open`, `hosi_submit`, `hosi_cancel`, `hosi_close`,
 `hosi_runtime_shutdown`, `hosi_thread_done`, `hosi_abi_version`. A request is handed in with a number (an id the caller chooses) and a body, and is answered **once**,
 through a callback, with a status (`HOSI_OK`, `HOSI_ERR_APP`, ...) and a body. Both bodies are UTF-8 EDN, `{:op :write :args {...}}` going in and
