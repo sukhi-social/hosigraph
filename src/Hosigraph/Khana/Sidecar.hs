@@ -43,7 +43,7 @@ import           System.IO
 import           System.Process
 import           System.Timeout (timeout)
 
-import           Native.Edn (Edn(..), readEdn)
+import           Takka.Edn (Edn(..), readEdn)
 
 -- | The JVM could not be started, died, or said something we cannot read.
 newtype SidecarError = SidecarError String

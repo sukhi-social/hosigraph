@@ -28,8 +28,8 @@ import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 import           Hosigraph
 import           Hosigraph.Bin
 import           Hosigraph.Chunk
-import           Native.Edn (Edn(..), readEdn)
-import           Native.Query (Pulled(..))
+import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Pull (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, makeId)
 import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
 import           Hosigraph.Manifest

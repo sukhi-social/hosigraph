@@ -16,7 +16,7 @@ import           Hosigraph
 import           Hosigraph.Id (epochMs, idMs, makeId)
 import           Hosigraph.Manifest
 import           Hosigraph.Tail (tailFile)
-import           Native.Types (renderValue)
+import           Takka.Types (renderValue)
 
 schema :: Schema
 schema = M.fromList

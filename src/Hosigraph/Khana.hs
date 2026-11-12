@@ -16,7 +16,7 @@
 -- /Two backends./  The instant can live in
 --
 -- * 'KhanaDatalevinNative': an engine that runs inside this process (the @khana/@ directory; see
---   "Native.Engine"), or
+--   "Takka.Engine"), or
 -- * @'KhanaDtlv' path@: a Datalevin database, driven through the @dtlv@ command
 --   (the executable at @path@; in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), or
 -- * @'KhanaDatalevinJvm' java jar@: the same Datalevin database (same @khana-dtlv/@ directory),
@@ -53,9 +53,9 @@ import           System.Directory (createDirectoryIfMissing)
 import           Hosigraph.Event
 import           Hosigraph.Khana.Dtlv
 import           Hosigraph.Khana.Sidecar (Sidecar, newSidecar, stopSidecar)
-import qualified Native.Query as Q
-import           Native.Engine
-import           Native.Types
+import qualified Takka.Query as Q
+import           Takka.Engine
+import           Takka.Types
 
 -- | Where the instant lives.
 data KhanaBackend

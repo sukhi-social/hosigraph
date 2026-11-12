@@ -1,6 +1,0 @@
--- Copy this file to cabal.project.local and give the paths of two packages:
---   native-bridge        the bridge (the directory that holds native-bridge.cabal)
---   the engine it wraps  (the directory that holds the engine's .cabal; native-bridge's README says which)
-packages:
-  /path/to/native-bridge
-  /path/to/the-engine

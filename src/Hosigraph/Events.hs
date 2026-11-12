@@ -48,7 +48,7 @@ import           Hosigraph.Chunk
 import           Hosigraph.Event
 import           Hosigraph.Id
 import           Hosigraph.Manifest
-import           Native.Types (Value(..))
+import           Takka.Types (Value(..))
 import           Hosigraph.Sync
 import           Hosigraph.Tail
 

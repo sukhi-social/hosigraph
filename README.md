@@ -46,25 +46,25 @@ After the MPHF (see "How the files are laid out") says "it is here", Probe asks 
 
 You need `ghc` (tested with 9.6.7), `gcc`, and the packages `aeson` and (for the tests) `QuickCheck`.
 
-**You must also say where two other packages are.** hosigraph does not guess:
-`native-bridge` (the shared types, EDN, and Datalog syntax) and the engine that `native-bridge` wraps.
+Everything is in this repository. [`takka/`](takka/README.md) is the Datalog engine that hosigraph uses
+(types, EDN, the Datalog syntax, and the in-process engine). cabal builds it together with hosigraph.
+Takka was called Hevin before; "takka" is Pali for reasoning and logic.
 
 ```sh
-cp cabal.project.local.example cabal.project.local   # then write the two paths in "packages:"
 cabal build all
-cabal run hosigraph-demo      # a walk-through that moves a clock from November to December
-cabal test                    # 41 tests; more with Datalevin (see below)
+cabal run hosigraph-demo                 # a walk-through that moves a clock from November to December
+cabal test hosigraph:spec takka:spec     # 41 + 76 tests; more with Datalevin (see below)
 ```
 
-Without the two paths, cabal says it cannot find `native-bridge`.
+(`cabal test` alone runs only hosigraph's tests.)
 
-Tested: GHC 9.6.7 with `cabal build all` and `cabal test`, on macOS (arm64). Linux is not tested.
+Tested: GHC 9.6.7 with `cabal build all` and both test suites, on macOS (arm64). Linux is not tested here;
+the GitHub Actions workflow ([`test.yml`](.github/workflows/test.yml)) runs it on ubuntu-24.04.
 
-> **`scripts/build-ghc.sh`** builds with plain `ghc` and `gcc`, for machines where cabal cannot reach Hackage.
-> It takes `BRIDGE_DIR` and `ENGINE_DIR` instead of `cabal.project.local`:
-> `BRIDGE_DIR=/path/to/native-bridge ENGINE_DIR=/path/to/the-engine scripts/build-ghc.sh app` (or `test`). It writes to `build/`.
+> **`scripts/build-ghc.sh`** builds with plain `ghc` and `gcc`, for machines where cabal cannot reach Hackage:
+> `scripts/build-ghc.sh app` (or `test`). It writes to `build/`. Plain `ghc` must be able to see `aeson` (and `QuickCheck` for the tests).
 > **It has not been run to the end yet.** An older version stopped at once because `$target` was never set; that is fixed,
-> but nobody has built the whole thing with it. Use cabal until then.
+> but on the Mac where this was tried, plain `ghc` could not see `aeson`. Use cabal until then.
 
 ### Run the tests against Datalevin
 
@@ -260,11 +260,11 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
   `history` takes the lock for a moment to see the manifest and the tail log in a stable state, so a seal in progress is not visible.
 * The MPHF is a minimal PTHash style (load factor about 89 %, about 4 keys for each bucket, 16-bit pilots).
   The choice between PtrHash, PTHash, and RecSplit is open.
-* `native-bridge` (a separate package) exports the types (`Value`, `Schema`, …), EDN, the Datalog syntax (`Native.Types`, `Native.Edn`, `Native.Query`),
-  and the engine interface (`Native.Engine`). hosigraph knows only this bridge.
-  There is no cabal flag to remove the engine: the types and the syntax come from the same package, so a flag would not remove the dependency.
+* `takka/` exports the types (`Value`, `Schema`, …), EDN, and the Datalog syntax (`Takka.Types`, `Takka.Edn`, `Takka.Query`, `Takka.Pull`).
+  The one place that knows the engine inside is `Takka.Engine`.
+  There is no cabal flag to remove the engine: hosigraph needs the types and the syntax even when the khana is Datalevin.
 * **About the name `KhanaDatalevinNative`.** It is the slot for the native core of Datalevin, which does not exist yet.
-  The engine in the slot today is a small Haskell engine on top of dlmdb, in a separate package. It is not Datalevin.
+  The engine in the slot today is takka (a small Haskell engine on top of dlmdb). It is not Datalevin.
   The tests use it as the oracle (the reference answer).
 * The license is **not set**.
 

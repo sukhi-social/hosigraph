@@ -62,9 +62,9 @@ import           Hosigraph.Id
 import           Hosigraph.Khana
 import           Hosigraph.Probe
 import           Hosigraph.Sync
-import           Native.Engine (Db)
-import           Native.Query (Input(..), Cell(..))
-import           Native.Types
+import           Takka.Engine (Db)
+import           Takka.Query (Input(..), Cell(..))
+import           Takka.Types
 
 -- ---------------------------------------------------------------------------
 -- Configuration and state

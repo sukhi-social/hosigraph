@@ -51,9 +51,10 @@ import           System.Exit (ExitCode)
 import           System.IO (hClose)
 import           System.Process
 
-import           Native.Edn
-import           Native.Query (Cell(..), FindShape(..), Input(..), Pulled(..), Query(..), parseQuery)
-import           Native.Types
+import           Takka.Edn
+import           Takka.Pull (Pulled(..))
+import           Takka.Query (Cell(..), FindShape(..), Input(..), Query(..), parseQuery)
+import           Takka.Types
 import           Hosigraph.Khana.Sidecar
 
 -- | Anything that went wrong while talking to @dtlv@ (including Datalevin refusing a transaction).
