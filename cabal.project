@@ -1,0 +1,6 @@
+packages: .
+
+-- The in-process engine behind KhanaDatalevinNative, and the words we share with it (types, EDN,
+-- Datalog syntax), come from the separate package native-bridge, and the engine it wraps.
+-- Their places are yours to say: copy cabal.project.local.example to cabal.project.local and put
+-- the paths in it.  Nothing here assumes where they live.
