@@ -2,7 +2,9 @@
 
 A small embedded database that **keeps the past as events**, and keeps **"now" as a copy you can throw away**.
 
-This is the **Phase 1 prototype** of the [design document v0.2.0-draft](docs/hosiDB-design-v0.2.0-draft.md).
+This is the **Phase 1 prototype** of the [design document v0.2.0-draft](docs/hosiDB-design-v0.2.0-draft.md),
+with the first half of **Phase 2** on top: the Binary Fuse filter and the "deep path" that reads a chunk by ranges (see "Phase 2 so far").
+**S3 itself is not here yet.**
 The project used to be called **hosiDB**, and the design document still uses that name. The code is in Haskell.
 
 ## The idea
@@ -16,7 +18,7 @@ The project used to be called **hosiDB**, and the design document still uses tha
   * **the past** → ask the events about one ID (`history`)
 
 ```
- write ──► events/tail.log ──seal──► events/chunks/c000001-create-2026-11/{chunk.hosi, mphf.idx}
+ write ──► events/tail.log ──seal──► events/chunks/c000001-create-2026-11/{chunk.hosi, mphf.idx, filter.bin}
                 │                                  │      (events/manifest lists the chunks)
                 └───────────── fold ───────────────┴──────────► khana/  (now, Datalog)
 ```
@@ -35,12 +37,15 @@ They also test a khana that is behind the events and a khana that is ahead of th
 | **Events** | The part that holds the truth: the tail log, the chunks, the manifest, and "find the events of one ID". The name is a placeholder (`Sky` was another candidate). |
 | **Probe** | The check for a point lookup. It is a pun: `Hosi` + `Khana` sounds like "hoshi kana", "is it a star?" |
 
+`historyTrace` asks the chunk's filter first (see "Phase 2 so far"); a chunk that the filter turns away is never opened.
 After the MPHF (see "How the files are laid out") says "it is here", Probe asks the slot twice. It answers one of four things:
 
 * `Star`: the key matches.
 * `LookAlike`: the fingerprint matches by chance, but the key is different.
-* `NotStar`: the fingerprint is different.
+* `NotStar`: the fingerprint is different. (On the deep path, with no MPHF: the id is outside every block's range.)
 * `EmptySky`: the slot is empty.
+
+On the deep path `LookAlike` also means "the id is inside a block's range, but that block does not have it".
 
 ## Get started
 
@@ -55,7 +60,7 @@ Takka was called Hevin before; "takka" is Pali for reasoning and logic.
 ```sh
 cabal build all
 cabal run hosigraph-demo                 # a walk-through that moves a clock from November to December
-cabal test                               # 13 tests that need no Datalevin; more with Datalevin (see below)
+cabal test                               # 30 tests that need no Datalevin; more with Datalevin (see below)
 ```
 
 Tested: GHC 9.6.7 with `cabal build all`, on macOS (arm64). Linux is not tested here;
@@ -77,10 +82,10 @@ HOSIGRAPH_DATALEVIN_JAR=/path/to/datalevin-1.2.10-standalone.jar HOSIGRAPH_JAVA=
 
 | You give | Tests that run |
 |---|---|
-| nothing | 13 (events, chunks, tail log, the EDN writer) |
-| `dtlv` | 46 |
-| the JVM | 47 |
-| `dtlv` and the JVM | more (including: write with the JVM and read with `dtlv`, and the reverse) |
+| nothing | 30 (events, chunks, filters, the deep path, tail log, the EDN writer) |
+| `dtlv` | not counted again since Phase 2 (it was 46) |
+| the JVM | not counted again since Phase 2 (it was 47) |
+| `dtlv` and the JVM | all 100 (including: write with the JVM and read with `dtlv`, and the reverse) |
 
 The same scenarios run on `dtlv` and on the JVM. The tests choose the khana themselves.
 
@@ -118,7 +123,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `writeMany` | Many batches with one append, one fsync, and one khana transaction. |
 | `getEntity`, `query`, `queryCells` | Read **now**. |
 | `getEntities`, `queryMany`, `queryCellsMany` | Read **now**, many questions at once. |
-| `history`, `historyTrace` | Read **the past**: every event of one ID, from the chunks and the tail log. `historyTrace` also shows which chunks it skipped and what each probe answered. |
+| `history`, `historyTrace` | Read **the past**: every event of one ID, from the chunks and the tail log. `historyTrace` also shows which chunks it skipped (by the zone map, and by the filter) and what each probe answered. |
 | `seal` | Turn the tail log into chunks. `HosiConfig` can also seal by itself, by size or by age. |
 | `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events.** An empty list means all good. |
 | `rebuildKhana` | Throw the khana away and fold the events again. |
@@ -220,12 +225,13 @@ macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmar
 | Word in the design document | Form here |
 |---|---|
 | Tail log | `events/tail.log`. One `write` is one record (length + CRC32). If a record is cut, hosigraph keeps what is before the cut and removes the rest. |
-| Hot chunk | `chunk.hosi` and `mphf.idx` in `events/chunks/<name>/`. One chunk for each kind and (creation) month. Nobody changes it. |
+| Hot chunk | `chunk.hosi`, `mphf.idx` and `filter.bin` in `events/chunks/<name>/`. One chunk for each kind and (creation) month. Nobody changes it. A chunk from before Phase 2 has no `filter.bin` and is still read. |
 | ID | `(milliseconds since 2026-01-01) << 21 \| sequence number` (63 bits). The ID alone tells you the month. |
 | MPHF | A *minimal perfect hash*: it gives each known key its own slot, with no collisions. This one is PTHash-style and written for this project (`Hosigraph.Mphf`). Each slot has a 32-bit fingerprint and the position of the body, which `Probe` checks. |
 | Manifest | `events/manifest`. Line 1 is JSON. Line 2 is `sha256:`. hosigraph writes a tmp file and replaces the manifest by a rename. A chunk that is not in the manifest is outside the world; hosigraph cleans it at open. |
 | Core material | `khana/` or `khana-dtlv/` (`Hosigraph.Khana`). Create becomes `Add`, Delete becomes `Retract`. The folded position (`folded-seq`) is in the same transaction. |
 | Update | None. For an attribute with cardinality one, a newer Create wins. |
+| Binary Fuse filter | `filter.bin`: a 3-wise Binary Fuse filter with 16-bit prints over the entity ids of the chunk, written for this project (`Hosigraph.BinaryFuse`, after Graf and Lemire 2022). "Certainly not" is always right; "maybe" is wrong about 1 time in 65,536 for an id that is not there. |
 | Zone map | The manifest keeps the month, the ID range, and the seq range of each chunk. `historyTrace` shows how many chunks it skipped. |
 
 The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-seq`) keep `hosi`.
@@ -242,9 +248,51 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
 | After the manifest swap, before the tail log is emptied | hosigraph ignores records with a sealed seq. Nothing is doubled. |
 | While it wrote `manifest.tmp` | hosigraph removes the tmp file. The old world stays. |
 
+## Phase 2 so far
+
+The design document says Phase 2 is "S3 and the deep path. Zone maps, Binary Fuse filters, Range GET."
+and "A question about the past skips the chunks that it does not need to read."
+The zone map was already here. This is what was added, and what is still missing.
+
+**The order of the gates.** `history` (and `historyTrace`) asks each chunk the cheapest question first:
+
+1. the zone map in the manifest (month, ID range): no file is touched;
+2. the chunk's filter, `filter.bin`: one small file, read once and kept in memory;
+3. only for a "maybe": open the chunk reader;
+4. the MPHF slot, its fingerprint, and the key check.
+
+`LookupTrace` has a new field, `ltSkippedByFilter`. A chunk that the filter turns away is **never opened**
+(a test checks that `xsReadersOpen` stays 0). `verify` also checks that the filter never says no to an ID that is in the chunk.
+
+**The deep path.** A reader now takes a `ChunkSource` (`Hosigraph.Chunk`): "give me these bytes of this file",
+"give me this small file whole", "how big is `chunk.hosi`". `localSource` answers from a directory.
+An S3 bucket would answer the first one with Range GET. If the source has no `mphf.idx`, the reader does not need it:
+it binary-searches the footer's block table (first and last ID of each block) and reads **one block**.
+Measured on one made-up chunk of 4,000 IDs (256 events a block), counting the bytes the reader asks for:
+
+| | bytes |
+|---|---|
+| `chunk.hosi` | 40,428 |
+| `mphf.idx` | 52,036 |
+| `filter.bin` | 11,296 (about 22 bits an ID; with 50,000 IDs a test sees 19 to 20 bits, and the paper's formula goes toward 18 for very many) |
+| open a chunk: 4 ranges (start, header, trailer, footer) | 645 |
+| one lookup, no `mphf.idx`: 1 range | 1,604 to 2,564 |
+
+The tests count the ranges too: opening takes 4 and less than a quarter of the file; one present ID takes one range and less than a tenth of the file;
+an ID past the last block takes none. The MPHF way and the block way give the same answers (a property test, for both chunk versions).
+`mphf.idx` is bigger than the data here (about 13 bytes an ID). On the deep path a chunk could do without it.
+
+**Still missing.**
+
+* **S3.** There is no S3 `ChunkSource`, no upload, and no manifest tier for a chunk that lives far away. `Events` only builds local sources.
+  The object store to build against is **RustFS** (decided). How hosigraph talks to it is not chosen yet. The package has no C and no HTTP or TLS stack,
+  so the candidates are a `curl` subprocess (`--aws-sigv4`, `-r` for ranges) or our own signing over an HTTP library. The plan is in [`TODO.md`](TODO.md).
+* The filters are kept in memory with no limit, outside `hcReaderCacheBytes` (about 2.3 to 2.8 bytes an ID). A bucket with millions of chunks needs a limit.
+* Nothing writes a chunk without `mphf.idx` yet; the deep path is reached only by a source that does not have the file (the tests make one).
+
 ## Not in Phase 1
 
-* Phase 2 and later: S3, deep paths, Binary Fuse filters (planned as the first gate of `Probe`), Range GET, freezing (cold chunks),
+* Phase 2 (the rest) and later: S3 and Range GET over a real network, freezing (cold chunks),
   Erase and invalidation records, garbage collection, metrics and capacity forecasts, anonymous metrics.
 * Not done yet, though they belong to Phase 1: compression of chunk values,
   JSON-LD import (Phase 0 decides this part), and a dictionary for IRIs from outside the ID space.

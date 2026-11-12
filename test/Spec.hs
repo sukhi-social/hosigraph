@@ -27,6 +27,7 @@ import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
 import           Hosigraph
 import           Hosigraph.Bin
+import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
 import           Takka.Edn (Edn(..), readEdn)
 import           Takka.Syntax (Pulled(..))
@@ -178,6 +179,49 @@ pureTests =
           mp = buildMphf ks
       checkEq "bijection" (50000 :: Int) (S.size (S.fromList (map (mphfSlot mp) ks))))
 
+  , ("binary fuse: every key it was built from is a member (QuickCheck); a key given twice counts once", prop 300 $
+      forAll (resize 400 (listOf arbitrary)) $ \(ks :: [Word64]) ->
+        let f = buildBinaryFuse (ks ++ ks)
+        in conjoin [ counterexample ("lost " ++ show k) (bfMember f k) | k <- ks ]
+             .&&. bfKeys f === S.size (S.fromList ks))
+  , ("binary fuse: survives serialization; the empty filter says no to everything", do
+      r <- quickCheckWithResult stdArgs { maxSuccess = 100, chatty = False } $
+        forAll (resize 300 (listOf arbitrary)) $ \(ks :: [Word64]) (probes :: [Word64]) ->
+          let f = buildBinaryFuse ks
+          in case runGet getBinaryFuse (build (putBinaryFuse f)) 0 of
+               Left e   -> counterexample e False
+               Right f' -> map (bfMember f) (ks ++ probes) === map (bfMember f') (ks ++ probes)
+      unless (isSuccess r) (throwIO (userError (output r)))
+      let none = buildBinaryFuse []
+      check "empty: no" (not (any (bfMember none) [0, 1, 12345, maxBound]))
+      check "empty: round trip" (either (const False) (not . flip bfMember 7) (runGet getBinaryFuse (build (putBinaryFuse none)) 0)))
+  , ("binary fuse: 50,000 ids like real ones: none lost, about 1 stranger in 65,536 let through, about 19-20 bits a key", do
+      let ks = [ fromIntegral (makeId (5 + m) s) | m <- [0 .. 49], s <- [0 .. 999] ] :: [Word64]
+          f  = buildBinaryFuse ks
+          -- strangers: ids of other months (the same shape), and a million made-up 64-bit numbers
+          sameShape = [ fromIntegral (makeId (60 + m) s) | m <- [0 .. 49], s <- [0 .. 999] ] :: [Word64]
+          random64  = [ mix64 (i + 0x1234567) | i <- [0 .. 999999] ]
+          fp1 = length (filter (bfMember f) sameShape)
+          fp2 = length (filter (bfMember f) random64)
+      checkEq "none lost" True (all (bfMember f) ks)
+      -- expected 0.8 and 15; the limits are many standard deviations away, and the keys are fixed, so this never flickers
+      check ("same-shape strangers let through: " ++ show fp1) (fp1 <= 10)
+      check ("random strangers let through: " ++ show fp2) (fp2 <= 60)
+      let bitsPerKey = fromIntegral (bfBytes f * 8) / 50000 :: Double
+      check ("bits per key: " ++ show bitsPerKey) (bitsPerKey < 21))
+  , ("binary fuse: small sets of every size from 1 to 40 build, and lose nothing", do
+      forM_ [1 .. 40 :: Int] $ \n -> do
+        let ks = [ mix64 (fromIntegral i) | i <- [1 .. n] ]
+            f  = buildBinaryFuse ks
+        check ("n = " ++ show n) (all (bfMember f) ks))
+  , ("binary fuse: a cut or odd file is an error, not a filter", do
+      let good = build (putBinaryFuse (buildBinaryFuse [mix64 i | i <- [1 .. 100]]))
+          bad  = [ ("cut short", B.take (B.length good - 1) good)
+                 , ("segment length not a power of two", B.concat [B.take 12 good, be32 12, B.drop 16 good])
+                 , ("no segments for keys", B.concat [B.take 16 good, be32 0, B.drop 20 good]) ]
+      forM_ bad $ \(what, bs) ->
+        check what (either (const True) (const False) (runGet getBinaryFuse bs 0)))
+
   , ("probe (星かな？): a stranger is turned away by the fingerprint without reading anything", do
       reads_ <- newIORef (0 :: Int)
       let slotBody r = modifyIORef' reads_ (+ 1) >> pure r :: IO (Maybe String)
@@ -214,6 +258,123 @@ pureTests =
       B.writeFile (cdir </> chunkDataFile) (B.take 20 bs)          -- cut short
       r <- try (openChunkReader cdir)
       check "expected Corrupt" (case r of Left (Corrupt _) -> True; _ -> False))
+  , ("chunk: the filter lets every id in; a stranger is never taken for a star, with the filter or without it", withTmp $ \dir -> do
+      let ids      = [ makeId (5 + m) s | m <- [0 .. 19], s <- [0 .. 99] ]            -- 2,000 ids of the real shape
+          strangers = [ makeId (40 + m) s | m <- [0 .. 19], s <- [0 .. 999] ]        -- 20,000 ids of other months
+          cdir     = dir </> "c"
+      _ <- writeChunk cdir 64 KCreate (2026, 1) [ E.Event q KCreate i "a" (VInt 1) | (q, i) <- zip [1 ..] ids ]
+      cr   <- openChunkReader cdir
+      filt <- readChunkFilter cdir (length ids)
+      check "there is a filter" (not (null filt))
+      check "every id passes the filter" (all (filterMayHave filt) ids)
+      checkEq "and finds its star" True . and =<< forM ids (\i -> (\o -> case o of Star _ -> True; _ -> False) <$> lookupInChunk cr i)
+      let letThrough = length (filter (filterMayHave filt) strangers)
+      check ("strangers let through by the filter: " ++ show letThrough ++ " of 20,000 (about 0.3 expected)") (letThrough <= 5)
+      -- 'lookupInChunk' does not look at the filter: the MPHF fingerprint alone must also keep strangers out
+      stars <- length . filter (\o -> case o of Star _ -> True; _ -> False) <$> mapM (lookupInChunk cr) strangers
+      checkEq "no stranger is a star" 0 stars)
+  , ("chunk: a chunk without filter.bin (an older one) still answers; a cut or foreign filter is Corrupt", withTmp $ \dir -> do
+      let evs n  = [ E.Event q KCreate (makeId 5 (fromIntegral q)) "a" (VInt 1) | q <- [1 .. n] ]
+          cdir   = dir </> "c"
+          corrupt' what act = do
+            r <- try act
+            check what (case r of Left (Corrupt _) -> True; Right _ -> False; Left _ -> False)
+      _ <- writeChunk cdir 4 KCreate (2026, 1) (evs 20)
+      removeFile (cdir </> chunkFilterFile)
+      filt <- readChunkFilter cdir 20
+      check "no filter file: no filter" (null filt)
+      check "so it may have anything" (filterMayHave filt (makeId 77 7))
+      cr <- openChunkReader cdir
+      o <- lookupInChunk cr (makeId 5 3)
+      check "and the lookup still finds a real id" (case o of Star _ -> True; _ -> False)
+      -- a cut filter
+      _ <- writeChunk cdir 4 KCreate (2026, 1) (evs 20)
+      fb <- B.readFile (cdir </> chunkFilterFile)
+      B.writeFile (cdir </> chunkFilterFile) (B.take (B.length fb - 1) fb)
+      corrupt' "a cut filter is Corrupt" (readChunkFilter cdir 20)
+      -- the filter of a chunk with another number of ids
+      _ <- writeChunk (dir </> "d") 4 KCreate (2026, 1) (evs 30)
+      copyFile (dir </> "d" </> chunkFilterFile) (cdir </> chunkFilterFile)
+      corrupt' "another chunk's filter is Corrupt" (readChunkFilter cdir 20))
+
+  , ("deep path: with no MPHF index, the footer's block table gives the same answers as the MPHF (QuickCheck, versions 1 and 2)", prop 60 $
+      forAll genEvents $ \evs -> monadicIO $ do
+        ok <- run $ withTmp $ \dir -> do
+          rs <- forM [1, 2] $ \v -> do
+            let cdir = dir </> show v
+            _ <- writeChunkVersion v cdir 7 KCreate (2026, 11) evs
+            fast <- openChunkReader cdir
+            deep <- openChunkReaderWith (withoutMphf (localSource cdir))
+            let want = M.fromListWith (flip (++)) [ (evId e, [e]) | e <- sortOn (\e -> (evId e, evAttr e, evSeq e)) evs ]
+            -- every id from before the first to after the last: present ones, and absent ones inside and outside the ranges
+            same <- forM [90 .. 130] $ \i -> do
+              a <- lookupInChunk fast i
+              b <- lookupInChunk deep i
+              pure (case (M.lookup i want, a, b) of
+                      (Just es, Star x, Star y) -> x == es && y == es
+                      (Nothing, x, y)           -> not (isStar x) && not (isStar y)
+                      _                         -> False)
+            back <- readChunkEvents deep
+            pure (and same && back == concat (M.elems want))
+          pure (and rs)
+        assert ok)
+  , ("deep path: opening reads four ranges; a lookup reads one block, or nothing when the footer already says no", withTmp $ \dir -> do
+      let ids = [ makeId 5 (2 * s) | s <- [0 .. 1999] ]                           -- even seq numbers only
+          inside   = [ makeId 5 (2 * s + 1) | s <- [0 .. 1998] ]                  -- odd ones: inside the ranges, not in the chunk
+          outside  = [ makeId 6 s | s <- [0 .. 99] ]                              -- past the last block
+          cdir = dir </> "c"
+      _ <- writeChunk cdir 64 KCreate (2026, 1) [ E.Event (fromIntegral q) KCreate i "a" (VInt (fromIntegral q)) | (q, i) <- zip [1 :: Int ..] ids ]
+      size <- fromIntegral . B.length <$> B.readFile (cdir </> chunkDataFile)
+      calls <- newIORef (0 :: Int); bytes <- newIORef (0 :: Int)
+      let counted = (withoutMphf (localSource cdir))
+            { csRange = \f off len -> do
+                b <- csRange (localSource cdir) f off len
+                modifyIORef' calls (+ 1) >> modifyIORef' bytes (+ B.length b)
+                pure b }
+          measure act = do
+            c0 <- readIORef calls; b0 <- readIORef bytes
+            r <- act
+            c1 <- readIORef calls; b1 <- readIORef bytes
+            pure (r, c1 - c0, b1 - b0)
+      (cr, openCalls, openBytes) <- measure (openChunkReaderWith counted)
+      checkEq "open: fixed part, header, trailer, footer" 4 openCalls
+      check ("open reads far less than the chunk (" ++ show openBytes ++ " of " ++ show size ++ ")") (openBytes * 4 < size)
+      -- every present id: one range, one block (a small part of the file), and the right answer
+      forM_ (take 200 (cycle' 17 ids)) $ \i -> do
+        (o, c, b) <- measure (lookupInChunk cr i)
+        checkEq "one range" 1 c
+        check ("one block is a small part of the chunk (" ++ show b ++ " of " ++ show size ++ ")") (b * 10 < size)
+        check "found" (isStar o)
+      -- inside the ranges but not in the chunk: the block is read for nothing, and the answer says so
+      (o1, c1, _) <- measure (lookupInChunk cr (inside !! 500))
+      checkEq "looked like a star: one range" (LookAlike, 1) (o1, c1)
+      -- past the last block: the footer's table has already answered
+      forM_ outside $ \i -> do
+        (o, c, b) <- measure (lookupInChunk cr i)
+        checkEq "nothing read" (NotStar, 0, 0) (o, c, b))
+  , ("deep path: a chunk the filter turns away is never opened", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+      ev <- Ev.openEvents cfg dir
+      let write1 n = do
+            r <- Ev.withEventsLock ev (Ev.record ev [Create (Tmp 1) "a" (Lit (VInt n))])
+            Ev.withEventsLock ev (Ev.commit ev r)
+            pure (Ev.rcTemps r M.! 1)
+      a <- write1 1
+      writeIORef clk (nov11 + 3600000)
+      _ <- write1 2
+      _ <- Ev.seal ev
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents cfg dir                                       -- nothing is open yet
+      let ghost = makeId (idMs a + 1800000) 0                            -- inside the chunk's id range, never written
+      (es, tr) <- Ev.historyTrace ev2 ghost
+      checkEq "nothing found" [] es
+      checkEq "turned away by the filter, with no reader opened" (1, 0) . (\s -> (Ev.ltSkippedByFilter tr, Ev.xsReadersOpen s)) =<< Ev.eventsStats ev2
+      (esA, trA) <- Ev.historyTrace ev2 a
+      checkEq "a real id passes the filter" 0 (Ev.ltSkippedByFilter trA)
+      checkEq "and its chunk is opened only now" 1 . Ev.xsReadersOpen =<< Ev.eventsStats ev2
+      check "and it finds the event" (length esA == 1)
+      Ev.closeEvents ev2)
 
   , ("chunk: the value dictionary loses nothing; versions 1 and 2 read back the same (QuickCheck)", prop 60 $
       forAll genRepetitiveEvents $ \evs -> monadicIO $ do
@@ -490,12 +651,13 @@ hosiTests be =
         checkEq "C: both Nov chunks skipped by month" 2 (ltSkippedByMonth tc)
         (_, tb) <- historyTrace h b
         checkEq "B: month of its id" (2026, 11) (ltMonth tb)
-        -- an id inside chunk 1's range that was never written: turned away by the fingerprint
+        -- an id inside chunk 1's range that was never written: the zone map cannot tell, the filter can
         let ghost = makeId (idMs a + 1800000) 0
         check "ghost id is inside chunk 1's range" (ghost > a && ghost < a2)
         (eg, tg) <- historyTrace h ghost
         checkEq "no events" [] eg
-        checkEq "fingerprint rejects (the body was not read)" [NotStar] (map snd (ltProbed tg)))
+        checkEq "the filter turned the chunk away (no MPHF question)" (1, []) (ltSkippedByFilter tg, map snd (ltProbed tg))
+        checkEq "and a real id passes the filter" 0 (ltSkippedByFilter ta))
 
   , ("a rejected write leaves no trace, in the log or in numbering", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
@@ -1065,6 +1227,20 @@ genValue = oneof
   , VStr . T.pack <$> listOf (elements ("abc é日本 \n\0" :: String))
   , VBool <$> arbitrary
   , (VKw . Keyword . T.pack) <$> listOf1 (elements ("abc/:" :: String)) ]
+
+-- | A chunk source that has no @mphf.idx@ (as a chunk far away, whose index we do not hold).
+withoutMphf :: ChunkSource -> ChunkSource
+withoutMphf src = src { csWhole = \f -> if f == chunkMphfFile then pure Nothing else csWhole src f }
+
+isStar :: Probe a -> Bool
+isStar (Star _) = True
+isStar _        = False
+
+-- | Every @k@th element, as many times round as needed (a spread of ids to look up).
+cycle' :: Int -> [a] -> [a]
+cycle' k xs = case drop (k - 1) xs of
+  []      -> []
+  (y : _) -> y : cycle' k (drop k xs)
 
 genEvents :: Gen [E.Event]
 genEvents = do

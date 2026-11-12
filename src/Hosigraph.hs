@@ -19,7 +19,7 @@
 -- * "Hosigraph.Khana": 刹那 (setsuna), the instant "now" they add up to, kept in a Datalevin
 --   database.  It is derived: it can be thrown away and folded again at any time.
 --
--- > write ──► events/tail.log ──seal──► events/chunks/<name>/{chunk.hosi, mphf.idx}
+-- > write ──► events/tail.log ──seal──► events/chunks/<name>/{chunk.hosi, mphf.idx, filter.bin}
 -- >                 │                              │          (events/manifest lists the chunks)
 -- >                 └──────────── fold ────────────┴───────► khana/  ("now", Datalog)
 module Hosigraph
