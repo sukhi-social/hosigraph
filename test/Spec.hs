@@ -215,6 +215,87 @@ pureTests =
       r <- try (openChunkReader cdir)
       check "expected Corrupt" (case r of Left (Corrupt _) -> True; _ -> False))
 
+  , ("chunk: the value dictionary loses nothing; versions 1 and 2 read back the same (QuickCheck)", prop 60 $
+      forAll genRepetitiveEvents $ \evs -> monadicIO $ do
+        ok <- run $ withTmp $ \dir -> do
+          let want = sortOn (\e -> (evId e, evAttr e, evSeq e)) evs
+              same v = do
+                _ <- writeChunkVersion v (dir </> show v) 7 KCreate (2026, 11) evs
+                cr <- openChunkReader (dir </> show v)
+                back <- readChunkEvents cr
+                -- the sign of zero is part of the value: (==) cannot see it, so look at the bits
+                let bits = map (\e -> case evVal e of VDouble d -> Just (isNegativeZero d); _ -> Nothing)
+                found <- forM (S.toList (S.fromList (map evId evs))) $ \i -> do
+                  o <- lookupInChunk cr i
+                  pure (case o of Star es -> es == [ e | e <- want, evId e == i ] && bits es == bits [ e | e <- want, evId e == i ]; _ -> False)
+                pure (back == want && bits back == bits want && and found)
+          rs <- mapM same [1, 2]
+          pure (and rs)
+        assert ok)
+  , ("chunk: the dictionary makes a chunk with repeated values smaller, by exactly what it saves", withTmp $ \dir -> do
+      let sizeOf v name evs = do
+            _ <- writeChunkVersion v (dir </> name) 50 KCreate (2026, 11) evs
+            B.length <$> B.readFile (dir </> name </> chunkDataFile)
+          kw t = VKw (Keyword t)
+          repeated = [ E.Event s KCreate (fromIntegral s) "type" (kw "http://schema.org/Person") | s <- [1 .. 200] ]
+          -- the same length (24 characters) but every one different, so nothing goes in the dictionary
+          varied   = [ E.Event s KCreate (fromIntegral s) "type" (kw ("http://schema.org/P" <> T.justifyRight 5 '0' (T.pack (show s)))) | s <- [1 .. 200] ]
+          distinct = [ E.Event s KCreate (fromIntegral s) "n" (VInt (fromIntegral s * 1000003)) | s <- [1 .. 200] ]
+      rep2 <- sizeOf 2 "rep2" repeated; var2 <- sizeOf 2 "var2" varied
+      -- the keyword is 1 (tag) + 1 (length) + 24 (text) = 26 bytes; a reference is 2 (tag, number 0).
+      -- Each of the 200 saves 26 - 2, and the header pays for the entry once (26)
+      checkEq "repeated values: exactly the bytes the references save" (200 * (26 - 2) - 26) (var2 - rep2)
+      -- and version 2 spells numbers short: it must be clearly smaller than version 1 on all of them
+      forM_ [("repeated", repeated), ("varied", varied), ("distinct", distinct)] $ \(name, evs) -> do
+        a <- sizeOf 1 ("a" ++ name) evs; b <- sizeOf 2 ("b" ++ name) evs
+        check ("version 2 is smaller than version 1 on " ++ name ++ " (" ++ show b ++ " < " ++ show a ++ ")") (b < a))
+  , ("chunk: version 2 reads back the extremes: edge numbers, huge seqs, ids far apart, empty and long text", withTmp $ \dir -> do
+      let ints = [minBound, minBound + 1, -65, -64, -1, 0, 1, 63, 64, 8191, 8192, maxBound - 1, maxBound]
+          ev s i a v = E.Event s KCreate i a v
+          evs = [ ev (fromIntegral n) (5 + fromIntegral n) "n" (VInt x) | (n, x) <- zip [1 :: Int ..] ints ]
+             ++ [ ev maxBound (maxBound - 1) "s" (VStr "") , ev (maxBound - 1) (maxBound - 1) "s" (VStr (T.replicate 3000 "長い文字列 "))
+                , ev 2 1 "k" (VKw (Keyword "")), ev 3 1 "d" (VDouble (-0.0)), ev 4 1 "d" (VDouble (1 / 0)), ev 5 1 "b" (VBool True) ]
+      _ <- writeChunk (dir </> "c") 4 KCreate (2026, 11) evs
+      cr <- openChunkReader (dir </> "c")
+      back <- readChunkEvents cr
+      checkEq "every event comes back" (sortOn (\e -> (evId e, evAttr e, evSeq e)) evs) back
+      found <- forM (S.toList (S.fromList (map evId evs))) $ \i -> (\o -> o == Star [ e | e <- back, evId e == i ]) <$> lookupInChunk cr i
+      check "and every id finds its run" (and found))
+  , ("varint: any number round-trips in at most 10 bytes; zigzag round-trips (QuickCheck)", prop 500 $
+      forAll (frequency [(3, arbitrary), (1, elements [0, 127, 128, 16383, 16384, maxBound, maxBound - 1])]) $ \(w :: Word64) ->
+        let bs = build (putVar w)
+        in B.length bs <= 10 .&&. runGet getVar bs 0 === Right w
+           .&&. runGet (unzigzag <$> getVar) (build (putVar (zigzag (fromIntegral w)))) 0 === Right (fromIntegral w))
+  , ("varint: a number that does not fit in 64 bits, or is cut short, is an error", do
+      check "11 bytes" (either (const True) (const False) (runGet getVar (B.replicate 10 0xff <> B.pack [0x01]) 0))
+      check "the 10th byte holds more than 1 bit" (either (const True) (const False) (runGet getVar (B.replicate 9 0xff <> B.pack [0x02]) 0))
+      check "cut short" (either (const True) (const False) (runGet getVar (B.pack [0x80, 0x80]) 0))
+      checkEq "the largest number is fine" (Right maxBound) (runGet getVar (build (putVar maxBound)) 0))
+  , ("chunk: 0.0 and -0.0 are two values in the dictionary, and a few repeats are not worth an entry", withTmp $ \dir -> do
+      let cdir = dir </> "c"
+          zeros = [ E.Event s KCreate 7 "z" (VDouble (if even s then 0.0 else -0.0)) | s <- [1 .. 40] ]
+      _ <- writeChunk cdir 8 KCreate (2026, 11) zeros
+      back <- readChunkEvents =<< openChunkReader cdir
+      checkEq "the signs come back as they went" [ even s | s <- [1 .. 40 :: Int] ]
+        [ case evVal e of VDouble d -> not (isNegativeZero d); _ -> False | e <- back ]
+      -- a 3-byte value seen 6 times: 6 * (3 - 4) < 3 → not worth it, so no entry
+      _ <- writeChunk (dir </> "few") 8 KCreate (2026, 11) [ E.Event s KCreate 7 "z" (VStr "a") | s <- [1 .. 6] ]
+      bs <- B.readFile (dir </> "few" </> chunkDataFile)
+      check "no dictionary reference was written" (not (B.pack [5, 0] `B.isInfixOf` bs)))
+  , ("chunk: a dictionary number that points nowhere is reported, not misread", withTmp $ \dir -> do
+      -- (the reference "dictionary entry 0" is the bytes below; we look in the body only, not the header)
+      forM_ [(2, B.pack [5, 0], B.pack [5, 9])] $ \(v, ref, broken) -> do
+        let cdir = dir </> show v
+        _ <- writeChunkVersion v cdir 8 KCreate (2026, 11) [ E.Event s KCreate (fromIntegral s) "t" (VStr "a long enough string") | s <- [1 .. 20] ]
+        bs <- B.readFile (cdir </> chunkDataFile)
+        let bodyAt = fromIntegral (B.foldl' (\a b -> a * 256 + fromIntegral b) (0 :: Word64) (B.take 8 (B.drop 18 bs)))
+            (before, from) = B.breakSubstring ref (B.drop bodyAt bs)
+        check ("version " ++ show v ++ ": a reference is there to break") (not (B.null from))
+        B.writeFile (cdir </> chunkDataFile) (B.take bodyAt bs <> before <> broken <> B.drop (B.length ref) from)
+        cr <- openChunkReader cdir
+        r <- try (readChunkEvents cr)
+        check ("version " ++ show v ++ ": expected Corrupt") (case r of Left (Corrupt _) -> True; _ -> False))
+
   , ("tail: batches round-trip; a torn last record is noticed and cut", withTmp $ \dir -> do
       tl <- openTail dir False
       let b1 = [ E.Event 1 KCreate 10 "a" (VStr "x"), E.Event 2 KCreate 10 "b" (VInt 2) ]
@@ -274,6 +355,34 @@ hosiTests be =
       checkEq "history after reopen" [VInt 1, VInt 2] (map evVal es)
       checkEq "last seq" 2 =<< Ev.lastSeq ev2
       Ev.closeEvents ev2)
+
+  , ("events alone: the chunk reader cache keeps within its limit and still answers", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      -- three seals = three chunks, each with one entity
+      let fill ev = forM [1 .. 3 :: Int] $ \n -> do
+            r <- Ev.withEventsLock ev (Ev.record ev [Create (Tmp 1) "a" (Lit (VInt (fromIntegral n)))])
+            Ev.withEventsLock ev (Ev.commit ev r)
+            _ <- Ev.seal ev
+            pure (Ev.rcTemps r M.! 1, VInt (fromIntegral n))
+          askAll ev ids = forM_ ids $ \(i, v) -> do
+            es <- Ev.history ev i
+            checkEq "the history is right" [v] (map evVal es)
+      ev0 <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      ids <- fill ev0
+      Ev.closeEvents ev0
+      -- room for everything: all three readers stay open
+      evBig <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      askAll evBig ids
+      sBig <- Ev.eventsStats evBig
+      checkEq "three chunks, three readers" 3 (Ev.xsReadersOpen sBig)
+      Ev.closeEvents evBig
+      -- no room: the newest reader is kept, the others are let go, and every answer is the same
+      evTiny <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock, Ev.ecReaderCacheBytes = 0 } dir
+      askAll evTiny (ids ++ reverse ids)
+      sTiny <- Ev.eventsStats evTiny
+      checkEq "one reader is always kept" 1 (Ev.xsReadersOpen sTiny)
+      check "and its bytes are counted" (Ev.xsReaderBytes sTiny > 0)
+      Ev.closeEvents evTiny)
 
   , ("write, read now, seal, reopen: the same answers", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
@@ -964,6 +1073,23 @@ genEvents = do
     i <- choose (100, 118)                           -- few distinct ids, so runs have several events
     a <- elements ["name", "age", "tag", "x/y"]
     v <- genValue
+    pure (E.Event (fromIntegral (s :: Int)) KCreate i a v)
+
+-- | Events whose values come from a small pool, so that a chunk's dictionary has something to do
+-- (long strings, keywords, a few numbers, and the two zeros).
+genRepetitiveEvents :: Gen [E.Event]
+genRepetitiveEvents = do
+  pool <- resize 6 $ listOf1 (frequency
+    [ (3, VStr . T.pack <$> vectorOf 12 (elements ("abcde" :: String)))
+    , (2, VKw . Keyword . T.pack <$> vectorOf 9 (elements ("xyz/" :: String)))
+    , (1, VInt <$> arbitrary)
+    , (1, elements [VDouble 0.0, VDouble (-0.0), VDouble 1.5])
+    , (1, VBool <$> arbitrary) ])
+  n <- choose (1, 80)
+  forM [1 .. n] $ \s -> do
+    i <- choose (100, 112)
+    a <- elements ["name", "type", "x/y"]
+    v <- elements pool
     pure (E.Event (fromIntegral (s :: Int)) KCreate i a v)
 
 copyDir :: FilePath -> FilePath -> IO ()

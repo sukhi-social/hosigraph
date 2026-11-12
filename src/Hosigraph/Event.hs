@@ -4,7 +4,7 @@
 module Hosigraph.Event
   ( HosiId, Kind(..), kindName, kindFromName
   , Event(..), Ref(..), Val(..), Op(..)
-  , putValue, getValue, putEvent, getEvent
+  , putValue, getValue, getValueBody, putEvent, getEvent
   , HosiError(..)
   ) where
 
@@ -77,8 +77,12 @@ putValue v = case v of
   VKw (Keyword t) -> putU8 4 <> putText t
 
 getValue :: Get Value
-getValue = do
-  tag <- getU8
+getValue = getU8 >>= getValueBody
+
+-- | The rest of a value, once its tag byte has been read.  (A chunk adds one tag of its own,
+-- a reference into its dictionary; it reads the tag itself and hands the others to this.)
+getValueBody :: Word8 -> Get Value
+getValueBody tag =
   case tag of
     0 -> VInt . fromIntegral <$> getU64
     1 -> VDouble . castWord64ToDouble <$> getU64
