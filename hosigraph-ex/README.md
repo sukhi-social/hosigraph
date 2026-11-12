@@ -10,14 +10,32 @@ connection numbers the requests and gives each answer to its caller. Bodies are 
 Hosi.stop(db)
 ```
 
-## Build and test
+## Getting libhosi
 
-Needs Elixir/OTP, a C compiler, and `libhosi` (`cabal build hosigraph-abi:hosi`). `mix` looks for
-the library in this repository's `dist-newstyle`; otherwise say where:
+`mix compile` puts the NIF and `libhosi` into `priv/` one of two ways (`support/hosi_build.ex`):
 
-```sh
-HOSI_LIB_DIR=/dir/with/libhosi HOSI_INCLUDE_DIR=/dir/with/hosi.h mix test
-```
+* **Prebuilt** (the default on a machine with no source): it downloads the bundle for this machine
+  (`aarch64-darwin`, `x86_64-linux`, `aarch64-linux`; OTP 26 or newer; Linux needs glibc 2.39 or newer,
+  as the bundle is built on Ubuntu 24.04) from the GitHub release `hosi-ex-vX.Y.Z`, checks its sha256 against
+  `checksum.txt` in this package, and unpacks it. No Haskell, no C compiler. A checkout with no
+  `checksum.txt` entry for its version does not download anything.
+* **From source**: needs a C compiler and `libhosi` (`cabal build hosigraph-abi:flib:hosi`). It is used
+  when `libhosi` is found in this repository's `dist-newstyle`, or at `HOSI_LIB_DIR`:
+
+  ```sh
+  HOSI_LIB_DIR=/dir/with/libhosi HOSI_INCLUDE_DIR=/dir/with/hosi.h mix test
+  ```
+
+`HOSI_BUILD=source|precompiled|none` says which (none: use `priv/` as it is);
+`HOSI_PRECOMPILED_URL` points at a mirror of the release's files.
+
+## Releasing (the prebuilt bundles)
+
+1. Set `@version` in `mix.exs`; tag `hosi-ex-vX.Y.Z`; push the tag.
+2. Workflow `precompile-hosi-ex` builds a bundle on each machine, runs the Elixir tests on it with the
+   source tree out of reach, and puts the tarballs and `checksum.txt` on the release.
+3. Commit that `checksum.txt` into `hosigraph-ex/` and use that commit (or publish to Hex).
+   A tag cannot hold its own checksums, so the commit that is used comes after the tag.
 
 The tests use a connection with no database (`open: %{}`): ping, abi, the error kinds, many callers
 at once, stop and kill. **Not tried here:** a real database (`:dir`), which needs `dtlv` or the
@@ -29,5 +47,6 @@ Datalevin jar.
   is "when the process is ending"). Connections are closed by `Hosi.stop/1` or when their process ends.
 * Keywords become atoms (schema names are the user's own, and few). `##NaN` etc. read as `{:float, :nan}`.
 * `hosi_cancel` is in the NIF but not offered in `Hosi`: the ids are the connection's own.
-* On Linux and for a shipped package, `libhosi` must be found at run time (rpath is set to `HOSI_LIB_DIR`).
-  Bundling it is undecided.
+* A bundle is big (about 75 MB unpacked, 16 MB packed on macOS): `hosigraph` depends on `aeson`, which brings
+  its own dependencies along as shared libraries.
+* The Linux bundles have not run yet (the workflow is their first run); the macOS one has, by hand.

@@ -1,0 +1,148 @@
+# Prebuilt libhosi + NIF for the Elixir package (hosigraph-ex/), one tarball per machine.
+#
+# A tag `hosi-ex-vX.Y.Z` builds them and puts them, with checksum.txt, on the GitHub release of
+# that tag.  Then commit checksum.txt into hosigraph-ex/ (it is what `mix` checks a download
+# against) and use that commit (or publish it to Hex).  See hosigraph-ex/README.md.
+#
+# Each bundle has hosi_nif.so (built with the oldest NIF API we support, OTP 26) and libhosi with
+# every library it needs but the system's, all looking for each other next to themselves.
+# A bundle is tried before it is shipped: it is unpacked where the source tree cannot help, and
+# the Elixir tests run on it.
+name: precompile-hosi-ex
+
+on:
+  push:
+    tags:
+      - "hosi-ex-v*"
+  workflow_dispatch:   # builds and tries the bundles; releases nothing
+
+permissions:
+  contents: read
+
+env:
+  GHC_VERSION: "9.10.3"
+  CABAL_VERSION: "3.14.2.0"
+  OTP_VERSION: "26.2"      # the oldest NIF API we ship for (2.17); newer OTP loads it
+  ELIXIR_VERSION: "1.15.8"
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-darwin }
+          - { os: ubuntu-24.04,     target: x86_64-linux }
+          - { os: ubuntu-24.04-arm, target: aarch64-linux }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version (the tag must say what mix.exs says)
+        id: v
+        shell: bash
+        run: |
+          version=$(sed -n 's/^  @version "\(.*\)"$/\1/p' hosigraph-ex/mix.exs)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "hosi-ex-v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} but hosigraph-ex/mix.exs says ${version}" >&2; exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "asset=hosi-nif-v${version}-nif2.17-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-bundle-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
+          restore-keys: |
+            cabal-bundle-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: patchelf
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Build libhosi
+        run: |
+          cabal update
+          cabal build hosigraph-abi:flib:hosi
+
+      - name: Bundle libhosi and what it needs, build the NIF next to it
+        shell: bash
+        run: |
+          lib=$(find dist-newstyle -type f \( -name 'libhosi.so*' -o -name 'libhosi.dylib' \) | head -n 1)
+          echo "library: $lib"
+          mkdir -p hosigraph-ex/priv
+          hosigraph-ex/scripts/bundle-libhosi.sh "$lib" "$PWD/hosigraph-ex/priv"
+          cd hosigraph-ex
+          HOSI_BUILD=source HOSI_LIB_DIR="$PWD/priv" HOSI_INCLUDE_DIR="$PWD/../hosigraph-abi/gen/include" \
+            mix compile
+          tar -czf "../${{ steps.v.outputs.asset }}" -C priv .
+
+      # Try what will be shipped, where nothing of the build can be found: the source tree is put
+      # aside, and the bundle is unpacked into a copy of the package that has no priv/.
+      - name: Try the bundle
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/try"
+          cp -R hosigraph-ex/mix.exs hosigraph-ex/c_src hosigraph-ex/support hosigraph-ex/lib hosigraph-ex/test "$RUNNER_TEMP/try/"
+          mkdir "$RUNNER_TEMP/try/priv"
+          tar -xzf "${{ steps.v.outputs.asset }}" -C "$RUNNER_TEMP/try/priv"
+          mv dist-newstyle dist-newstyle.aside
+          cd "$RUNNER_TEMP/try"
+          HOSI_BUILD=none mix test
+          mv "$GITHUB_WORKSPACE/dist-newstyle.aside" "$GITHUB_WORKSPACE/dist-newstyle"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null; then sum=$(sha256sum "${{ steps.v.outputs.asset }}"); else sum=$(shasum -a 256 "${{ steps.v.outputs.asset }}"); fi
+          # "<sha256>  <file>": the line mix looks for in checksum.txt
+          echo "${sum%% *}  ${{ steps.v.outputs.asset }}" > "${{ steps.v.outputs.asset }}.sha256"
+          cat "${{ steps.v.outputs.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            ${{ steps.v.outputs.asset }}
+            ${{ steps.v.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: bundle
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: bundle-*
+          merge-multiple: true
+
+      - name: checksum.txt
+        run: cat out/*.sha256 | sort -k2 > out/checksum.txt && cat out/checksum.txt
+
+      - name: Put them on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes "Prebuilt libhosi and NIF for the Elixir package. Commit checksum.txt into hosigraph-ex/ before using this tag; see hosigraph-ex/README.md."
+          gh release upload "$GITHUB_REF_NAME" out/*.tar.gz out/checksum.txt --clobber
