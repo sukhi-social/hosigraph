@@ -16,7 +16,7 @@ defmodule Hosi.Build do
   @repo "https://github.com/sukhi-social/hosigraph"
   # The bundles are built with the oldest NIF API we support; a newer OTP loads them.
   @nif_min "2.17.0"
-  @targets ~w(aarch64-darwin x86_64-linux aarch64-linux)
+  @targets ~w(aarch64-darwin x86_64-linux aarch64-linux x86_64-musl aarch64-musl)
 
   def run(version, root) do
     priv = Path.join(root, "priv")

@@ -15,8 +15,8 @@ Hosi.stop(db)
 `mix compile` puts the NIF and `libhosi` into `priv/` one of two ways (`support/hosi_build.ex`):
 
 * **Prebuilt** (the default on a machine with no source): it downloads the bundle for this machine
-  (`aarch64-darwin`, `x86_64-linux`, `aarch64-linux`; OTP 26 or newer; Linux needs glibc 2.39 or newer,
-  as the bundle is built on Ubuntu 24.04) from the GitHub release `hosi-ex-vX.Y.Z`, checks its sha256 against
+  (`aarch64-darwin`, `x86_64-linux`, `aarch64-linux`, and for Alpine `x86_64-musl`, `aarch64-musl`; OTP 26
+  or newer; the glibc ones need glibc 2.39 or newer, as they are built on Ubuntu 24.04) from the GitHub release `hosi-ex-vX.Y.Z`, checks its sha256 against
   `checksum.txt` in this package, and unpacks it. No Haskell, no C compiler. A checkout with no
   `checksum.txt` entry for its version does not download anything.
 * **From source**: needs a C compiler and `libhosi` (`cabal build hosigraph-abi:flib:hosi`). It is used
@@ -49,4 +49,6 @@ Datalevin jar.
 * `hosi_cancel` is in the NIF but not offered in `Hosi`: the ids are the connection's own.
 * A bundle is big (about 75 MB unpacked, 16 MB packed on macOS): `hosigraph` depends on `aeson`, which brings
   its own dependencies along as shared libraries.
-* The Linux bundles have not run yet (the workflow is their first run); the macOS one has, by hand.
+* The Linux bundles, glibc and musl, have not run yet (the workflow is their first run); the macOS one has, by hand.
+  The musl ones are built inside `alpine:3.20` by `scripts/ci-musl-bundle.sh`, with the Alpine GHC that ghcup picks
+  (dynamically linked, so that it can make a shared library; not yet seen to do so).
