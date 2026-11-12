@@ -11,6 +11,7 @@ description:
 category:           Database
 license:            BlueOak-1.0.0
 license-file:       LICENSE
+copyright:          2026 Sukhi Contributors
 build-type:         Simple
 extra-source-files:
   gen/include/hosi.h

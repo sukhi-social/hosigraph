@@ -14,6 +14,7 @@ description:
 category:           Development
 license:            BlueOak-1.0.0
 license-file:       LICENSE
+copyright:          2026 Sukhi Contributors
 build-type:         Simple
 tested-with:        GHC == 9.10.3
 extra-doc-files:
