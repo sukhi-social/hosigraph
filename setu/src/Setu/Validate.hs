@@ -55,6 +55,14 @@ validateAt base ty0 e0 = go (reverse base) ty0 e0
         | k `elem` ns     -> ok
         | otherwise       -> bad rp ("expected one of " <> kws ns <> ", got :" <> k)
       (TMap fs, EMap ps)  -> goMap rp fs ps
+      (TDict t, EMap ps)  -> do
+        keys <- keywordKeys rp ps
+        mapM_ (\(k, v) -> go (PKey k : rp) t v) (zip keys (map snd ps))
+      (TUnion ts, _)
+        | any (`accepts` e) ts -> ok
+        -- the alternative that is of the value's own kind is the one it was meant for: say what is wrong with it
+        | (t : _) <- filter (`shallow` e) ts -> go rp t e
+        | otherwise       -> bad rp ("expected " <> tyName ty <> ", got " <> describe e)
       (TTag vs, EVec (EKw tag : args)) -> case [v | v <- vs, variantTag v == tag] of
         []      -> bad rp ("unknown tag :" <> tag <> ", expected one of " <> kws (map variantTag vs))
         (v : _)
@@ -64,13 +72,17 @@ validateAt base ty0 e0 = go (reverse base) ty0 e0
           | otherwise -> mapM_ (\(i, t, a) -> go (PIdx i : rp) t a) (zip3 [1 ..] (variantArgs v) args)
       _                   -> bad rp ("expected " <> tyName ty <> ", got " <> describe e)
 
-    goMap rp fs ps = do
+    -- the keys of a map, which must be keywords and must not repeat
+    keywordKeys rp ps = do
       keys <- mapM (\(k, _) -> case k of
                        EKw n -> Right n
                        _     -> bad rp ("map keys must be keywords, got " <> describe k)) ps
       case firstDup keys of
         Just k  -> bad (PKey k : rp) ("key :" <> k <> " is given twice")
-        Nothing -> Right ()
+        Nothing -> Right keys
+
+    goMap rp fs ps = do
+      keys <- keywordKeys rp ps
       case [k | k <- keys, k `notElem` map fieldName fs] of
         (k : _) -> bad (PKey k : rp) ("unknown key :" <> k <> ", expected " <> kws (map fieldName fs))
         []      -> Right ()
@@ -86,6 +98,25 @@ validateAt base ty0 e0 = go (reverse base) ty0 e0
 -- | Is this value of this shape?
 accepts :: Ty -> Edn -> Bool
 accepts ty e = either (const False) (const True) (validate ty e)
+
+-- | Is this value of the same kind as the shape asks for, looking no deeper than the first level?
+shallow :: Ty -> Edn -> Bool
+shallow ty e = case (ty, e) of
+  (TAny, _)          -> True
+  (TNil, ENil)       -> True
+  (TBool, EBool _)   -> True
+  (TInt, EInt _)     -> True
+  (TDouble, EFloat _) -> True
+  (TStr, EStr _)     -> True
+  (TKw, EKw _)       -> True
+  (TVec _, EVec _)   -> True
+  (TMap _, EMap _)   -> True
+  (TDict _, EMap _)  -> True
+  (TOpt t, _)        -> e == ENil || shallow t e
+  (TUnion ts, _)     -> any (`shallow` e) ts
+  (TEnum _, EKw _)   -> True
+  (TTag _, EVec _)   -> True
+  _                  -> False
 
 firstDup :: [Text] -> Maybe Text
 firstDup = go S.empty
@@ -107,7 +138,9 @@ tyName ty = case ty of
   TAny    -> "anything"
   TVec _  -> "vector"
   TMap _  -> "map"
+  TDict _ -> "map"
   TOpt t  -> tyName t <> " or nil"
+  TUnion ts -> T.intercalate " or " (map tyName ts)
   TEnum ns -> "one of " <> kws ns
   TTag _  -> "a tagged vector like [:tag ...]"
 

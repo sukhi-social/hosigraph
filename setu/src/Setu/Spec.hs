@@ -57,7 +57,9 @@ data Ty
   | TAny                    -- ^ any EDN; the library does not look inside
   | TVec Ty                 -- ^ a vector whose every element has this shape
   | TMap [Field]            -- ^ a map whose keys are keywords
+  | TDict Ty                -- ^ a map whose keys are any keywords, each value of this shape (attribute names, say)
   | TOpt Ty                 -- ^ @nil@, or this shape
+  | TUnion [Ty]             -- ^ any one of these shapes (at least two)
   | TEnum [Text]            -- ^ one of these keywords
   | TTag [Variant]          -- ^ a tagged vector: @[:tag arg ...]@
   deriving (Eq, Show)
@@ -120,7 +122,11 @@ okName t = case T.uncons t of
 tyProblems :: Text -> Ty -> [Text]
 tyProblems where_ ty = case ty of
   TVec t     -> tyProblems (where_ <> ", element") t
+  TDict t    -> tyProblems (where_ <> ", value") t
   TOpt t     -> tyProblems (where_ <> ", optional") t
+  TUnion ts  ->
+    [ where_ <> ": a union needs at least two shapes" | length ts < 2 ]
+    ++ concat [ tyProblems (where_ <> ", alternative " <> T.pack (show i)) t | (i, t) <- zip [1 :: Int ..] ts ]
   TMap fs    ->
     [ where_ <> ": field name " <> shown n <> " is not a kebab-case keyword name" | n <- map fieldName fs, not (okName n) ]
     ++ [ where_ <> ": field " <> shown n <> " is given twice" | n <- dups (map fieldName fs) ]

@@ -67,34 +67,43 @@ cDecls api = T.intercalate "\n"
       ] ++ statusLines ++
       [ "} " <> p <> "_status;" ]
   , T.unlines
-      [ "/* Called exactly once for each submit that returned 0, on a thread of the library."
-      , "   Keep it short: no blocking, no exception, no longjmp. buf is valid only during the call. */"
+      [ "/* Called exactly once for each submit that returned 0, on a thread of the library, never on"
+      , "   the thread that called submit, cancel or close. Keep it short: no blocking, no exception,"
+      , "   no longjmp, and do not call close from it. buf is valid only during the call (NULL when n is 0). */"
       , "typedef void (*" <> p <> "_done)(" <> p <> "_id id, " <> p <> "_status st,"
       , indentTo ("typedef void (*" <> p <> "_done)(") <> "const uint8_t *buf, size_t n, void *ud);"
       ]
   , T.unlines
-      [ "/* Once per process. 0 on success. A second start after a shutdown is refused (non-zero). */"
+      [ "/* Once per process. 0 on success (also when it is already running). A start after a shutdown is"
+      , "   refused (-EPERM). Starts the Haskell runtime without taking over the process's signals. */"
       , "int  " <> p <> "_runtime_init(void);"
-      , "void " <> p <> "_runtime_shutdown(void);   /* only when the process is ending */"
+      , "/* Only when the process is ending: closes every connection, then stops the runtime."
+      , "   Calls that start after it are refused. */"
+      , "void " <> p <> "_runtime_shutdown(void);"
       ]
   , T.unlines
-      [ "/* Returns a handle at once; getting ready goes on in the background. */"
+      [ "/* Returns a handle at once; getting ready goes on in the background. uri is UTF-8 text and"
+      , "   what it means is the library's to say. NULL opts means the defaults. A failure to get ready"
+      , "   is reported to every request that waited for it. NULL if the runtime is not running. */"
       , pad openRet (p <> "_conn *") <> p <> "_open(const char *uri, const " <> p <> "_opts *opts);"
-      , "/* Every request still waiting is answered with CLOSED. */"
+      , "/* Every request still waiting is answered with CLOSED. Returns after every callback has returned,"
+      , "   so what ud points to may be freed after it. */"
       , pad openRet "void" <> p <> "_close(" <> p <> "_conn *c);"
       ]
   , T.unlines
       [ "/* Returns 0 if the request is accepted; then done is called exactly once."
-      , "   Otherwise done is never called: the id is already in use (EINVAL) or too many"
-      , "   requests are waiting (EBUSY). The body is UTF-8 EDN and the ABI does not read it."
-      , "   Requests start in the order of submit and may finish in any order. */"
+      , "   Otherwise done is never called, and the result is a negative errno: -EINVAL (the id is already"
+      , "   in use, or c is not an open connection), -EBUSY (too many requests are waiting), -EPIPE (the"
+      , "   connection or the runtime is closed). The body is UTF-8 EDN and the ABI does not read it;"
+      , "   it is copied before submit returns. Requests start in the order of submit and may finish"
+      , "   in any order. */"
       , "int " <> p <> "_submit(" <> p <> "_conn *c, " <> p <> "_id id,"
       , indentTo ("int " <> p <> "_submit(") <> "const uint8_t *req, size_t n,"
       , indentTo ("int " <> p <> "_submit(") <> p <> "_done cb, void *ud);"
       ]
   , T.unlines
       [ "/* May be called any number of times (idempotent). If the cancel and the finish meet,"
-      , "   exactly one of them is reported. */"
+      , "   exactly one of them is reported. Returns 0, or -EINVAL if c is not an open connection. */"
       , "int " <> p <> "_cancel(" <> p <> "_conn *c, " <> p <> "_id id);"
       ]
   , T.unlines

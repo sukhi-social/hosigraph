@@ -21,7 +21,7 @@
 module Setu.Dispatch
   ( Failure(..), Handler
   , Dispatch, newDispatch, dispatchApi
-  , runRequest
+  , runRequest, failureReply
   ) where
 
 import           Control.Exception hiding (Handler)
@@ -74,6 +74,10 @@ newDispatch api hs
           ])
       ]
 
+-- | A failure as the status and the body an answer carries.
+failureReply :: Failure -> (Status, ByteString)
+failureReply (Failure st kind msg) = (st, encodeReply (ReplyErr kind msg))
+
 -- | One request, one answer.  Never throws (an exception thrown /to/ the thread excepted).
 runRequest :: Dispatch -> ByteString -> IO (Status, ByteString)
 runRequest d body = case decodeRequest body of
@@ -90,7 +94,7 @@ runRequest d body = case decodeRequest body of
             Left e  -> broke "bad-result" ("the handler of :" <> name <> " gave a result of the wrong shape: " <> renderTyError e)
           Right (Left (Failure st kind msg))
             | st == StOk -> pure (broke "bad-failure" ("the handler of :" <> name <> " failed with the status ok"))
-            | otherwise  -> pure (st, encodeReply (ReplyErr kind msg))
+            | otherwise  -> pure (failureReply (Failure st kind msg))
           Left (e :: SomeException)
             | isKill e -> throwIO e
             | Just (ie :: IOException) <- fromException e ->

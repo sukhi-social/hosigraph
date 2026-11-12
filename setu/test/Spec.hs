@@ -20,6 +20,7 @@ import           System.Process (readProcessWithExitCode)
 import           Test.QuickCheck
 
 import           Takka.Edn (Edn(..), readEdn)
+import           AbiTests
 import           DispatchTests
 import           Harness
 import           TicketTests
@@ -42,7 +43,7 @@ main = do
   when (failed > 0) exitFailure
 
 tests :: [Test]
-tests = specTests ++ validateTests ++ wireTests ++ headerTests ++ ticketTests ++ dispatchTests
+tests = specTests ++ validateTests ++ wireTests ++ headerTests ++ ticketTests ++ dispatchTests ++ abiTests
 
 -- ---------------------------------------------------------------------------
 -- Fixtures: two APIs.  dtlv is the second customer (the requirements' section 6.1 is its header).
@@ -101,6 +102,9 @@ specTests =
       refuses "empty enum" "at least one name" (one (TEnum []))
       refuses "enum twice" "enum name \"a\" is given twice" (one (TEnum ["a", "a"]))
       refuses "empty tag" "at least one tag" (one (TTag []))
+      refuses "lonely union" "a union needs at least two shapes" (one (TUnion [TInt]))
+      refuses "inside a dict" "operation \"x\", args, value: an enum needs" (one (TDict (TEnum [])))
+      refuses "inside a union" "alternative 2: an enum needs" (one (TUnion [TInt, TEnum []]))
       refuses "nested" "operation \"x\", args, field \"v\", element: an enum needs" (one (TMap [Field "v" (TVec (TEnum []))]))
       refuses "bad field name" "field name \"Bad\"" (one (TMap [Field "Bad" TInt])))
   ]
@@ -153,6 +157,19 @@ validateCases =
   , ("map, key twice", m1, edn "{:a 1 :a 1}", Just "at [:a]: key :a is given twice")
   , ("map, key that is not a keyword", m1, edn "{\"a\" 1}", Just "map keys must be keywords, got string")
   , ("map, not a map", m1, edn "[1]", Just "expected map, got vector")
+  , ("dict", TDict TInt, edn "{:a 1 :b/c 2}", Nothing)
+  , ("dict, empty", TDict TInt, edn "{}", Nothing)
+  , ("dict, wrong value", TDict TInt, edn "{:a 1 :b \"x\"}", Just "at [:b]: expected integer, got string")
+  , ("dict, key twice", TDict TInt, edn "{:a 1 :a 2}", Just "at [:a]: key :a is given twice")
+  , ("dict, key that is not a keyword", TDict TInt, edn "{1 1}", Just "map keys must be keywords, got integer")
+  , ("dict, not a map", TDict TInt, edn "[1]", Just "expected map, got vector")
+  , ("union, first", un, edn "1", Nothing)
+  , ("union, second", un, edn "\"s\"", Nothing)
+  , ("union, third", un, edn "[:tmp 3]", Nothing)
+  , ("union, none, says all of them", un, edn ":k", Just "expected integer or string or a tagged vector like [:tag ...], got keyword")
+  , ("union, the one of the value's own kind says what is wrong", un, edn "[:tmp \"x\"]", Just "at [1]: expected integer, got string")
+  , ("union, a tag that is not offered", un, edn "[:other 1]", Just "unknown tag :other, expected one of :tmp")
+  , ("union with optional", TUnion [TOpt TInt, TStr], ENil, Nothing)
   , ("tag", tg, edn "[:create 1 \"a\"]", Nothing)
   , ("tag without arguments to spare", tg, edn "[:delete 1]", Nothing)
   , ("tag, unknown", tg, edn "[:nope]", Just "unknown tag :nope, expected one of :create :delete")
@@ -170,6 +187,7 @@ validateCases =
     m1 = TMap [Field "a" TInt]
     m2 = TMap [Field "a" TInt, Field "b" TStr]
     tg = TTag [Variant "create" [TInt, TStr], Variant "delete" [TInt]]
+    un = TUnion [TInt, TStr, TTag [Variant "tmp" [TInt]]]
     deepTy = TMap [Field "args" (TMap [Field "ops" (TVec tg)])]
 
 validateTests :: [Test]
@@ -389,6 +407,8 @@ genTy d
       [ (4, genTy 0)
       , (1, TVec <$> genTy (d - 1))
       , (1, TOpt <$> genTy (d - 1))
+      , (1, TDict <$> genTy (d - 1))
+      , (1, do n <- choose (2, 3); TUnion <$> vectorOf n (genTy (d - 1)))
       , (2, TMap <$> genFieldsTy (d - 1))
       , (1, TEnum <$> genNames 1 4)
       , (1, TTag <$> genVariants (d - 1))
@@ -418,6 +438,11 @@ genEdnFor ty = case ty of
   TAny    -> genEdnAny 2
   TVec t  -> EVec <$> vectorOf' 4 (genEdnFor t)
   TOpt t  -> oneof [pure ENil, genEdnFor t]
+  TDict t -> do
+    ns <- genNames 0 3
+    ps <- forM ns $ \n -> (,) (EKw n) <$> genEdnFor t
+    EMap <$> shuffle ps
+  TUnion ts -> oneof (map genEdnFor ts)
   TEnum ns -> EKw <$> elements ns
   TMap fs -> do
     ps <- fmap concat $ forM fs $ \f -> do
@@ -445,6 +470,7 @@ badFor :: Ty -> Maybe Edn
 badFor ty = case ty of
   TAny    -> Nothing
   TOpt t  -> badFor t
+  TUnion _ -> Nothing                                  -- which value is wrong for all of them depends on all of them; see the table
   TNil    -> Just (EBool True)
   TStr    -> Just (EInt 0)
   TEnum _ -> Just (EKw "not-one-of-the-names-zzz-0")   -- genName makes at most 7 characters
