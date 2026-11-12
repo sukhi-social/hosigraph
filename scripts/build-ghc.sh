@@ -7,6 +7,7 @@
 #   (both need BRIDGE_DIR=/path/to/native-bridge and ENGINE_DIR=/path/to/the-engine)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+target="${1:-app}"
 # native-bridge and the engine it wraps are separate packages and live wherever you keep them: say where.
 bridge="${BRIDGE_DIR:-}"; engine="${ENGINE_DIR:-}"
 if [ ! -f "$bridge/src/Native/Engine.hs" ] || [ ! -f "$engine/cbits/dlmdb/mdb.c" ]; then
