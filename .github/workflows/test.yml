@@ -1,0 +1,100 @@
+# The tests, on every change.
+#
+# The khana is Datalevin on a resident JVM: the standalone jar, checked against a pinned sha256.
+# The native `dtlv` is not used here, so the tests that need it print that they skipped them
+# (see "Run the tests against Datalevin" in the README).
+#
+# hosigraph needs two other packages that are not inside this repository:
+#   native-bridge   the shared types, EDN and Datalog syntax
+#   hevin           the in-process engine that native-bridge wraps
+# They are checked out beside the code and handed to cabal through cabal.project.local,
+# the same way the README says to do it by hand.
+# If they are private, put a token that can read them in the secret DEPS_TOKEN.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHC_VERSION: "9.6.7"
+  CABAL_VERSION: "3.10.3.0"
+  DATALEVIN_VERSION: "1.2.10"
+  # sha256 of datalevin-1.2.10-standalone.jar, from the release page of datalevin/datalevin
+  DATALEVIN_JAR_SHA256: "0e8aba6d4022e63e9b34eafc39e257d1efa8ec2a920f089836c459e987605513"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out native-bridge
+        uses: actions/checkout@v4
+        with:
+          repository: sukhi-social/native-bridge
+          path: deps/native-bridge
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+
+      - name: Check out hevin
+        uses: actions/checkout@v4
+        with:
+          repository: sukhi-social/hevin
+          path: deps/hevin
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+
+      - name: Tell cabal where the two packages are
+        run: |
+          cat > cabal.project.local <<EOF
+          packages:
+            $GITHUB_WORKSPACE/deps/native-bridge
+            $GITHUB_WORKSPACE/deps/hevin
+          EOF
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'deps/*/*.cabal') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Fetch the Datalevin jar
+        run: |
+          jar="$RUNNER_TEMP/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          curl -fsSL -o "$jar" \
+            "https://github.com/datalevin/datalevin/releases/download/${DATALEVIN_VERSION}/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          echo "${DATALEVIN_JAR_SHA256}  ${jar}" | sha256sum -c -
+          echo "HOSIGRAPH_DATALEVIN_JAR=${jar}" >> "$GITHUB_ENV"
+          echo "HOSIGRAPH_JAVA=${JAVA_HOME}/bin/java" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cabal update
+          cabal build all --enable-tests
+
+      - name: Test
+        run: cabal test --test-show-details=direct
