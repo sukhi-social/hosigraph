@@ -1,15 +1,9 @@
 # The tests, on every change.
 #
-# The khana is Datalevin on a resident JVM: the standalone jar, checked against a pinned sha256.
-# The native `dtlv` is not used here, so the tests that need it print that they skipped them
-# (see "Run the tests against Datalevin" in the README).
-#
-# hosigraph needs two other packages that are not inside this repository:
-#   native-bridge   the shared types, EDN and Datalog syntax
-#   hevin           the in-process engine that native-bridge wraps
-# They are checked out beside the code and handed to cabal through cabal.project.local,
-# the same way the README says to do it by hand.
-# If they are private, put a token that can read them in the secret DEPS_TOKEN.
+# Two suites: takka (the Datalog engine in takka/) and hosigraph itself.
+# For hosigraph, the khana is also tried on Datalevin in a resident JVM: the standalone jar,
+# checked against a pinned sha256. The native `dtlv` is not used here, so the tests that need it
+# print that they skipped them (see "Run the tests against Datalevin" in the README).
 name: test
 
 on:
@@ -40,28 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check out native-bridge
-        uses: actions/checkout@v4
-        with:
-          repository: sukhi-social/native-bridge
-          path: deps/native-bridge
-          token: ${{ secrets.DEPS_TOKEN || github.token }}
-
-      - name: Check out hevin
-        uses: actions/checkout@v4
-        with:
-          repository: sukhi-social/hevin
-          path: deps/hevin
-          token: ${{ secrets.DEPS_TOKEN || github.token }}
-
-      - name: Tell cabal where the two packages are
-        run: |
-          cat > cabal.project.local <<EOF
-          packages:
-            $GITHUB_WORKSPACE/deps/native-bridge
-            $GITHUB_WORKSPACE/deps/hevin
-          EOF
-
       - uses: haskell-actions/setup@v2
         id: setup
         with:
@@ -73,7 +45,7 @@ jobs:
           path: |
             ${{ steps.setup.outputs.cabal-store }}
             dist-newstyle
-          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'deps/*/*.cabal') }}
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal') }}
           restore-keys: |
             cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
 
@@ -96,5 +68,6 @@ jobs:
           cabal update
           cabal build all --enable-tests
 
+      # "cabal test" alone runs only the package in the current directory, so name both suites.
       - name: Test
-        run: cabal test --test-show-details=direct
+        run: cabal test hosigraph:spec takka:spec --test-show-details=direct
