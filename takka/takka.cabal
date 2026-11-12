@@ -1,0 +1,83 @@
+cabal-version:      2.4
+name:               takka
+version:            0.1.0.0
+synopsis:           A Datalog database for Haskell on dlmdb (Datalevin's LMDB fork)
+description:
+  Takka is a small, embeddable, durable Datalog database written in Haskell.
+  It stores EAV/AVE triples in dlmdb (vendored C sources, no system LMDB needed),
+  speaks an EDN dialect of Datalog (patterns, predicates, aggregates, negation,
+  recursive rules), plans joins from counted-B+tree statistics, and can import
+  and export a practical subset of JSON-LD.
+category:           Database
+build-type:         Simple
+extra-source-files:
+  README.md
+  docs/*.md
+  docs/repro/*.c
+  bench/FuzzDlmdb.hs
+  cbits/dlmdb/*.h
+  cbits/dlmdb/LICENSE
+  cbits/dlmdb/COPYRIGHT
+  cbits/dlmdb/VENDORED_FROM.txt
+
+common shared
+  default-language: Haskell2010
+  ghc-options:      -Wall -Wno-name-shadowing
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:
+    Takka
+    Takka.Types
+    Takka.Codec
+    Takka.Native
+    Takka.KV
+    Takka.Edn
+    Takka.Store
+    Takka.Query
+    Takka.TxEdn
+    Takka.Pull
+    Takka.JsonLD
+    Takka.Engine
+  build-depends:
+      base        >=4.14 && <5
+    , aeson       >=2.0  && <2.3
+    , bytestring  >=0.10 && <0.13
+    , containers  >=0.6  && <0.8
+    , directory   >=1.3  && <1.4
+    , scientific  >=0.3  && <0.4
+    , text        >=1.2  && <2.2
+    , vector      >=0.12 && <0.14
+  c-sources:
+    cbits/dlmdb/mdb.c
+    cbits/dlmdb/midl.c
+  include-dirs:     cbits/dlmdb
+  cc-options:       -pthread -fPIC -w
+  ld-options:       -pthread
+
+executable takka-demo
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:
+      base, takka, aeson, bytestring, containers, directory, text
+  ghc-options:      -threaded -rtsopts
+
+executable takka-bench
+  import:           shared
+  hs-source-dirs:   bench
+  main-is:          Bench.hs
+  build-depends:
+      base, takka, containers, directory, text
+  ghc-options:      -threaded -rtsopts
+
+test-suite spec
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Spec.hs
+  build-depends:
+      base, takka, QuickCheck >=2.14, aeson, bytestring, containers
+    , directory, filepath, text, unix
+  ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4"
