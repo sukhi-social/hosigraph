@@ -2,7 +2,7 @@
 #
 # hosigraph, with its khana on Datalevin in a resident JVM: the standalone jar, checked against a
 # pinned sha256. The native `dtlv` is not used here, so the tests that need it print that they
-# skipped them (see "Run the tests against Datalevin" in the README).
+# skipped them (see "Run the tests against Datalevin" in docs/guide.md).
 # takka/ (the words hosigraph shares with Datalevin) is built along with it.
 #
 # setu/ (writes the doors other languages use) and hosigraph-abi/ (hosigraph behind a C ABI) are

@@ -1149,7 +1149,7 @@ nativeTests exe =
       checkEq "verify" [] =<< verify h2
       closeHosi h2)
 
-  , ("canary: (max ?x) / (min ?x) in :find do not work through `dtlv exec` 1.2.10 (if this fails, it was fixed upstream: update the README)", withTmp $ \dir -> do
+  , ("canary: (max ?x) / (min ?x) in :find do not work through `dtlv exec` 1.2.10 (if this fails, it was fixed upstream: update docs/guide.md)", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       withHosiCfg ((backendCfg (KhanaDtlv exe)) { hcClock = clock }) dir $ \h -> do
         _ <- person h "Frege" 70

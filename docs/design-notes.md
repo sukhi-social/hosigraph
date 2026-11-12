@@ -2,7 +2,7 @@
 
 > About names: the design document calls the "now" part the "core material" (芯材). In hosigraph, it is the **khana** (刹那, "a moment" = now).
 > The part that groups the tail log, the chunks, and the manifest is called **Events**.
-> In these notes, "core material" means the khana (see "About the names" in the README).
+> In these notes, "core material" means the khana (see "What the names mean" in docs/guide.md).
 
 These notes list the open points of the Phase 1 prototype of the [design document v0.2.0-draft](hosiDB-design-v0.2.0-draft.md).
 Each note says what the prototype does and asks what the design document wants.
