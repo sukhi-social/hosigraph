@@ -23,7 +23,8 @@ import           Hosigraph.Abi.Codec
 import           Setu.Codec (ToEdn(..))
 import           Setu.Dispatch (Failure(..), Handler)
 import           Setu.Ticket (Status(..))
-import           Takka.Edn (Edn(..))
+import           Takka.Edn (Edn(..), readEdn)
+import           Takka.Syntax (parseQuery)
 import           Takka.Types (TakkaError(..))
 
 -- | The functions of "Hosigraph" that the operations use, without the 'Hosi' they work on.
@@ -68,8 +69,8 @@ handlers b =
   , ("write-many",       run decBatches  (bWriteMany b)      (EVec . map encWriteResult))
   , ("seal",             run none        (const (bSeal b))   toEdn)
   , ("get-entities",     run decIds      (bGetEntities b)    toEdn)
-  , ("query-many",       run decQueries  (bQueryMany b)      toEdn)
-  , ("query-cells-many", run decQueries  (bQueryCellsMany b) toEdn)
+  , ("query-many",       run decQueries  (\qs -> readable qs >> bQueryMany b qs)      toEdn)
+  , ("query-cells-many", run decQueries  (\qs -> readable qs >> bQueryCellsMany b qs) toEdn)
   , ("history",          run decId       (bHistory b)        toEdn)
   , ("history-trace",    run decId       (bHistoryTrace b)   encTrace)
   , ("verify",           run none        (const (bVerify b)) toEdn)
@@ -77,6 +78,17 @@ handlers b =
   , ("rebuild-khana",    run none        (const (bRebuildKhana b)) (const ENil))
   ]
   where none _ = Right ()
+
+-- | A query whose text takka cannot read is the caller's mistake, and is refused here (@parse-error@),
+-- before any backend is asked. The real backend refuses it too, but with a 'Hosigraph.Khana.Dtlv.DtlvError',
+-- a bare string that cannot be told from a backend that has failed (a JVM that died); left to it, a
+-- caller's broken query would be answered as the library's own mistake.
+readable :: [(Text, [Input])] -> IO ()
+readable qs = mapM_ one (zip [0 :: Int ..] qs)
+  where
+    one (i, (txt, _)) = case readEdn txt >>= parseQuery of
+      Left why -> E.throwIO (ParseError ("query " ++ show i ++ ": " ++ why))
+      Right _  -> pure ()
 
 -- | A handler from its three parts. A decoder that refuses what the 'Setu.Spec.Ty' let through is
 -- our mistake, and is told as one.

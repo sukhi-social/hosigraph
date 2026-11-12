@@ -351,6 +351,16 @@ failureTests =
         _ <- askErr d "{:op :stats}" StApp kind
         pure ())
 
+  , ("failure: a query that cannot be read is refused at the door as parse-error; the backend is not asked", do
+      -- the real backend throws a DtlvError for it, a bare string: it would be answered as INTERNAL
+      ref <- newIORef []
+      let asked = \_ -> throwIO (ErrorCall "the backend was asked")
+          d = dispatchOver (fake ref) { bQueryMany = asked, bQueryCellsMany = asked }
+      forM_ ["query-many", "query-cells-many"] $ \op -> do
+        m <- askErr d ("{:op :" <> op <> " :args {:queries [{:q \"[:find ?n :where\"}]}}") StApp "parse-error"
+        check "it says which query" ("query 0" `T.isInfixOf` m)
+        check "the backend was not asked" (not ("the backend" `T.isInfixOf` m)))
+
   , ("failure: an I/O error is HOSI_ERR_IO, and any other exception is HOSI_ERR_INTERNAL", do
       ref <- newIORef []
       let d1 = dispatchOver (fake ref) { bStats = throwIO (userError "disk gone") }
