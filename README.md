@@ -246,8 +246,27 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
 
 * Phase 2 and later: S3, deep paths, Binary Fuse filters (planned as the first gate of `Probe`), Range GET, freezing (cold chunks),
   Erase and invalidation records, garbage collection, metrics and capacity forecasts, anonymous metrics.
-* Not done yet, though they belong to Phase 1: a dictionary and compression of chunk values (only attribute names have a dictionary),
-  JSON-LD import (Phase 0 decides this part), a size limit for the chunk read cache, and a dictionary for IRIs from outside the ID space.
+* Not done yet, though they belong to Phase 1: compression of chunk values,
+  JSON-LD import (Phase 0 decides this part), and a dictionary for IRIs from outside the ID space.
+* **Each chunk has a value dictionary** (chunk format version 2). A value that the chunk says many times is written once in the header,
+  and the runs say "number 17" instead (2-3 bytes). A value goes in only when that makes the chunk smaller:
+  a value of `len` bytes that appears `n` times is worth it when `n * (len - 4) > len`.
+  Values are told apart by their bytes, not by `==`, so `0.0` and `-0.0` stay two values.
+  The dictionary is read when a chunk is opened and stays in memory with the reader (it is part of what `hcReaderCacheBytes` counts).
+  Chunks of version 1 (no dictionary) are still read; nothing rewrites them. The tail log's format did not change.
+* **Version 2 also writes numbers short.** Every number in a run is a variable-length one (LEB128, 1-10 bytes): the attribute number, the seq
+  (counted from the chunk's first seq), the entity id (counted from the chunk's first id), the lengths, and integer values (zigzag, so `-1` is short too).
+  A text value's length is one byte, not four. Point lookups work as before: the slot still points at the start of a run, and the run's head is
+  read with one read of at most 30 bytes. It is a new chunk format only; nothing else needed to change.
+  On 20,000 made-up events (4,000 entities with a name, a type, an age, a language and a friend), `chunk.hosi` was 595,208 bytes in version 1
+  and 205,466 in version 2, with no compressor (the dictionary alone took version 1 to 474,462; the short numbers did the rest).
+  Invented data is only a hint: names made of a few repeated words, random friend ids.
+  A general compressor on top does not make version 2 smaller than version 1 (xz -9: 72.6 KB vs 70.0 KB; zstd -19: 94.4 KB vs 91.1 KB),
+  because it had been squeezing the same fixed-width zeros. `mphf.idx` was not touched (about 13 bytes for each id).
+  The dictionary is per chunk; one for the whole khana, or one shared by IRIs from outside the ID space, is the item above.
+* The open chunk readers (each holds the chunk's slot table, 12 bytes per id) have a memory limit: `hcReaderCacheBytes`, 64 MiB by default.
+  The least recently used reader is closed first; the one just used is always kept, so a single huge chunk still opens.
+  The count is about the slot tables only (`Events.xsReadersOpen`, `xsReaderBytes` show it).
 
 ## Notes on the current state
 

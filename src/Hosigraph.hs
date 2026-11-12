@@ -75,17 +75,19 @@ data HosiConfig = HosiConfig
   , hcSync        :: Bool             -- ^ fsync the tail on every write (turn off only for experiments)
   , hcKhanaBackend :: KhanaBackend    -- ^ where "now" lives: Datalevin through a resident JVM (the default; give it the real jar), or through @dtlv@
   , hcClock       :: Clock            -- ^ milliseconds since the POSIX epoch (tests inject their own)
+  , hcReaderCacheBytes :: Int         -- ^ memory the open chunk readers may hold together (least recently used go first)
   }
 
 defaultConfig :: HosiConfig
 defaultConfig = HosiConfig
   { hcSealEvents = 10000, hcSealAgeMs = Nothing, hcBlockEvents = 256
-  , hcSync = True, hcKhanaBackend = KhanaDatalevinJvm "java" "datalevin-standalone.jar", hcClock = systemClock }
+  , hcSync = True, hcKhanaBackend = KhanaDatalevinJvm "java" "datalevin-standalone.jar", hcClock = systemClock
+  , hcReaderCacheBytes = 64 * 1024 * 1024 }
 
 eventsConfig :: HosiConfig -> EventsConfig
 eventsConfig c = EventsConfig
   { ecSealEvents = hcSealEvents c, ecSealAgeMs = hcSealAgeMs c, ecBlockEvents = hcBlockEvents c
-  , ecSync = hcSync c, ecClock = hcClock c }
+  , ecSync = hcSync c, ecClock = hcClock c, ecReaderCacheBytes = hcReaderCacheBytes c }
 
 data Hosi = Hosi
   { hDir    :: FilePath

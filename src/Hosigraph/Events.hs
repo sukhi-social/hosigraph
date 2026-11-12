@@ -61,11 +61,39 @@ data EventsConfig = EventsConfig
   , ecBlockEvents :: Int              -- ^ target events per block inside a chunk
   , ecSync        :: Bool             -- ^ fsync the tail on every record (turn off only for experiments)
   , ecClock       :: Clock            -- ^ milliseconds since the POSIX epoch (tests inject their own)
+  , ecReaderCacheBytes :: Int         -- ^ how much memory the open chunk readers may hold together (the least recently used are closed first; one reader is always kept)
   }
 
 defaultEventsConfig :: EventsConfig
 defaultEventsConfig = EventsConfig
-  { ecSealEvents = 10000, ecSealAgeMs = Nothing, ecBlockEvents = 256, ecSync = True, ecClock = systemClock }
+  { ecSealEvents = 10000, ecSealAgeMs = Nothing, ecBlockEvents = 256, ecSync = True, ecClock = systemClock
+  , ecReaderCacheBytes = 64 * 1024 * 1024 }
+
+-- | The open chunk readers.  Each use stamps a reader with a new tick; when the total is over the
+-- limit, the reader with the oldest tick goes first.
+data ReaderCache = ReaderCache
+  { rkTick  :: !Int
+  , rkBytes :: !Int
+  , rkMap   :: !(M.Map String (Int, ChunkReader))
+  }
+
+emptyReaderCache :: ReaderCache
+emptyReaderCache = ReaderCache 0 0 M.empty
+
+-- | Put a reader in (or stamp it again) and drop the oldest ones while over the limit.
+-- The reader just put in is never dropped, so one huge chunk still opens.
+cacheReader :: Int -> String -> ChunkReader -> ReaderCache -> ReaderCache
+cacheReader limit name r rk0 = shrink rk1
+  where
+    t   = rkTick rk0 + 1
+    old = maybe 0 (readerBytes . snd) (M.lookup name (rkMap rk0))
+    rk1 = ReaderCache t (rkBytes rk0 - old + readerBytes r) (M.insert name (t, r) (rkMap rk0))
+    shrink rk
+      | rkBytes rk <= limit || M.size (rkMap rk) <= 1 = rk
+      | otherwise =
+          let (victim, (_, vr)) = minimumByTick (M.toList (rkMap rk))
+          in shrink rk { rkBytes = rkBytes rk - readerBytes vr, rkMap = M.delete victim (rkMap rk) }
+    minimumByTick = foldr1 (\a b -> if fst (snd a) <= fst (snd b) then a else b)
 
 data TailState = TailState
   { tsBatchesRev :: [[Event]]                 -- ^ newest batch first
@@ -99,7 +127,7 @@ data Events = Events
   , xTailSt   :: IORef TailState
   , xNextSeq  :: IORef Word64
   , xIds      :: IdGen
-  , xReaders  :: IORef (M.Map String ChunkReader)
+  , xReaders  :: IORef ReaderCache
   }
 
 chunksDir :: Events -> FilePath
@@ -137,7 +165,7 @@ openEvents cfg dir = do
   gen <- newIdGen maxIdSeen
   now <- Just <$> ecClock cfg
   Events dir cfg <$> newMVar () <*> newIORef mf <*> pure tl <*> newIORef (fromBatches now batches)
-                <*> newIORef (lastS + 1) <*> pure gen <*> newIORef M.empty
+                <*> newIORef (lastS + 1) <*> pure gen <*> newIORef emptyReaderCache
 
 closeEvents :: Events -> IO ()
 closeEvents = closeTail . xTail
@@ -156,12 +184,12 @@ sweepOrphans dir mf = do
 readerFor :: Events -> ChunkEntry -> IO ChunkReader
 readerFor k c = do
   cache <- readIORef (xReaders k)
-  case M.lookup (ceName c) cache of
-    Just r  -> pure r
-    Nothing -> do
-      r <- openChunkReader (chunksDir k </> ceName c)
-      modifyIORef' (xReaders k) (M.insert (ceName c) r)
-      pure r
+  r <- case M.lookup (ceName c) (rkMap cache) of
+    Just (_, r) -> pure r
+    Nothing     -> openChunkReader (chunksDir k </> ceName c)
+  -- stamp it as just used (readers run in parallel, so the update is atomic)
+  atomicModifyIORef' (xReaders k) (\rk -> (cacheReader (ecReaderCacheBytes (xCfg k)) (ceName c) r rk, ()))
+  pure r
 
 -- ---------------------------------------------------------------------------
 -- Letting events in
@@ -387,6 +415,8 @@ data EventsStats = EventsStats
   , xsNextSeq    :: Word64
   , xsTailEvents :: Int
   , xsTailBytes  :: Integer
+  , xsReadersOpen  :: Int       -- ^ chunk readers held open right now
+  , xsReaderBytes  :: Int       -- ^ about how much memory they hold (see 'ecReaderCacheBytes')
   } deriving Show
 
 eventsStats :: Events -> IO EventsStats
@@ -395,7 +425,9 @@ eventsStats k = do
   ts <- readIORef (xTailSt k)
   ns <- readIORef (xNextSeq k)
   tb <- tailSize (xTail k)
-  pure (EventsStats (mfGeneration mf) (length (mfChunks mf)) (mfSealedSeq mf) ns (tsCount ts) tb)
+  rk <- readIORef (xReaders k)
+  pure (EventsStats (mfGeneration mf) (length (mfChunks mf)) (mfSealedSeq mf) ns (tsCount ts) tb
+                    (M.size (rkMap rk)) (rkBytes rk))
 
 -- | Check what can be checked without "now": the manifest's signature, every chunk file's
 -- hash and footer, and every MPHF (each id must find exactly its own events).

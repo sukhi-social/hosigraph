@@ -3,15 +3,16 @@
 -- Description : Big-endian binary builders and a tiny bounds-checked parser.
 module Hosigraph.Bin
   ( -- * Writing
-    Builder', put, putU8, putU16, putU32, putU64, putBytes, putText, build
+    Builder', put, putU8, putU16, putU32, putU64, putBytes, putText, putVar, putVarBytes, putVarText, zigzag, build
     -- * Reading
-  , Get, runGet, failGet, getU8, getU16, getU32, getU64, getRaw, getBytes, getText, getPos, atEnd
+  , Get, runGet, failGet, getU8, getU16, getU32, getU64, getRaw, getBytes, getText, getVar, getVarBytes, getVarText, unzigzag, getPos, atEnd
   , be32, be64, getBe64At
   , crc32
   ) where
 
 import           Data.Array.Unboxed (UArray, listArray, (!))
 import           Data.Bits
+import           Data.Int (Int64)
 import qualified Data.ByteString as B
 import           Data.ByteString.Builder
 import qualified Data.ByteString.Lazy as BL
@@ -48,6 +49,28 @@ putBytes b = putU32 (fromIntegral (B.length b)) <> byteString b
 
 putText :: Text -> Builder
 putText = putBytes . TE.encodeUtf8
+
+-- | A variable-length unsigned number (LEB128): 7 bits at a time, the low bits first, and the top bit
+-- of each byte says "more follows".  0-127 take 1 byte, up to 2^14 - 1 take 2, a full 64 bits take 10.
+putVar :: Word64 -> Builder
+putVar n
+  | n < 0x80  = word8 (fromIntegral n)
+  | otherwise = word8 (fromIntegral (n .&. 0x7f) .|. 0x80) <> putVar (n `shiftR` 7)
+
+-- | 'putVar' length, then the bytes.
+putVarBytes :: B.ByteString -> Builder
+putVarBytes b = putVar (fromIntegral (B.length b)) <> byteString b
+
+putVarText :: Text -> Builder
+putVarText = putVarBytes . TE.encodeUtf8
+
+-- | Fold the sign into the lowest bit (0, -1, 1, -2, 2 ... become 0, 1, 2, 3, 4 ...), so that a small
+-- number of either sign is a small 'putVar'.
+zigzag :: Int64 -> Word64
+zigzag n = fromIntegral ((n `shiftL` 1) `xor` (n `shiftR` 63))
+
+unzigzag :: Word64 -> Int64
+unzigzag w = fromIntegral (w `shiftR` 1) `xor` negate (fromIntegral (w .&. 1))
 
 build :: Builder -> B.ByteString
 build = BL.toStrict . toLazyByteString
@@ -118,6 +141,26 @@ getBytes = getU32 >>= getRaw . fromIntegral
 
 getText :: Get Text
 getText = TE.decodeUtf8With TE.lenientDecode <$> getBytes
+
+-- | Reads what 'putVar' wrote.  More than 10 bytes, or a 10th byte that does not fit in 64 bits, is an error.
+getVar :: Get Word64
+getVar = go 0 0
+  where
+    go :: Int -> Word64 -> Get Word64
+    go sh acc = do
+      b <- getU8
+      let acc' = acc .|. (fromIntegral (b .&. 0x7f) `shiftL` sh)
+      if sh == 63 && b > 1 then failGet "variable-length number does not fit in 64 bits"
+      else if b .&. 0x80 == 0 then pure acc'
+      else go (sh + 7) acc'
+
+-- | Reads what 'putVarBytes' wrote.
+getVarBytes :: Get B.ByteString
+getVarBytes = getVar >>= \n ->
+  if n > fromIntegral (maxBound :: Int) then failGet "length out of range" else getRaw (fromIntegral n)
+
+getVarText :: Get Text
+getVarText = TE.decodeUtf8With TE.lenientDecode <$> getVarBytes
 
 getPos :: Get Int
 getPos = Get $ \_ o -> Right (o, o)
