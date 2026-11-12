@@ -5,14 +5,14 @@ synopsis:           hosigraph Phase 1 prototype (events, khana, MPHF)
 description:
   A prototype of the hosigraph design (formerly hosiDB, v0.2.0-draft): an embedded database that keeps the
   past as frozen chunks of Create/Delete events and "now" (the khana) as a rebuildable instant.
-  The khana ("now") is a Datalevin database (through dtlv or a resident JVM) or, for now, an in-process
-  Haskell engine, reached through takka, the Datalog engine that lives in this repository (takka/).
+  The khana ("now") is a Datalevin database (through dtlv or a resident JVM). The words it speaks
+  (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
+  There is no C in the package.
 category:           Database
 build-type:         Simple
 extra-source-files:
   README.md
   docs/*.md
-  cbits/hosi_sync.c
 
 common shared
   default-language: Haskell2010
@@ -53,11 +53,8 @@ library
     , scientific  >=0.3  && <0.4
     , text        >=1.2  && <2.2
     , time        >=1.9  && <1.14
+    , unix        >=2.8  && <2.9
     , vector      >=0.12 && <0.14
-  c-sources:
-    cbits/hosi_sync.c
-  cc-options:       -pthread -fPIC -w
-  ld-options:       -pthread
 
 executable hosigraph-demo
   import:           shared

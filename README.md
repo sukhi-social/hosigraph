@@ -44,31 +44,31 @@ After the MPHF (see "How the files are laid out") says "it is here", Probe asks 
 
 ## Get started
 
-You need `ghc` (tested with 9.6.7), `gcc`, and the packages `aeson` and (for the tests) `QuickCheck`.
+You need `ghc` (tested with 9.6.7) and the packages `aeson` and (for the tests) `QuickCheck`. There is no C to compile.
+The khana lives in Datalevin, so to use a database you also need either a JDK 21 or newer and the Datalevin jar, or the `dtlv` executable (see below).
 
-Everything is in this repository. [`takka/`](takka/README.md) is the Datalog engine that hosigraph uses
-(types, EDN, the Datalog syntax, and the in-process engine). cabal builds it together with hosigraph.
+Everything is in this repository. [`takka/`](takka/README.md) holds the words that hosigraph and Datalevin share
+(values, schema, EDN, and the syntax of Datalog queries and pull patterns), in plain Haskell. cabal builds it together with hosigraph.
 Takka was called Hevin before; "takka" is Pali for reasoning and logic.
+(Takka once also had a small database engine on dlmdb, and hosigraph could keep its khana there. That was removed. It is in the git history, commit `2aee1d7`.)
 
 ```sh
 cabal build all
 cabal run hosigraph-demo                 # a walk-through that moves a clock from November to December
-cabal test hosigraph:spec takka:spec     # 41 + 76 tests; more with Datalevin (see below)
+cabal test                               # 13 tests that need no Datalevin; more with Datalevin (see below)
 ```
 
-(`cabal test` alone runs only hosigraph's tests.)
+Tested: GHC 9.6.7 with `cabal build all`, on macOS (arm64). Linux is not tested here;
+the GitHub Actions workflow ([`test.yml`](.github/workflows/test.yml)) runs the tests on ubuntu-24.04, with the JVM.
 
-Tested: GHC 9.6.7 with `cabal build all` and both test suites, on macOS (arm64). Linux is not tested here;
-the GitHub Actions workflow ([`test.yml`](.github/workflows/test.yml)) runs it on ubuntu-24.04.
-
-> **`scripts/build-ghc.sh`** builds with plain `ghc` and `gcc`, for machines where cabal cannot reach Hackage:
+> **`scripts/build-ghc.sh`** builds with plain `ghc`, for machines where cabal cannot reach Hackage:
 > `scripts/build-ghc.sh app` (or `test`). It writes to `build/`. Plain `ghc` must be able to see `aeson` (and `QuickCheck` for the tests).
 > **It has not been run to the end yet.** An older version stopped at once because `$target` was never set; that is fixed,
 > but on the Mac where this was tried, plain `ghc` could not see `aeson`. Use cabal until then.
 
 ### Run the tests against Datalevin
 
-The tests also run against real Datalevin if you tell them where it is. If you do not, they print that they skipped those parts.
+Most tests need a real Datalevin, so tell them where it is. If you do not, they print that they skipped those parts.
 
 ```sh
 HOSIGRAPH_DTLV=/path/to/dtlv cabal test        # the native dtlv
@@ -77,13 +77,14 @@ HOSIGRAPH_DATALEVIN_JAR=/path/to/datalevin-1.2.10-standalone.jar HOSIGRAPH_JAVA=
 
 | You give | Tests that run |
 |---|---|
-| nothing | 41 (`KhanaDatalevinNative` only) |
-| `dtlv` | 76 |
-| `dtlv` and the JVM | 113 (including: write with the JVM and read with `dtlv`, and the reverse) |
+| nothing | 13 (events, chunks, tail log, the EDN writer) |
+| `dtlv` | 46 |
+| the JVM | 47 |
+| `dtlv` and the JVM | more (including: write with the JVM and read with `dtlv`, and the reverse) |
 
-The same scenarios pass on all three. The tests choose the khana themselves, so the 41 tests need no jar.
+The same scenarios run on `dtlv` and on the JVM. The tests choose the khana themselves.
 
-The demo uses the JVM when `HOSIGRAPH_DATALEVIN_JAR` (and `HOSIGRAPH_JAVA`) is set. Otherwise it uses `KhanaDatalevinNative`.
+The demo needs the JVM: set `HOSIGRAPH_DATALEVIN_JAR` (and `HOSIGRAPH_JAVA` if `java` is not on your path).
 
 ## Use it
 
@@ -93,9 +94,9 @@ import Control.Exception (bracket)
 import Hosigraph
 import qualified Data.Map as M
 
--- KhanaDatalevinNative needs no jar. See "Where 'now' lives" for the others.
+-- Give the real jar. See "Where 'now' lives" for `dtlv`.
 cfg :: HosiConfig
-cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinNative }
+cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datalevin-1.2.10-standalone.jar" }
 
 main :: IO ()
 main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
@@ -109,7 +110,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
   where schema = M.fromList [("person/name", identity (attr TString)), ("person/age", attr TLong)]
 ```
 
-`withHosi dir schema` is a shorter way to open, but it uses `defaultConfig`, which wants a Datalevin jar and `java` (see below).
+`withHosi dir schema` is a shorter way to open, but it uses `defaultConfig`, which wants `datalevin-standalone.jar` in the place where you run, and `java`.
 
 | Call | What it does |
 |---|---|
@@ -121,21 +122,20 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `seal` | Turn the tail log into chunks. `HosiConfig` can also seal by itself, by size or by age. |
 | `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events.** An empty list means all good. |
 | `rebuildKhana` | Throw the khana away and fold the events again. |
-| `withKhana` | Run code on one snapshot of the in-process engine (only with `KhanaDatalevinNative`). |
 
 You can also use `Hosigraph.Events` alone, without a khana. The tests cover this.
 
 ## Where "now" lives
 
-The events are the same everywhere. Only the place of the khana changes. There are three:
+The khana is a Datalevin database. There are two ways to reach it:
 
-| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlv path` | `KhanaDatalevinNative` |
-|---|---|---|---|
-| What it is | Datalevin in **one JVM that stays up** (one JVM for each `Hosi`) | Datalevin through the `dtlv` command, **one process for each operation** | A small Haskell engine inside your process. **Not Datalevin.** |
-| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 25 ms (the first call: about 0.4 s) | about 0.1 ms or less |
-| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file | nothing |
-| `(max ?x)` and `(min ?x)` | work | **do not work** (see "Limits") | work |
-| Files in | `khana-dtlv/` | `khana-dtlv/` | `khana/` |
+| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlv path` |
+|---|---|---|
+| What it is | Datalevin in **one JVM that stays up** (one JVM for each `Hosi`) | Datalevin through the `dtlv` command, **one process for each operation** |
+| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 25 ms (the first call: about 0.4 s) |
+| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file |
+| `(max ?x)` and `(min ?x)` | work | **do not work** (see "Limits") |
+| Files in | `khana-dtlv/` | `khana-dtlv/` |
 
 ```haskell
 cfg = defaultConfig { hcKhanaBackend = KhanaDtlv "/usr/local/bin/dtlv" }
@@ -188,32 +188,30 @@ and it reads `foldedSeq` once. A catch-up of 5 batches starts 3 `dtlv` processes
 
 macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmark is not part of the project.
 
-| | `KhanaDatalevinNative` | `KhanaDatalevinJvm` | `KhanaDtlv` |
-|---|---|---|---|
-| `write`, one item at a time | 0.12 ms | 0.9 ms | about 25 ms |
-| the same items in one batch (for each item) | 0.01 ms | 0.05 ms | 1.2 ms |
-| `getEntity`, one at a time | almost 0 | 0.6 ms | about 23 ms |
-| `getEntities`, 200 together | 0.09 ms | about 3 ms | about 23 ms |
-| 6 queries (one by one → `queryMany`) | 1.2 → 1.3 ms | 2.6 → 1.9 ms | 156 → 28 ms |
-| `stats` | almost 0 | 1 ms | about 24 ms |
+| | `KhanaDatalevinJvm` | `KhanaDtlv` |
+|---|---|---|
+| `write`, one item at a time | 0.9 ms | about 25 ms |
+| the same items in one batch (for each item) | 0.05 ms | 1.2 ms |
+| `getEntity`, one at a time | 0.6 ms | about 23 ms |
+| `getEntities`, 200 together | about 3 ms | about 23 ms |
+| 6 queries (one by one → `queryMany`) | 2.6 → 1.9 ms | 156 → 28 ms |
+| `stats` | 1 ms | about 24 ms |
 
 * **Grouping helps `KhanaDtlv` most**, because starting a process is almost all of its time.
   A JVM call is cheap already (200 entities: about 40 times faster; 6 queries: about 1.4 times).
-  `KhanaDatalevinNative` runs in your process, so it does not change.
 * "The same items in one batch" is the **upper limit** for grouped writes. `writeMany` (separate batches) comes close to it.
 * The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms). hosigraph calls only `fsync(2)`,
   and on macOS that does not wait for the disk write cache. On systems that really wait, the time is higher. It is not measured.
 
 ## Limits
 
-* `withKhana` works only with `KhanaDatalevinNative`. With a Datalevin khana it fails with `BadArgument`. Use `query` or `queryCells`.
 * `query` does not accept `InRules`, because a `Rule` is a structure and not EDN text. Write the rules inside the query.
 * **`KhanaDtlv` cannot use `(max ?x)` or `(min ?x)`.** In `dtlv exec` 1.2.10, they return the collection of values, not the maximum or the minimum.
   They seem to resolve to `clojure.core/max` and `min`. `count`, `sum`, and `avg` are correct, and the same jar on a JVM is correct too.
   So the problem is in `exec` of the native `dtlv`. hosigraph returns an error and does not read the result.
   A canary test tells you when upstream fixes it.
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
-* NaN and ±Infinity have no EDN form, so hosigraph refuses to write them. (`KhanaDatalevinNative` is not checked.)
+* NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
 * The order of rows is not guaranteed (a Datalevin answer is a set). Sort the rows before you compare them.
 * Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). The memory use of the resident JVM is not measured.
 
@@ -255,17 +253,15 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
 
 * **Speed is measured only roughly.** Each write fsyncs the tail log and the khana commits once, so one-by-one writes are slow. The design expects grouped writes.
 * `Schema` is an argument of open. hosigraph does not store it. See item 6 of [`docs/design-notes.md`](docs/design-notes.md).
-* `hcKhanaNoSync` (no fsync in the khana) exists, but nobody tested a power failure. It works with `KhanaDatalevinNative` only.
 * Writes go one at a time (`MVar`). Reads run in parallel.
   `history` takes the lock for a moment to see the manifest and the tail log in a stable state, so a seal in progress is not visible.
 * The MPHF is a minimal PTHash style (load factor about 89 %, about 4 keys for each bucket, 16-bit pilots).
   The choice between PtrHash, PTHash, and RecSplit is open.
-* `takka/` exports the types (`Value`, `Schema`, …), EDN, and the Datalog syntax (`Takka.Types`, `Takka.Edn`, `Takka.Query`, `Takka.Pull`).
-  The one place that knows the engine inside is `Takka.Engine`.
-  There is no cabal flag to remove the engine: hosigraph needs the types and the syntax even when the khana is Datalevin.
-* **About the name `KhanaDatalevinNative`.** It is the slot for the native core of Datalevin, which does not exist yet.
-  The engine in the slot today is takka (a small Haskell engine on top of dlmdb). It is not Datalevin.
-  The tests use it as the oracle (the reference answer).
+* `takka/` exports the types (`Value`, `Schema`, …), EDN, and the Datalog and pull syntax (`Takka.Types`, `Takka.Edn`, `Takka.Syntax`).
+  hosigraph needs these to write to Datalevin and to read its answers back.
+* **There is no in-process khana any more.** An earlier version could keep the khana in a small Haskell engine on dlmdb (`KhanaDatalevinNative`).
+  It was removed, so the C sources and that engine's tests are gone. They stay in the git history (commit `2aee1d7`).
+  If Datalevin gets a native core of its own, it would be a new backend next to the two above.
 * The license is **not set**.
 
 ## Open questions for the design document
@@ -274,7 +270,7 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
 
 1. **A chunk also needs a sequence number (seq).** The fold needs the order of Create and Delete, and which Create is newer.
 2. **The "month" is the month in which the entity was created, not the month of the event.** A Delete or update of an old entity goes into an old month's chunk. How should this meet the freezing unit?
-3. **A khana plus a tail log cannot be read together** with `KhanaDatalevinNative` (one LMDB read transaction). Instead, hosigraph folds into the khana at each write (write-through).
+3. **A khana plus a tail log cannot be read together** (a Datalevin `Db` is one LMDB read transaction). Instead, hosigraph folds into the khana at each write (write-through).
 4. **Who decides whether a write is allowed?** A type error or a unique-key conflict shows only when hosigraph folds into the khana.
 5. **There are two fast paths.** "Now" comes from the khana. "The events of one ID" comes from the MPHF.
 6. **Nobody stores the schema.** The cardinality sets the meaning of Create, so it changes the fold.

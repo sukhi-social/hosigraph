@@ -1,9 +1,9 @@
 # The tests, on every change.
 #
-# Two suites: takka (the Datalog engine in takka/) and hosigraph itself.
-# For hosigraph, the khana is also tried on Datalevin in a resident JVM: the standalone jar,
-# checked against a pinned sha256. The native `dtlv` is not used here, so the tests that need it
-# print that they skipped them (see "Run the tests against Datalevin" in the README).
+# hosigraph, with its khana on Datalevin in a resident JVM: the standalone jar, checked against a
+# pinned sha256. The native `dtlv` is not used here, so the tests that need it print that they
+# skipped them (see "Run the tests against Datalevin" in the README).
+# takka/ (the words hosigraph shares with Datalevin) is built along with it.
 name: test
 
 on:
@@ -68,6 +68,5 @@ jobs:
           cabal update
           cabal build all --enable-tests
 
-      # "cabal test" alone runs only the package in the current directory, so name both suites.
       - name: Test
-        run: cabal test hosigraph:spec takka:spec --test-show-details=direct
+        run: cabal test hosigraph:spec --test-show-details=direct

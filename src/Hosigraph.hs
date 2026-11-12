@@ -31,7 +31,7 @@ module Hosigraph
   , Op(..), Ref(..), Val(..), WriteReport(..), write, writeMany
   , SealReport(..), seal
     -- * Reading "now" (the khana)
-  , getEntity, query, queryCells, withKhana
+  , getEntity, query, queryCells
     -- * Reading many at once (one snapshot; one round trip with Datalevin)
   , getEntities, queryMany, queryCellsMany
     -- * Reading the past (events: chunks + tail, point lookup by id)
@@ -62,8 +62,7 @@ import           Hosigraph.Id
 import           Hosigraph.Khana
 import           Hosigraph.Probe
 import           Hosigraph.Sync
-import           Takka.Engine (Db)
-import           Takka.Query (Input(..), Cell(..))
+import           Takka.Syntax (Input(..), Cell(..))
 import           Takka.Types
 
 -- ---------------------------------------------------------------------------
@@ -74,15 +73,14 @@ data HosiConfig = HosiConfig
   , hcSealAgeMs   :: Maybe Integer    -- ^ ...or when its oldest event is this old (checked on each write)
   , hcBlockEvents :: Int              -- ^ target events per block inside a chunk
   , hcSync        :: Bool             -- ^ fsync the tail on every write (turn off only for experiments)
-  , hcKhanaNoSync :: Bool             -- ^ skip fsync in the khana (it is rebuildable; see 'openKhana'; the in-process engine only)
-  , hcKhanaBackend :: KhanaBackend    -- ^ where "now" lives: Datalevin through a resident JVM (the default; give it the real jar), through @dtlv@, or an in-process engine
+  , hcKhanaBackend :: KhanaBackend    -- ^ where "now" lives: Datalevin through a resident JVM (the default; give it the real jar), or through @dtlv@
   , hcClock       :: Clock            -- ^ milliseconds since the POSIX epoch (tests inject their own)
   }
 
 defaultConfig :: HosiConfig
 defaultConfig = HosiConfig
   { hcSealEvents = 10000, hcSealAgeMs = Nothing, hcBlockEvents = 256
-  , hcSync = True, hcKhanaNoSync = False, hcKhanaBackend = KhanaDatalevinJvm "java" "datalevin-standalone.jar", hcClock = systemClock }
+  , hcSync = True, hcKhanaBackend = KhanaDatalevinJvm "java" "datalevin-standalone.jar", hcClock = systemClock }
 
 eventsConfig :: HosiConfig -> EventsConfig
 eventsConfig c = EventsConfig
@@ -111,7 +109,6 @@ verifyDir h = hDir h </> ("verify-" ++ khanaDirName (hcKhanaBackend (hCfg h)))
 
 -- | Fail early, and without touching any khana, if the chosen backend cannot start.
 checkBackend :: KhanaBackend -> IO ()
-checkBackend KhanaDatalevinNative = pure ()
 checkBackend (KhanaDtlv exe) = do
   found <- runnable exe
   unless found $ throwIO (BadArgument ("KhanaDtlv: no executable dtlv at " ++ show exe))
@@ -145,7 +142,7 @@ openHosiWith cfg dir schema = do
   createDirectoryIfMissing True dir
   rt <- newKhanaRuntime (hcKhanaBackend cfg)
   ev <- E.openEvents (eventsConfig cfg) (dir </> "events") `onException` closeKhanaRuntime rt
-  (do forM_ [KhanaDatalevinNative, KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
+  (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
       ref0 <- newIORef (error "khana not opened yet")
       let h = Hosi dir cfg schema ev ref0 rt
       lastS <- E.lastSeq ev
@@ -165,7 +162,7 @@ withHosi dir schema = bracket (openHosi dir schema) closeHosi
 -- | Get a khana that agrees with the events.
 recoverKhana :: Hosi -> Word64 -> IO Khana
 recoverKhana h lastS = do
-  r <- try (openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h) (hcKhanaNoSync (hCfg h)))
+  r <- try (openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h))
   case r of
     Left (_ :: SomeException) -> rebuildFresh
     Right conn -> do
@@ -218,7 +215,7 @@ buildKhana :: Hosi -> FilePath -> IO (Khana, [[Event]])
 buildKhana h target = do
   let ev = hEvents h
   sealedEvs <- E.eventsAfter ev 0
-  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) target (hSchema h) (hcKhanaNoSync (hCfg h))
+  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) target (hSchema h)
   applyBatched 2000 conn sealedEvs
   batches <- E.tailBatches ev
   refused <- foldTail conn (foldedAfter 0 sealedEvs) batches
@@ -353,13 +350,6 @@ queryCellsMany h qs = do
   k <- readIORef (hKhana h)
   khanaQueryCellsMany k qs
 
--- | Run something against one consistent snapshot of the khana, with the whole in-process engine available.
--- Only the in-process khana can do this; with 'KhanaDtlv' it throws 'BadArgument' (use 'query' / 'queryCells').
-withKhana :: Hosi -> (Db -> IO a) -> IO a
-withKhana h act = do
-  k <- readIORef (hKhana h)
-  khanaWithDb k act
-
 -- ---------------------------------------------------------------------------
 -- Reading the past
 
@@ -387,7 +377,7 @@ rebuildKhana h = E.withEventsLock ev $ do
   removePathForcibly (khanaDir h)
   renameDirectory fresh (khanaDir h)
   syncDir (hDir h)
-  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h) (hcKhanaNoSync (hCfg h))
+  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
   writeIORef (hKhana h) conn
   unless (null refused) $ do
     -- same rule as at open: a logged batch the khana refuses is not part of the world

@@ -52,8 +52,7 @@ import           System.IO (hClose)
 import           System.Process
 
 import           Takka.Edn
-import           Takka.Pull (Pulled(..))
-import           Takka.Query (Cell(..), FindShape(..), Input(..), Query(..), parseQuery)
+import           Takka.Syntax (Cell(..), FindShape(..), Input(..), Pulled(..), Query(..), parseQuery)
 import           Takka.Types
 import           Hosigraph.Khana.Sidecar
 
@@ -210,7 +209,7 @@ inputEdn i = case i of
   InScalar v -> ednVal v
   InColl vs  -> vec <$> mapM ednVal vs
   InRel rs   -> vec <$> mapM (fmap vec . mapM ednVal) rs
-  InRules _  -> Left "rules (InRules) cannot be sent to dtlv: write them into the query instead, or use KhanaDatalevinNative"
+  InRules _  -> Left "rules (InRules) cannot be sent to dtlv: write them into the query instead"
   where vec xs = "[" <> T.unwords xs <> "]"
 
 shapeRows :: FindShape -> Edn -> Either String [[Edn]]

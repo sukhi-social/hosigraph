@@ -31,7 +31,7 @@ In the prototype, a Delete and a newer Create go into the chunk of **the month i
 ## 3. Read the core material and the tail log together
 
 Design document: "When you read, look at the core material and the unsealed tail log together."
-The `Db` of the in-process engine is one LMDB read transaction. It has no place to put other data on top of it.
+A Datalevin `Db` is one LMDB read transaction (the same was true of the in-process engine this prototype once had). It has no place to put other data on top of it.
 To make the whole Datalog engine read two sources together is a big job.
 
 The prototype uses **write-through**: `write` appends to the tail log (fsync), and then folds into the core material.
@@ -96,7 +96,7 @@ One option: a 12-bit sequence and 9 bits for the node. Phase 0 ("ID scheme") mus
 
 The code has two parts that the design document does not name.
 
-* **Khana** (刹那 = now = core material): the part that the system builds from the events and that you can throw away. It sits on an engine (Datalevin, or the in-process engine).
+* **Khana** (刹那 = now = core material): the part that the system builds from the events and that you can throw away. It sits on Datalevin.
 * **Events**: the tail log, the chunks, the manifest, and "find the events of one ID". This part holds the truth. It knows no khana and no Datalog.
 
 `Events` has an interface of **three beats: write (record) → see if the khana accepts → confirm (commit) or cancel (rollback)**.

@@ -1,2 +1,0 @@
-dlmdb commit 32c59dd6e8eae08a7dd17ed8c2f0fa0a022bbec5 (Fri Oct 30 21:00:28 2026 -0700)
-source: https://github.com/datalevin/dlmdb (libraries/liblmdb)

@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- |
 -- Module      : Hosigraph.Khana
--- Description : かな(刹那)。The "now": events folded into a single instant, kept in a Datalevin database or an in-process engine.
+-- Description : かな(刹那)。The "now": events folded into a single instant, kept in a Datalevin database.
 --
 -- /On the name./  @khana@ is 刹那 (setsuna), a single instant: Pali khaṇa, Sanskrit kṣaṇa;
 -- in Japanese the sound is カナ, \"かな\".  The khana is the instant the past keeps
@@ -13,18 +13,15 @@
 -- 「星かな？」 ("a star, I wonder?"), which is also the question the point lookup asks,
 -- see "Hosigraph.Probe".
 --
--- /Two backends./  The instant can live in
+-- /Two ways to reach Datalevin./  The instant is a Datalevin database, driven through
 --
--- * 'KhanaDatalevinNative': an engine that runs inside this process (the @khana/@ directory; see
---   "Takka.Engine"), or
 -- * @'KhanaDtlv' path@: a Datalevin database, driven through the @dtlv@ command
 --   (the executable at @path@; in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), or
 -- * @'KhanaDatalevinJvm' java jar@: the same Datalevin database (same @khana-dtlv/@ directory),
 --   driven through one resident JVM running the Datalevin standalone jar
 --   (see "Hosigraph.Khana.Sidecar").  One JVM serves every khana a 'KhanaRuntime' opens.
 --
--- They have separate directories on purpose.  Both are made from the same events, so moving
--- from one to the other needs no migration: the new one is simply folded from the events.
+-- Both use the same files, so moving from one to the other needs no migration.
 --
 -- Folding is:
 --
@@ -40,7 +37,7 @@ module Hosigraph.Khana
   , metaEntity, foldedSeqAttr, khanaSchema
   , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, khanaDatoms, khanaDatomCount
   , khanaFoldedAndCount
-  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany, khanaWithDb
+  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany
   ) where
 
 import           Control.Exception (SomeException, try, throwIO)
@@ -48,19 +45,16 @@ import           Control.Monad
 import qualified Data.Map.Strict as M
 import           Data.Text (Text)
 import           Data.Word
-import           System.Directory (createDirectoryIfMissing)
 
 import           Hosigraph.Event
 import           Hosigraph.Khana.Dtlv
 import           Hosigraph.Khana.Sidecar (Sidecar, newSidecar, stopSidecar)
-import qualified Takka.Query as Q
-import           Takka.Engine
+import qualified Takka.Syntax as Q
 import           Takka.Types
 
 -- | Where the instant lives.
 data KhanaBackend
-  = KhanaDatalevinNative       -- ^ an engine inside this process, no outside tool needed (today a Haskell one; Datalevin's own native core, when there is one)
-  | KhanaDtlv FilePath         -- ^ a Datalevin database, through the @dtlv@ executable at this path
+  = KhanaDtlv FilePath         -- ^ a Datalevin database, through the @dtlv@ executable at this path
   | KhanaDatalevinJvm FilePath FilePath
                                -- ^ the same, through one resident JVM: the @java@ command, and the
                                --   @datalevin-<version>-standalone.jar@
@@ -68,7 +62,6 @@ data KhanaBackend
 
 -- | The directory (inside the database directory) that holds this backend's khana.
 khanaDirName :: KhanaBackend -> FilePath
-khanaDirName KhanaDatalevinNative     = "khana"
 khanaDirName (KhanaDtlv _)           = "khana-dtlv"
 khanaDirName (KhanaDatalevinJvm _ _) = "khana-dtlv"       -- the same Datalevin files, whoever runs them
 
@@ -85,9 +78,7 @@ closeKhanaRuntime :: KhanaRuntime -> IO ()
 closeKhanaRuntime (KhanaRuntime m) = mapM_ stopSidecar m
 
 -- | An open khana.
-data Khana
-  = NativeKhana Native
-  | DtlvKhana  Dtlv
+newtype Khana = DtlvKhana Dtlv
 
 -- | Entity 1 is reserved for the khana's own bookkeeping.  Real ids are time-based and
 -- start at 2^21, so they cannot collide with it.
@@ -101,14 +92,9 @@ foldedSeqAttr = "hosi.meta/folded-seq"
 khanaSchema :: Schema -> Schema
 khanaSchema = M.insert foldedSeqAttr (attr TLong)
 
--- | Open (creating if needed) a khana in a directory.  @noSync@: skip fsync on commit (the in-process engine only).
--- That is allowed /because/ the khana can be rebuilt; after a crash, 'Hosigraph.verify'
--- (or simply 'Hosigraph.rebuildCore') tells you whether it is still good.
-openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> Bool -> IO Khana
-openKhana (KhanaRuntime sc) backend dir schema noSync = case backend of
-  KhanaDatalevinNative -> do
-    createDirectoryIfMissing True dir
-    NativeKhana <$> openNative dir (khanaSchema schema) noSync
+-- | Open (creating if needed) a khana in a directory.
+openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> IO Khana
+openKhana (KhanaRuntime sc) backend dir schema = case backend of
   KhanaDtlv exe ->
     DtlvKhana <$> openDtlv (Native exe) dir (khanaSchema schema)
   KhanaDatalevinJvm _ _ -> case sc of
@@ -117,17 +103,11 @@ openKhana (KhanaRuntime sc) backend dir schema noSync = case backend of
 
 closeKhana :: Khana -> IO ()
 closeKhana k = case k of
-  NativeKhana n   -> closeNative n
   DtlvKhana d     -> closeDtlv d             -- native: nothing stays open; JVM: close this one database
 
 -- | The seq of the last event folded in (0 for an empty khana).
 foldedSeq :: Khana -> IO Word64
 foldedSeq k = case k of
-  NativeKhana n -> do
-    vs <- nativeValues n metaEntity foldedSeqAttr
-    pure $ case vs of
-      (VInt x : _) -> fromIntegral x
-      _            -> 0
   DtlvKhana d -> seqIn <$> dtlvEntity d metaEntity
 
 seqIn :: M.Map Keyword [Value] -> Word64
@@ -138,7 +118,6 @@ seqIn m = case M.lookup foldedSeqAttr m of
 -- | 'foldedSeq' and 'khanaDatomCount' together: with Datalevin it is one round trip, not two.
 khanaFoldedAndCount :: Khana -> IO (Word64, Word64)
 khanaFoldedAndCount k = case k of
-  NativeKhana _ -> (,) <$> foldedSeq k <*> khanaDatomCount k
   DtlvKhana d  -> do
     (m, n) <- dtlvEntityAndCount d metaEntity
     pure (seqIn m, minusMeta (fromInteger n))
@@ -146,11 +125,6 @@ khanaFoldedAndCount k = case k of
 -- | The bookkeeping fact is not the caller's.
 minusMeta :: Word64 -> Word64
 minusMeta n = if n > 0 then n - 1 else 0
-
-eventToNative :: Event -> NativeOp
-eventToNative e = case evKind e of
-  KCreate -> NAdd     (evId e) (evAttr e) (evVal e)
-  KDelete -> NRetract (evId e) (evAttr e) (evVal e)
 
 eventToDtlv :: Event -> DtlvOp
 eventToDtlv e = case evKind e of
@@ -162,7 +136,6 @@ eventToDtlv e = case evKind e of
 applyEvents :: Khana -> [Event] -> IO ()
 applyEvents _ [] = pure ()
 applyEvents k evs = case k of
-  NativeKhana n   -> nativeTransact n (map eventToNative evs ++ [NAdd metaEntity foldedSeqAttr marker])
   DtlvKhana d     -> dtlvTransact d (map eventToDtlv evs ++ [DAdd metaEntity foldedSeqAttr marker])
   where marker = VInt (fromIntegral (maximum (map evSeq evs)))
 
@@ -180,32 +153,27 @@ applyBatched n k evs = do
 -- | Every fact in the khana except the bookkeeping one.
 khanaDatoms :: Khana -> IO [Datom]
 khanaDatoms k = filter ((/= metaEntity) . dE) <$> case k of
-  NativeKhana n -> nativeDatoms n
   DtlvKhana d     -> dtlvDatoms d
 
 khanaDatomCount :: Khana -> IO Word64
 khanaDatomCount k = do
   n <- case k of
-    NativeKhana n -> nativeDatomCount n
     DtlvKhana d     -> fromInteger <$> dtlvDatomCount d
   pure (minusMeta n)
 
 -- | Everything the khana knows about one entity: attribute -> values.
 khanaEntity :: Khana -> EntityId -> IO (M.Map Keyword [Value])
 khanaEntity k i = case k of
-  NativeKhana n -> nativeEntity n i
   DtlvKhana d     -> dtlvEntity d i
 
 -- | Many entities from one snapshot (with Datalevin, in one round trip).  Answers are in the order asked.
 khanaEntities :: Khana -> [EntityId] -> IO [M.Map Keyword [Value]]
 khanaEntities k is = case k of
-  NativeKhana n -> nativeEntities n is
   DtlvKhana d     -> dtlvEntities d is
 
 -- | A Datalog query (EDN) against the khana.
 khanaQuery :: Khana -> Text -> [Q.Input] -> IO [[Value]]
 khanaQuery k txt inputs = case k of
-  NativeKhana n -> nativeQuery n txt inputs
   DtlvKhana _     -> do
     cells <- khanaQueryCells k txt inputs
     forM cells $ mapM $ \c -> case c of
@@ -215,14 +183,12 @@ khanaQuery k txt inputs = case k of
 -- | Like 'khanaQuery', with @(pull ?e [...])@ allowed in @:find@.
 khanaQueryCells :: Khana -> Text -> [Q.Input] -> IO [[Q.Cell]]
 khanaQueryCells k txt inputs = case k of
-  NativeKhana n -> nativeQueryCells n txt inputs
   DtlvKhana d     -> dtlvQueryCells d txt inputs
 
 -- | Many queries against one snapshot (with Datalevin, in one round trip).  The answers are in the
 -- order asked.  If one query fails, the call fails.
 khanaQueryMany :: Khana -> [(Text, [Q.Input])] -> IO [[[Value]]]
 khanaQueryMany k qs = case k of
-  NativeKhana n -> nativeQueryMany n qs
   DtlvKhana _     -> do
     all' <- khanaQueryCellsMany k qs
     forM all' $ \cells -> forM cells $ mapM $ \c -> case c of
@@ -232,12 +198,4 @@ khanaQueryMany k qs = case k of
 -- | Like 'khanaQueryMany', with @(pull ?e [...])@ allowed in @:find@.
 khanaQueryCellsMany :: Khana -> [(Text, [Q.Input])] -> IO [[[Q.Cell]]]
 khanaQueryCellsMany k qs = case k of
-  NativeKhana n -> nativeQueryCellsMany n qs
   DtlvKhana d     -> dtlvQueryMany d qs
-
--- | Run something against one consistent snapshot, with the whole in-process engine available.
--- Only the in-process khana has a 'Db'; with Datalevin this is a 'BadArgument'.
-khanaWithDb :: Khana -> (Db -> IO a) -> IO a
-khanaWithDb k act = case k of
-  NativeKhana n -> nativeWithDb n act
-  DtlvKhana _     -> throwIO (BadArgument "withKhana needs the in-process khana (KhanaDatalevinNative): with a Datalevin khana there is no Db to hand over (use query / queryCells)")
