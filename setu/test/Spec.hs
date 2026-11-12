@@ -20,28 +20,13 @@ import           System.Process (readProcessWithExitCode)
 import           Test.QuickCheck
 
 import           Takka.Edn (Edn(..), readEdn)
+import           DispatchTests
+import           Harness
+import           TicketTests
 import           Setu.Gen.CHeader
 import           Setu.Spec
 import           Setu.Validate
 import           Setu.Wire
-
--- ---------------------------------------------------------------------------
--- A very small harness (the same shape as hosigraph's)
-
-type Test = (String, IO ())
-
-check :: String -> Bool -> IO ()
-check msg ok = unless ok (throwIO (userError msg))
-
-checkEq :: (Eq a, Show a) => String -> a -> a -> IO ()
-checkEq msg expected actual =
-  unless (expected == actual) $
-    throwIO (userError (msg ++ "\n      expected: " ++ show expected ++ "\n      actual:   " ++ show actual))
-
-prop :: Testable p => Int -> p -> IO ()
-prop n p = do
-  r <- quickCheckWithResult stdArgs { maxSuccess = n, chatty = False } p
-  unless (isSuccess r) (throwIO (userError (output r)))
 
 main :: IO ()
 main = do
@@ -57,7 +42,7 @@ main = do
   when (failed > 0) exitFailure
 
 tests :: [Test]
-tests = specTests ++ validateTests ++ wireTests ++ headerTests
+tests = specTests ++ validateTests ++ wireTests ++ headerTests ++ ticketTests ++ dispatchTests
 
 -- ---------------------------------------------------------------------------
 -- Fixtures: two APIs.  dtlv is the second customer (the requirements' section 6.1 is its header).
