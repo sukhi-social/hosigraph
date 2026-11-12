@@ -1,4 +1,4 @@
-cabal-version:      2.4
+cabal-version:      3.0
 name:               hosigraph
 version:            0.0.1.0
 synopsis:           hosigraph Phase 1 prototype (events, khana, MPHF)
@@ -15,10 +15,7 @@ extra-source-files:
   docs/*.md
 
 common shared
-  default-language: Haskell2010
-  -- scripts/build-ghc.sh builds with GHC's own default (GHC2021); cabal-version 2.4 cannot name
-  -- that language, so the two extensions the code relies on are listed here.
-  default-extensions: DeriveFunctor, FlexibleContexts
+  default-language: GHC2021
   ghc-options:      -Wall -Wno-name-shadowing
 
 library
@@ -42,7 +39,7 @@ library
     Hosigraph.Sync
     Hosigraph.Tail
   build-depends:
-      base        >=4.14 && <5
+      base        >=4.20 && <5
     , takka
     , aeson       >=2.0  && <2.3
     , array       >=0.5  && <0.6

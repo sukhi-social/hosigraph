@@ -26,8 +26,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GHC_VERSION: "9.6.7"
-  CABAL_VERSION: "3.10.3.0"
+  GHC_VERSION: "9.10.3"
+  CABAL_VERSION: "3.14.2.0"
   DATALEVIN_VERSION: "1.2.10"
   # sha256 of datalevin-1.2.10-standalone.jar, from the release page of datalevin/datalevin
   DATALEVIN_JAR_SHA256: "0e8aba6d4022e63e9b34eafc39e257d1efa8ec2a920f089836c459e987605513"

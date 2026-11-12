@@ -1,4 +1,4 @@
-cabal-version:      2.4
+cabal-version:      3.0
 name:               hosigraph-abi
 version:            0.0.1.0
 synopsis:           hosigraph through a C ABI (written by setu from one description)
@@ -16,8 +16,7 @@ extra-source-files:
   test/abi_conformance.py
 
 common shared
-  default-language: Haskell2010
-  default-extensions: DeriveFunctor, FlexibleContexts
+  default-language: GHC2021
   ghc-options:      -Wall -Wno-name-shadowing
 
 -- What hosigraph offers, and how each operation reads and writes EDN.  No C, no foreign exports:
@@ -32,7 +31,7 @@ library
     Hosigraph.Abi.Handlers
     Hosigraph.Abi.Library
   build-depends:
-      base        >=4.14 && <5
+      base        >=4.20 && <5
     , hosigraph
     , setu
     , takka
@@ -54,7 +53,7 @@ foreign-library hosi
   build-depends:    base, bytestring, hosigraph-abi, setu
   c-sources:        gen/cbits/hosi_abi.c
   include-dirs:     gen/include
-  default-language: Haskell2010
+  default-language: GHC2021
   ghc-options:      -threaded -Wall
 
 test-suite spec

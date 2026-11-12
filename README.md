@@ -49,7 +49,7 @@ On the deep path `LookAlike` also means "the id is inside a block's range, but t
 
 ## Get started
 
-You need `ghc` (tested with 9.6.7) and the packages `aeson` and (for the tests) `QuickCheck`. There is no C to compile.
+You need `ghc` 9.10 or newer (tested with 9.10.3) and the packages `aeson` and (for the tests) `QuickCheck`. There is no C to compile.
 The khana lives in Datalevin, so to use a database you also need either a JDK 21 or newer and the Datalevin jar, or the `dtlv` executable (see below).
 
 Everything is in this repository. [`takka/`](takka/README.md) holds the words that hosigraph and Datalevin share
@@ -63,7 +63,7 @@ cabal run hosigraph-demo                 # a walk-through that moves a clock fro
 cabal test                               # 30 tests that need no Datalevin; more with Datalevin (see below)
 ```
 
-Tested: GHC 9.6.7 with `cabal build all`, on macOS (arm64). Linux is not tested here;
+Tested: GHC 9.10.3 with `cabal build all`, on macOS (arm64). Linux is not tested here;
 the GitHub Actions workflow ([`test.yml`](.github/workflows/test.yml)) runs the tests on ubuntu-24.04, with the JVM.
 
 > **`scripts/build-ghc.sh`** builds with plain `ghc`, for machines where cabal cannot reach Hackage:
@@ -322,7 +322,7 @@ python3 -I hosigraph-abi/test/abi_conformance.py <path to libhosi>   # the rules
 cabal test setu:spec hosigraph-abi:spec
 ```
 
-What has been seen working: the Haskell tests above, and the ctypes conformance on macOS (arm64, GHC 9.6.7). What has not:
+What has been seen working: the Haskell tests above, and the ctypes conformance on macOS (arm64, GHC 9.6.7 when it was first tried; the Haskell tests also pass on 9.10.3). What has not:
 
 * The operations against a real database. `hosigraph-abi:spec` runs them when `HOSIGRAPH_DTLV` (or `HOSIGRAPH_DATALEVIN_JAR` and `HOSIGRAPH_JAVA`) is set,
   as in CI; without one they are skipped, with a line saying so.
