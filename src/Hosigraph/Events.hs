@@ -11,7 +11,7 @@
 -- Events are the truth.  "Now" ("Hosigraph.Khana") is made /from/ them and can be thrown
 -- away and made again; this part cannot.  It knows nothing about Datalog or any khana.
 --
--- > record ──► tail.log ──sealNow──► chunks/<name>/{chunk.hosi, mphf.idx}
+-- > record ──► tail.log ──sealNow──► chunks/<name>/{chunk.hosi, mphf.idx, filter.bin}
 -- >                                     ▲
 -- >                                     └─ manifest (which chunks are the world; zone maps; hashes; signature)
 --
@@ -44,6 +44,7 @@ import           Data.Word
 import           System.Directory
 import           System.FilePath ((</>))
 
+import           Hosigraph.BinaryFuse (BinaryFuse)
 import           Hosigraph.Chunk
 import           Hosigraph.Event
 import           Hosigraph.Id
@@ -128,6 +129,7 @@ data Events = Events
   , xNextSeq  :: IORef Word64
   , xIds      :: IdGen
   , xReaders  :: IORef ReaderCache
+  , xFilters  :: IORef (M.Map String (Maybe BinaryFuse))   -- ^ every chunk's filter we have read (about 2.3 to 2.8 bytes an id; not part of the reader limit)
   }
 
 chunksDir :: Events -> FilePath
@@ -165,7 +167,7 @@ openEvents cfg dir = do
   gen <- newIdGen maxIdSeen
   now <- Just <$> ecClock cfg
   Events dir cfg <$> newMVar () <*> newIORef mf <*> pure tl <*> newIORef (fromBatches now batches)
-                <*> newIORef (lastS + 1) <*> pure gen <*> newIORef emptyReaderCache
+                <*> newIORef (lastS + 1) <*> pure gen <*> newIORef emptyReaderCache <*> newIORef M.empty
 
 closeEvents :: Events -> IO ()
 closeEvents = closeTail . xTail
@@ -190,6 +192,18 @@ readerFor k c = do
   -- stamp it as just used (readers run in parallel, so the update is atomic)
   atomicModifyIORef' (xReaders k) (\rk -> (cacheReader (ecReaderCacheBytes (xCfg k)) (ceName c) r rk, ()))
   pure r
+
+-- | The chunk's filter (none for a chunk that has no @filter.bin@).  It is read once and kept: it is small,
+-- and it is what answers \"is this chunk worth opening?\" before the reader is.
+filterFor :: Events -> ChunkEntry -> IO (Maybe BinaryFuse)
+filterFor k c = do
+  known <- M.lookup (ceName c) <$> readIORef (xFilters k)
+  case known of
+    Just f  -> pure f
+    Nothing -> do
+      f <- readChunkFilter (chunksDir k </> ceName c) (ceIds c)
+      atomicModifyIORef' (xFilters k) (\m -> (M.insert (ceName c) f m, ()))
+      pure f
 
 -- ---------------------------------------------------------------------------
 -- Letting events in
@@ -345,12 +359,14 @@ data LookupTrace = LookupTrace
   , ltChunks         :: Int                   -- ^ chunks in the world
   , ltSkippedByMonth :: Int                   -- ^ zone map: another month
   , ltSkippedByRange :: Int                   -- ^ zone map: right month, id outside [min, max]
+  , ltSkippedByFilter :: Int                  -- ^ the chunk's filter said \"certainly not\" (the MPHF was not asked)
   , ltProbed         :: [(String, Probe Int)] -- ^ 「星かな？」 asked of each chunk that was not skipped (Int = events found)
   , ltTailEvents     :: Int                   -- ^ events found in the unsealed tail
   } deriving Show
 
 -- | Every event about one entity (Creates and Deletes, oldest first), from the chunks
--- (MPHF point lookup) and the unsealed tail.
+-- and the unsealed tail.  Each chunk is asked in this order, cheapest first: the zone map in the
+-- manifest (month, id range), the chunk's filter, then the MPHF with its fingerprint and key check.
 history :: Events -> HosiId -> IO [Event]
 history k i = fst <$> historyTrace k i
 
@@ -362,7 +378,10 @@ historyTrace k i = do
       chunks = mfChunks mf
       sameMonth = [ c | c <- chunks, ceMonth c == month ]
       inRange   = [ c | c <- sameMonth, ceMinId c <= i, i <= ceMaxId c ]
-  probes <- forM inRange $ \c -> do
+  -- the filters first: a chunk that says \"certainly not\" is never opened
+  filters <- forM inRange $ \c -> (,) c <$> filterFor k c
+  let maybeHere = [ c | (c, f) <- filters, filterMayHave f i ]
+  probes <- forM maybeHere $ \c -> do
     cr <- readerFor k c
     r <- lookupInChunk cr i
     pure (ceName c, r)
@@ -372,6 +391,7 @@ historyTrace k i = do
         { ltMonth = month, ltChunks = length chunks
         , ltSkippedByMonth = length chunks - length sameMonth
         , ltSkippedByRange = length sameMonth - length inRange
+        , ltSkippedByFilter = length inRange - length maybeHere
         , ltProbed = [ (n, length <$> r) | (n, r) <- probes ]
         , ltTailEvents = length fromTail }
   pure (sortOn evSeq (fromChunks ++ fromTail), trace)
@@ -451,11 +471,13 @@ checkChunk k c = do
   if not exists then pure [tag "directory is missing"] else do
     r <- try $ do
       files <- hashChunkFiles dir
-      let fileProblems = [ tag ("file " ++ feName fe ++ " does not match its recorded hash/size")
+      let fileProblems = [ tag ("file " ++ feName fe ++ " is missing") | fe <- ceFiles c, feName fe `notElem` [ n | (n, _, _) <- files ] ]
+                      ++ [ tag ("file " ++ feName fe ++ " does not match its recorded hash/size")
                          | fe <- ceFiles c, (n, sz, sh) <- files, n == feName fe, sz /= feBytes fe || sh /= feSha256 fe ]
           hashProblem  = [ tag "chunk hash does not match its files" | chunkEntryHash (ceFiles c) /= ceHash c ]
       if not (null fileProblems) then pure (fileProblems ++ hashProblem) else do
         cr <- openChunkReader dir
+        filt <- readChunkFilter dir (ceIds c)
         evs <- readChunkEvents cr
         let info = crInfo cr
             footerProblems = [ tag "footer disagrees with the manifest (counts, range, month or kind)"
@@ -468,5 +490,7 @@ checkChunk k c = do
             Star got | sortOn evSeq got == sortOn evSeq es -> []
                      | otherwise -> [tag ("MPHF lookup of " ++ show i ++ " returns different events than a scan")]
             other -> [tag ("MPHF lookup of " ++ show i ++ " failed: " ++ show other)]
-        pure (hashProblem ++ footerProblems ++ mphfProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ])
+        -- the filter may be wrong about strangers, never about an id that is there
+        let filterProblems = [ tag ("the filter says no to " ++ show i ++ ", which is in the chunk") | i <- M.keys byId, not (filterMayHave filt i) ]
+        pure (hashProblem ++ footerProblems ++ mphfProblems ++ filterProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ])
     pure $ either (\(e :: SomeException) -> [tag ("unreadable: " ++ show e)]) id r

@@ -27,6 +27,7 @@ library
   exposed-modules:
     Hosigraph
     Hosigraph.Bin
+    Hosigraph.BinaryFuse
     Hosigraph.Chunk
     Hosigraph.Events
     Hosigraph.Khana

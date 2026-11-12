@@ -40,7 +40,8 @@ showEvent e = "seq " ++ show (evSeq e) ++ "  " ++ (case evKind e of KCreate -> "
 
 showTrace :: LookupTrace -> String
 showTrace t = "month=" ++ showMonth (ltMonth t) ++ "  of " ++ show (ltChunks t) ++ " chunks, skipped by month=" ++ show (ltSkippedByMonth t)
-  ++ ", skipped by ID range=" ++ show (ltSkippedByRange t) ++ ", probed=" ++ show (length (ltProbed t))
+  ++ ", skipped by ID range=" ++ show (ltSkippedByRange t) ++ ", skipped by filter=" ++ show (ltSkippedByFilter t)
+  ++ ", probed=" ++ show (length (ltProbed t))
   ++ concat [ "\n      " ++ n ++ " → is it a star? " ++ probeSays r ++ (case r of Star c -> " (" ++ show c ++ " events)"; _ -> "") | (n, r) <- ltProbed t ]
   ++ (if ltTailEvents t > 0 then "\n      from the tail log: " ++ show (ltTailEvents t) ++ " events" else "")
 
