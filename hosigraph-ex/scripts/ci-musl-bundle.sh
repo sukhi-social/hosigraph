@@ -47,5 +47,7 @@ cp -R hosigraph-ex/mix.exs hosigraph-ex/c_src hosigraph-ex/support hosigraph-ex/
 mkdir "$try/priv"
 tar -xzf "$asset" -C "$try/priv"
 mv dist-newstyle dist-newstyle.aside
-(cd "$try" && ldd priv/hosi_nif.so && HOSI_BUILD=none mix test)
+# (musl's ldd loads the NIF alone and cannot find the enif_* the BEAM gives it, and exits 1:
+# show only what it could not find as a library)
+(cd "$try" && { ldd priv/hosi_nif.so 2>&1 | grep -v 'Error relocating' || true; } && HOSI_BUILD=none mix test)
 mv dist-newstyle.aside dist-newstyle

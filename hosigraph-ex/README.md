@@ -49,6 +49,8 @@ Datalevin jar.
 * `hosi_cancel` is in the NIF but not offered in `Hosi`: the ids are the connection's own.
 * A bundle is big (about 75 MB unpacked, 16 MB packed on macOS): `hosigraph` depends on `aeson`, which brings
   its own dependencies along as shared libraries.
-* The Linux bundles, glibc and musl, have not run yet (the workflow is their first run); the macOS one has, by hand.
-  The musl ones are built inside `alpine:3.20` by `scripts/ci-musl-bundle.sh`, with the Alpine GHC that ghcup picks
-  (dynamically linked, so that it can make a shared library; not yet seen to do so).
+* The macOS bundle and the musl one for aarch64 have run (the musl one by `scripts/ci-musl-bundle.sh` in `alpine:3.20`, with
+  the Alpine GHC that ghcup picks, dynamically linked: 18 tests passed on the unpacked bundle). The glibc bundles and
+  x86_64-musl have not yet; the workflow is their first run.
+* musl's `ldd` loads a library alone, so it prints `Error relocating ... symbol not found` for every RTS (or `enif_*`) symbol
+  that only the host provides. It is noise; the scripts hide it.
