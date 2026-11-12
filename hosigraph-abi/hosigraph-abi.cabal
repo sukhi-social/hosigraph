@@ -1,0 +1,66 @@
+cabal-version:      2.4
+name:               hosigraph-abi
+version:            0.0.1.0
+synopsis:           hosigraph through a C ABI (written by setu from one description)
+description:
+  The door that other languages use to call hosigraph: a shared library (libhosi) whose C header,
+  Haskell exports and runtime start are written by setu from "Hosigraph.Abi.Api".
+  Requests and answers are UTF-8 EDN; a request is handed in with a number and answered once,
+  through a callback (the "ticket" ABI of setu).
+  The C in this package is generated text (gen/cbits); nothing in hosigraph, takka or setu has C.
+category:           Database
+build-type:         Simple
+extra-source-files:
+  gen/include/hosi.h
+  gen/cbits/hosi_abi.c
+  test/abi_conformance.py
+
+common shared
+  default-language: Haskell2010
+  default-extensions: DeriveFunctor, FlexibleContexts
+  ghc-options:      -Wall -Wno-name-shadowing
+
+-- What hosigraph offers, and how each operation reads and writes EDN.  No C, no foreign exports:
+-- it can be tested in Haskell alone.
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:
+    Hosigraph.Abi.Api
+    Hosigraph.Abi.Codec
+    Hosigraph.Abi.Files
+    Hosigraph.Abi.Handlers
+    Hosigraph.Abi.Library
+  build-depends:
+      base        >=4.14 && <5
+    , hosigraph
+    , setu
+    , takka
+    , containers  >=0.6  && <0.8
+    , text        >=1.2  && <2.2
+
+-- Writes gen/ (--out) or checks that it is as it should be (--check).
+executable hosigraph-abi-gen
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          Gen.hs
+  build-depends:    base, hosigraph-abi, setu
+
+-- libhosi.  The generated Haskell module and the C layer in front of it.
+foreign-library hosi
+  type:             native-shared
+  other-modules:    Hosigraph.Abi.Generated
+  hs-source-dirs:   gen
+  build-depends:    base, bytestring, hosigraph-abi, setu
+  c-sources:        gen/cbits/hosi_abi.c
+  include-dirs:     gen/include
+  default-language: Haskell2010
+  ghc-options:      -threaded -Wall
+
+test-suite spec
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Spec.hs
+  build-depends:    base, hosigraph-abi, hosigraph, setu, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text
+  ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4"

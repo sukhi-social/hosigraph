@@ -1,0 +1,18 @@
+-- How setu builds when it is in a repository of its own:
+--
+--   cabal --project-file=cabal.project.standalone build --enable-tests
+--   cabal --project-file=cabal.project.standalone test
+--
+-- While setu is a directory of the hosigraph repository, this file is not used: the cabal.project at
+-- the top of that repository is (cabal takes the nearest cabal.project, and this one has another name).
+--
+-- takka (EDN) is not on Hackage yet, so it is taken from where it lives: the takka/ directory of the
+-- hosigraph repository.  Pin it to a commit or a tag (`tag: <hash>`) so that a build can be repeated;
+-- the branch is only here so that the file works before there is one.
+packages: .
+
+source-repository-package
+  type: git
+  location: https://github.com/sukhi-social/hosigraph.git
+  branch: setu
+  subdir: takka

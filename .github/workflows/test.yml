@@ -4,6 +4,11 @@
 # pinned sha256. The native `dtlv` is not used here, so the tests that need it print that they
 # skipped them (see "Run the tests against Datalevin" in the README).
 # takka/ (the words hosigraph shares with Datalevin) is built along with it.
+#
+# setu/ (writes the doors other languages use) and hosigraph-abi/ (hosigraph behind a C ABI) are
+# tried here too: their Haskell tests, and a check that the generated files in hosigraph-abi/gen
+# are what the description gives.  The shared library itself (libhosi) is built and run against
+# the ctypes conformance in a job of its own, `abi`: it has been seen to pass on macOS only.
 name: test
 
 on:
@@ -45,7 +50,7 @@ jobs:
           path: |
             ${{ steps.setup.outputs.cabal-store }}
             dist-newstyle
-          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal') }}
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
           restore-keys: |
             cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
 
@@ -63,10 +68,51 @@ jobs:
           echo "HOSIGRAPH_DATALEVIN_JAR=${jar}" >> "$GITHUB_ENV"
           echo "HOSIGRAPH_JAVA=${JAVA_HOME}/bin/java" >> "$GITHUB_ENV"
 
+      # not `all`: that would build the shared library too, which has its own job below
       - name: Build
         run: |
           cabal update
-          cabal build all --enable-tests
+          cabal build --enable-tests hosigraph takka setu \
+            hosigraph-abi:lib:hosigraph-abi hosigraph-abi:exe:hosigraph-abi-gen hosigraph-abi:test:spec
 
       - name: Test
-        run: cabal test hosigraph:spec --test-show-details=direct
+        run: cabal test hosigraph:spec setu:spec hosigraph-abi:spec --test-show-details=direct
+
+      - name: Are the generated files up to date?
+        run: cabal run hosigraph-abi:exe:hosigraph-abi-gen -- --check hosigraph-abi/gen
+
+  # libhosi: the shared library, tried through ctypes with a fake database (no JVM here).
+  abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # Only macOS (arm64) has run this so far.  Let it fail without turning the whole run red,
+    # until it has been seen green on Linux once; then take this line out.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-abi-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
+          restore-keys: |
+            cabal-abi-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
+
+      - name: Build libhosi
+        run: |
+          cabal update
+          cabal build hosigraph-abi:flib:hosi
+
+      - name: Conformance (T-01 to T-14, through ctypes)
+        run: |
+          lib=$(find dist-newstyle -type f -name 'libhosi.so*' | head -n 1)
+          echo "library: $lib"
+          python3 -I hosigraph-abi/test/abi_conformance.py "$lib"

@@ -290,6 +290,47 @@ an ID past the last block takes none. The MPHF way and the block way give the sa
 * The filters are kept in memory with no limit, outside `hcReaderCacheBytes` (about 2.3 to 2.8 bytes an ID). A bucket with millions of chunks needs a limit.
 * Nothing writes a chunk without `mphf.idx` yet; the deep path is reached only by a source that does not have the file (the tests make one).
 
+## From other languages (`setu/`, `hosigraph-abi/`)
+
+hosigraph is a Haskell library. To use it from Go, Python, Elixir or C, the repository has two more packages next to `takka/`.
+Neither touches `hosigraph` or `takka`, and `hosigraph`, `takka` and `setu` still have no C.
+
+* **`setu/`** (working name; Pali for "bridge") writes the doors other languages use, from one description of an API (`Setu.Spec.Api`):
+  the operations, the shape of each argument and answer (`Ty`), and the error kinds. It is a set of pure functions from the description to text,
+  so the files it writes are committed and `--check` tells you when they are out of date. It also holds what every door shares:
+  the table of waiting requests (`Setu.Ticket`) and the table of operations (`Setu.Dispatch`).
+* **`hosigraph-abi/`** is the first customer. `Hosigraph.Abi.Api` describes hosigraph (`write`, `write-many`, `get-entities`, `query-many`,
+  `query-cells-many`, `history`, `history-trace`, `seal`, `verify`, `stats`, `rebuild-khana`); `gen/` holds what setu writes from it:
+  `include/hosi.h`, the Haskell `foreign export`s, and a small C file that starts the Haskell runtime and guards the calls.
+  The shared library is `libhosi`.
+
+`setu/` is made to be moved into a repository of its own (it has its own README, changelog, CI file and a `cabal.project.standalone`);
+[`docs/split-setu.md`](docs/split-setu.md) says how, what was tried, and what is still to be decided.
+
+The C interface is thin and does not change when an operation is added: `hosi_runtime_init`, `hosi_open`, `hosi_submit`, `hosi_cancel`, `hosi_close`,
+`hosi_runtime_shutdown`, `hosi_thread_done`, `hosi_abi_version`. A request is handed in with a number (an id the caller chooses) and a body, and is answered **once**,
+through a callback, with a status (`HOSI_OK`, `HOSI_ERR_APP`, ...) and a body. Both bodies are UTF-8 EDN, `{:op :write :args {...}}` going in and
+`{:ok ...}` or `{:error :write-rejected :message "..."}` coming back. The reserved operations `:ping` and `:abi` work on every connection, without a database.
+`open` takes EDN too (`{:dir ".." :schema {..} :config {..}}`) and returns a handle at once; the database starts on a thread of its own, and a failure to start
+is the answer of every request. A callback never runs on the thread that called `submit`, `cancel` or `close`, and `close` returns after all callbacks have returned.
+
+```bash
+cabal run hosigraph-abi-gen -- --out   hosigraph-abi/gen    # write the generated files
+cabal run hosigraph-abi-gen -- --check hosigraph-abi/gen    # fail if they are out of date
+cabal build hosigraph-abi:flib:hosi                          # libhosi
+python3 -I hosigraph-abi/test/abi_conformance.py <path to libhosi>   # the rules, through ctypes, with a fake database
+cabal test setu:spec hosigraph-abi:spec
+```
+
+What has been seen working: the Haskell tests above, and the ctypes conformance on macOS (arm64, GHC 9.6.7). What has not:
+
+* The operations against a real database. `hosigraph-abi:spec` runs them when `HOSIGRAPH_DTLV` (or `HOSIGRAPH_DATALEVIN_JAR` and `HOSIGRAPH_JAVA`) is set,
+  as in CI; without one they are skipped, with a line saying so.
+* Linux. CI has a separate job for it (`abi`), allowed to fail until it has passed once.
+* A host that is not Python. The runtime cannot be started again after `hosi_runtime_shutdown` (GHC's RTS refuses), and signal handlers are never installed
+  (`--install-signal-handlers=no`), so Ctrl-C stays with the host.
+* Shipping. The dylib names GHC's libraries by absolute path; a copy for someone else's machine needs them gathered with it.
+
 ## Not in Phase 1
 
 * Phase 2 (the rest) and later: S3 and Range GET over a real network, freezing (cold chunks),

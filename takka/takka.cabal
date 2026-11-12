@@ -1,6 +1,6 @@
 cabal-version:      2.4
 name:               takka
-version:            0.1.0.0
+version:            0.1.0.1
 synopsis:           Values, EDN, and the syntax of Datalog queries and pull patterns
 description:
   The words hosigraph and Datalevin share, in plain Haskell (no database, no C): the value and
