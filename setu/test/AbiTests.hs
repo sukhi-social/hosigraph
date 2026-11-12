@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings #-}
 -- | Tests of "Setu.Abi" (connections and handles) and of what "Setu.Gen.HsExport",
 -- "Setu.Gen.CAbi" and "Setu.Gen" write.  No C is compiled here; the C that is written is tried

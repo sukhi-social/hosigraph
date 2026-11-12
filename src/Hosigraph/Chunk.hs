@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings #-}
 -- |
 -- Module      : Hosigraph.Chunk
@@ -65,7 +66,7 @@ import           Control.Monad
 import           Data.Array (Array, bounds, listArray, rangeSize, (!))
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
-import           Data.List (foldl', sortOn)
+import           Data.List (sortOn)
 import qualified Data.IntMap.Strict as IM
 import qualified Data.Map.Strict as M
 import           Data.Word

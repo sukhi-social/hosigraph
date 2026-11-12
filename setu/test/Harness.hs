@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | A very small harness, shared by the test modules.
 module Harness

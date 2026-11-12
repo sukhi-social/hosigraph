@@ -66,7 +66,7 @@ A reference that is built on it: [hosigraph-abi](https://github.com/sukhi-social
 
 ## Status
 
-An early version (0.0.1). What has been seen working: the tests below, and one customer (hosigraph) through a shared library on macOS (arm64, GHC 9.6.7),
+An early version (0.0.1). What has been seen working: the tests below, and one customer (hosigraph) through a shared library on macOS (arm64, GHC 9.6.7 when it was first tried; the Haskell tests also pass on 9.10.3),
 driven from Python's `ctypes`. What has not: Linux, a host other than Python, shipping the shared library to another machine (GHC's libraries are
 named by absolute path), the GHC runtime started a second time after shutdown (it refuses, and the guard layer says so). T-13 and T-14 are additions
 to the original twelve rules and have not been agreed by anyone but the author.

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- | Writes the files that are made from the description in "Hosigraph.Abi.Api":
 --
 -- > cabal run hosigraph-abi-gen -- --out   hosigraph-abi/gen    # write them

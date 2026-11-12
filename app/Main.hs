@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings #-}
 -- A walk through hosigraph.  The clock moves by hand, from November to December.
 module Main (main) where

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE DeriveGeneric, OverloadedStrings #-}
 -- | Tests of "Setu.Codec": what the Generic way writes, what it reads back, and what it refuses.
 module CodecTests (codecTests) where

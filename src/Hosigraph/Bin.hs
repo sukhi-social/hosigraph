@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Bin
 -- Description : Big-endian binary builders and a tiny bounds-checked parser.

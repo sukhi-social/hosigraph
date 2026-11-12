@@ -77,8 +77,8 @@ To rehearse again without touching anything real, the same steps were run in a s
 
 ## What the owner has to decide (not decided here)
 
-* **The licence.** There is no LICENSE file anywhere in this repository, and no author or maintainer in any `.cabal` file. The new repository cannot be
-  used by anyone else until this is chosen, and hosigraph's own is the same question.
+* **The licence.** hosigraph, takka, setu and hosigraph-abi are under the Blue Oak Model License 1.0.0: each package directory has its own `LICENSE`
+  (so `setu/` carries it when it moves), and each `.cabal` says `license: BlueOak-1.0.0` (which needs `cabal-version: 3.0`; with 2.4 the SPDX list of the Cabal library does not have it yet). Still empty: the author and maintainer in every `.cabal` file.
 * **The names.** `setu` and `hosigraph-abi` are working names. A rename is cheaper before the split than after.
 * **T-13 and T-14.** The two rules added to the original twelve (a callback is never on the thread that called; `close` returns after the last callback)
   are kept by `Setu.Ticket` and tried by its tests; the README says they are only the author's proposal. Nobody else has agreed to them, and a rule that

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -38,6 +39,7 @@ module Setu.Codec
 
 import           Data.Char (isLower, isUpper, toLower)
 import           Data.Int (Int64)
+import           Data.Kind (Constraint, Type)
 import qualified Data.Map.Strict as M
 import           Data.Text (Text)
 import qualified Data.Text as T
@@ -187,6 +189,7 @@ genericFromEdn st e = case gTry st e of
     EVec (EKw t : _)    -> "unknown tag :" <> t
     _                   -> "not a tagged vector"
 
+type GToEdn :: (Type -> Type) -> Constraint
 class GToEdn f where
   gToEdn :: Style -> f p -> Edn
 
@@ -208,6 +211,7 @@ instance (Constructor c, GFields f) => GToEdn (C1 c f) where
       tag = styleCtor st (conName m)
 
 -- | The fields of a constructor: the name of each (empty when it has none) and its EDN.
+type GFields :: (Type -> Type) -> Constraint
 class GFields f where
   gFields :: f p -> [(String, Edn)]
 
@@ -220,6 +224,7 @@ instance (GFields f, GFields g) => GFields (f :*: g) where
 instance (Selector s, ToEdn a) => GFields (S1 s (K1 i a)) where
   gFields m@(M1 (K1 x)) = [(selName m, toEdn x)]
 
+type GFromEdn :: (Type -> Type) -> Constraint
 class GFromEdn f where
   -- | 'Nothing' when the EDN is not about one of these constructors (another tag); 'Just' when
   -- it is, whether it reads or not.
@@ -254,6 +259,7 @@ instance (Constructor c, GFromFields f) => GFromEdn (C1 c f) where
 -- | Where the fields of a constructor are read from.
 data Source = Keys [(Edn, Edn)] | Args [Edn]
 
+type GFromFields :: (Type -> Type) -> Constraint
 class GFromFields f where
   gFromFields :: Style -> Source -> Either Text (f p, Source)
 

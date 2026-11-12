@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Sha256
 -- Description : SHA-256 in plain Haskell, so the manifest can be hash-signed
@@ -13,7 +14,6 @@ import           Data.Array.Unboxed (UArray, listArray, (!))
 import           Data.Bits
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Unsafe as BU
-import           Data.List (foldl')
 import           Data.Word
 
 roundK :: UArray Int Word32

@@ -1,4 +1,4 @@
-cabal-version:      2.4
+cabal-version:      3.0
 name:               setu
 version:            0.0.1.0
 synopsis:           Say once what a Haskell API offers; write the doors other languages use
@@ -12,8 +12,11 @@ description:
   and instances of ToEdn / FromEdn that Generic writes.
   There is no C in this package: the C it writes is text.
 category:           Development
+license:            BlueOak-1.0.0
+license-file:       LICENSE
+copyright:          2026 Hosigraph Contributors
 build-type:         Simple
-tested-with:        GHC == 9.6.7
+tested-with:        GHC == 9.10.3
 extra-doc-files:
   README.md
   CHANGELOG.md
@@ -21,7 +24,7 @@ extra-source-files:
   test/golden/*.h
 
 common shared
-  default-language: Haskell2010
+  default-language: GHC2021
   ghc-options:      -Wall -Wno-name-shadowing
 
 library
@@ -40,7 +43,7 @@ library
     Setu.Gen.CAbi
     Setu.Gen.HsExport
   build-depends:
-      base        >=4.14 && <5
+      base        >=4.20 && <5
     , takka       >=0.1.0.1 && <0.2
     , bytestring  >=0.10 && <0.13
     , containers  >=0.6  && <0.8
