@@ -9,7 +9,7 @@ description:
 category:           Database
 license:            BlueOak-1.0.0
 license-file:       LICENSE
-copyright:          2026 Sukhi Contributors
+copyright:          2026 Hosigraph Contributors
 build-type:         Simple
 
 common shared
