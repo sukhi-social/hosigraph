@@ -9,6 +9,8 @@ description:
   through a callback (the "ticket" ABI of setu).
   The C in this package is generated text (gen/cbits); nothing in hosigraph, takka or setu has C.
 category:           Database
+license:            BlueOak-1.0.0
+license-file:       LICENSE
 build-type:         Simple
 extra-source-files:
   gen/include/hosi.h

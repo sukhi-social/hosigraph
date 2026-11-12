@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Sync
 -- Description : fsync for files and directories (durability, not just flushing).

@@ -9,6 +9,8 @@ description:
   (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
   There is no C in the package.
 category:           Database
+license:            BlueOak-1.0.0
+license-file:       LICENSE
 build-type:         Simple
 extra-source-files:
   README.md

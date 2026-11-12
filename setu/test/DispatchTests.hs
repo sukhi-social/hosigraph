@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- | Tests of "Setu.Dispatch": bytes in, bytes out, and who is blamed.
 module DispatchTests (dispatchTests) where

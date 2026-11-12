@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- | Tests of "Setu.Ticket": the rules of the requirements (T-01 to T-08, T-11) and the two that
 -- setu adds (T-13, T-14), all in Haskell: no C, no database.

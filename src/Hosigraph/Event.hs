@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Event
 -- Description : The vocabulary of hosigraph: ids, events (Create / Delete), and their bytes.

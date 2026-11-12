@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Probe
 -- Description : 「星かな？」 What a point lookup finds out, one chunk at a time.

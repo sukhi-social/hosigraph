@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- setu tests.  A plain executable, QuickCheck where "for every input" is the point.
 -- Nothing here needs a database; the one check that wants a C compiler is skipped without one.

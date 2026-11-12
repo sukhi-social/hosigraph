@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BlueOak-1.0.0
 """Conformance of libhosi, driven from Python (ctypes) the way a foreign host would drive it.
 
     python3 -I hosigraph-abi/test/abi_conformance.py PATH/TO/libhosi.{dylib,so}

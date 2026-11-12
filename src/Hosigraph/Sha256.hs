@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Sha256
 -- Description : SHA-256 in plain Haskell, so the manifest can be hash-signed

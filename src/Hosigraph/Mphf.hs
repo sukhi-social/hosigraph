@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Mphf
 -- Description : A minimal perfect hash function, PTHash-style (hash, displace, remap).

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: BlueOak-1.0.0
 # Build without cabal (handy when Hackage is unreachable): needs only ghc and the packages that
 # ship with GHC / distributions (aeson, QuickCheck for the tests). There is no C to compile.
 # takka (values, EDN, Datalog syntax) is in this repository (takka/), so there is nothing else to find.

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings #-}
 -- |
 -- Module      : Setu.Gen.CHeader

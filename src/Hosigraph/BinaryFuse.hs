@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.BinaryFuse
 -- Description : A Binary Fuse filter (3 wise, 16-bit prints): "is this key maybe in the chunk?" in a few bytes per key.

@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 -- |
 -- Module      : Hosigraph.Id
 -- Description : Time-sortable ids. The id alone says which month an entity was created in.

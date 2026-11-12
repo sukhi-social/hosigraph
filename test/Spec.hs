@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: BlueOak-1.0.0
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- hosigraph Phase 1 tests.  Plain executable (no test framework needed), QuickCheck for the
 -- parts where "for all inputs" is the point (MPHF, chunk files), scenarios for the rest.
