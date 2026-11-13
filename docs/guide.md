@@ -123,6 +123,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | Call | What it does |
 |---|---|
 | `write` | Create and Delete operations in one call. **All of them go in, or none.** |
+| `writeIf` | `write`, but only if some facts of **now** are still true. The check and the write happen under one lock. See "Writing only if". |
 | `writeMany` | Many batches with one append, one fsync, and one khana transaction. |
 | `getEntity`, `query`, `queryCells` | Read **now**. |
 | `getEntities`, `queryMany`, `queryCellsMany` | Read **now**, many questions at once. |
@@ -167,6 +168,48 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datale
   `KhanaDtlv` is left as it was: one process per operation, with `transact!`.
 * The schema maps to the Datalevin schema (`:db/valueType`, `:db/cardinality`, `:db/unique`). `TAny` has no type.
 * Your EDN Datalog goes to Datalevin as it is, and `pull` works in `queryCells`.
+
+## Writing only if
+
+Read-then-write has a hole: between your read and your write another writer can go in, and your write is made
+from a "now" that is no longer there (two people press "like" at once, and one like is lost). `writeIf` closes it.
+
+```haskell
+data Cond = Holds HosiId Keyword Value   -- this entity has this value for this attribute, now
+          | Lacks HosiId Keyword Value   -- ...does not have it
+          | Unset HosiId Keyword         -- ...has no value at all for this attribute
+
+writeIf :: Hosi -> [Cond] -> [Op] -> IO (Either [Cond] WriteReport)
+
+-- "add one to the likes", and read again if somebody was first
+bump h post = do
+  [m] <- getEntities h [post]
+  let n = case M.lookup "post/likes" m of Just [VInt k] -> k; _ -> 0
+  r <- writeIf h [Holds post "post/likes" (VInt n)] [Create (Id post) "post/likes" (Lit (VInt (n + 1)))]
+  either (const (bump h post)) (const (pure ())) r
+```
+
+* The conditions are checked with the events lock held, against "now" in the khana (one read, however many
+  entities are named), and the batch is written under the same lock. No other writer can come between the check and the write.
+* `Right report`: the conditions held and the batch went in, as `write` does.
+* `Left conds`: these conditions did not hold (in the order given). **Nothing was written, and no seq was used.**
+  Retrying is yours: read again, and call again. hosigraph does not loop for you, because only you know what to do with what you read.
+* Which one for which job: `Holds` is compare-and-set (a counter, a status that moves from A to B); `Lacks` is "if I have
+  not done this yet" (a value in a many-attribute); `Unset` is "set it up once". "Create it if it is not there" needs none of them
+  for a new entity: hosigraph gives the ids, and a `unique` attribute in the schema already refuses a second one.
+* Bad input is an exception, as in `write`: an empty batch, or a condition on a reserved id (up to 1), is `BadArgument`.
+  If a condition fails and the batch is also bad, you hear about the condition first.
+* There is no `Tmp` in a condition: a new entity has no state to ask about.
+* `writeMany` has no conditions: a later batch may depend on what an earlier one did.
+* The check reads the same "now" that `getEntity` reads, so what you read and what the check sees can only differ
+  if somebody wrote in between. That is what `Holds` is for.
+* Seen in testing: with `KhanaDtlv`, a read made at the very moment another call writes could fail to open the
+  database. The lock only orders the writers; it does not stop an outside read. (The JVM backend was not tried for this.)
+
+Through the C door it is the same call: `write` takes an optional `:when`, a vector of `[:holds id attr v]`,
+`[:lacks id attr v]` and `[:unset id attr]`. When one does not hold the answer is the error kind `:conflict`
+(status `HOSI_ERR_APP`), and its message is the failed conditions as EDN text. From Elixir: `Hosi.write(db, ops, when: [...])`
+(then `{:error, {:app, :conflict, message}}`).
 
 ## Faster with groups
 

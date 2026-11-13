@@ -7,6 +7,9 @@ connection numbers the requests and gives each answer to its caller. Bodies are 
 ```elixir
 {:ok, db} = Hosi.start_link(open: %{dir: "/var/lib/hosi", schema: %{"person/name": %{type: :string}}})
 {:ok, report} = Hosi.write(db, [[:create, [:tmp, 1], :"person/name", "Frege"]])
+
+# only if it is still as you read it (else {:error, {:app, :conflict, message}}: read again, try again)
+Hosi.write(db, [[:create, 5, :"post/likes", 4]], when: [[:holds, 5, :"post/likes", 3]])
 Hosi.stop(db)
 ```
 

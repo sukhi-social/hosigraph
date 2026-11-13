@@ -1854,6 +1854,79 @@ hosiTests be =
       checkEq "verify clean" [] =<< verify h2
       closeHosi h2)
 
+  , ("writeIf: racing writers on one condition; exactly one wins, the others get the condition back and leave nothing", withTmp $ \dir -> do
+      -- (nobody reads from outside while the others write: with the dtlv executable a read and a write
+      -- at the same moment cannot both open the database)
+      h <- openHosiWith (backendCfg be) dir schema
+      p <- person h "Racer" 0
+      s0 <- stats h
+      done <- newEmptyMVar
+      forM_ [1 .. 6 :: Int] $ \t -> forkIO $ do
+        r <- try (writeIf h [Holds p "person/age" (VInt 0)] [Create (Id p) "person/age" (Lit (VInt (fromIntegral t)))])
+        putMVar done r
+      rs <- replicateM 6 (takeMVar done) :: IO [Either SomeException (Either [Cond] WriteReport)]
+      let wins  = [ w | Right (Right w) <- rs ]
+          lost  = [ c | Right (Left c)  <- rs ]
+      checkEq "nobody threw" 6 (length wins + length lost)
+      checkEq "one winner" 1 (length wins)
+      checkEq "the five others were told which condition failed" (replicate 5 [Holds p "person/age" (VInt 0)]) lost
+      Just [VInt winner] <- ageOf h p
+      check "the value is the winner's, not a mix" (winner >= 1 && winner <= 6)
+      s1 <- stats h
+      checkEq "one event went in, the losers left no seq behind" (stNextSeq s0 + 1) (stNextSeq s1)
+      checkEq "verify" [] =<< verify h
+      h2 <- reopen (backendCfg be) dir h
+      checkEq "after reopen" (Just [VInt winner]) =<< ageOf h2 p
+      closeHosi h2)
+
+  , ("writeIf: Holds, Lacks and Unset, one by one; the failed ones come back in order; nothing is written when any fails", withTmp $ \dir -> do
+      h <- openHosiWith (backendCfg be) dir schema
+      p <- person h "Frege" 70
+      q <- person h "Peirce" 75
+      let setAge i n = [Create (Id i) "person/age" (Lit (VInt n))]
+          isBad r = case r of Left (BadArgument _) -> True; _ -> False
+          nextSeq = stNextSeq <$> stats h
+      s0 <- nextSeq
+      -- Holds: the right value goes in; a stale one is Left and leaves nothing
+      r1 <- writeIf h [Holds p "person/age" (VInt 70)] (setAge p 71)
+      check "Holds with the current value" (either (const False) (const True) r1)
+      checkEq "age is 71" (Just [VInt 71]) =<< ageOf h p
+      r2 <- writeIf h [Holds p "person/age" (VInt 70)] (setAge p 99)
+      checkEq "Holds with a stale value is Left" (Left [Holds p "person/age" (VInt 70)]) (fmap (const ()) r2)
+      checkEq "...and the age is as it was" (Just [VInt 71]) =<< ageOf h p
+      checkEq "...and no seq was used" (s0 + 1) =<< nextSeq
+      -- Lacks and Unset
+      r3 <- writeIf h [Lacks p "person/age" (VInt 70), Unset p "person/score"] [Create (Id p) "person/score" (Lit (VDouble 1.5))]
+      check "Lacks (a value it does not have) and Unset (no value yet)" (either (const False) (const True) r3)
+      r4 <- writeIf h [Unset p "person/score"] [Create (Id p) "person/score" (Lit (VDouble 2.5))]
+      checkEq "Unset once it has a value is Left" (Left [Unset p "person/score"]) (fmap (const ()) r4)
+      r5 <- writeIf h [Lacks p "person/age" (VInt 71)] (setAge p 5)
+      checkEq "Lacks a value it has is Left" (Left [Lacks p "person/age" (VInt 71)]) (fmap (const ()) r5)
+      -- several conditions, several entities: all must hold; the Left names only those that do not
+      s1 <- nextSeq
+      r6 <- writeIf h [ Holds p "person/age" (VInt 71), Holds q "person/age" (VInt 1), Unset q "person/score", Holds q "person/name" (VStr "x") ]
+                      (setAge p 6 ++ setAge q 7)
+      checkEq "the failed ones, in the order given"
+        (Left [Holds q "person/age" (VInt 1), Holds q "person/name" (VStr "x")]) (fmap (const ()) r6)
+      checkEq "neither entity changed" [Just [VInt 71], Just [VInt 75]] =<< mapM (ageOf h) [p, q]
+      checkEq "no seq was used" s1 =<< nextSeq
+      -- an entity that is not there: Unset holds, Holds does not
+      r7 <- writeIf h [Holds 123456789 "person/age" (VInt 1)] (setAge q 8)
+      check "Holds on a thing that is not there is Left" (either (const True) (const False) r7)
+      -- no conditions: it is 'write'
+      r8 <- writeIf h [] (setAge q 9)
+      check "no conditions" (either (const False) (const True) r8)
+      checkEq "q is 9" (Just [VInt 9]) =<< ageOf h q
+      -- a reserved id in a condition is a BadArgument; a bad batch is an exception, as in write
+      r9 <- try (writeIf h [Unset 1 "person/age"] (setAge p 1))
+      check "reserved id in a condition" (isBad (fmap (const ()) (r9 :: Either HosiError (Either [Cond] WriteReport))))
+      r10 <- try (writeIf h [Holds p "person/age" (VInt 71)] [])
+      check "an empty batch is BadArgument" (isBad (fmap (const ()) (r10 :: Either HosiError (Either [Cond] WriteReport))))
+      checkEq "verify" [] =<< verify h
+      h2 <- reopen (backendCfg be) dir h
+      checkEq "after reopen" [Just [VInt 71], Just [VInt 9]] =<< mapM (ageOf h2) [p, q]
+      closeHosi h2)
+
   , ("scale: 20,000 events over several seals; every id found; reopen; verify", withTmp $ \dir -> do
       (clk, clock) <- newClock nov11
       h <- openHosiWith (cfgWith clock) dir schema

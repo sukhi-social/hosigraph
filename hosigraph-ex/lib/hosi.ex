@@ -78,8 +78,30 @@ defmodule Hosi do
   def ping(conn, value \\ 1), do: request(conn, :ping, value)
   def abi(conn), do: request(conn, :abi)
 
-  @doc "One batch, all of it or none. Ops are `[:create, ref, attr, val]` / `[:delete, ...]`, ref `id` or `[:tmp, n]`."
-  def write(conn, ops), do: request(conn, :write, %{ops: ops})
+  @doc """
+  One batch, all of it or none. Ops are `[:create, ref, attr, val]` / `[:delete, ...]`, ref `id` or `[:tmp, n]`.
+
+  With `when:`, the batch goes in only if every condition still holds in now. The conditions are
+  checked and the batch written under one lock, so no other writer can come between: read, then
+  write with `when:` what you read.
+
+      {:ok, [%{"post/likes": [n]}]} = Hosi.get_entities(db, [post])
+      Hosi.write(db, [[:create, post, :"post/likes", n + 1]],
+        when: [[:holds, post, :"post/likes", n]])
+
+  A condition is `[:holds, id, attr, value]` (it has this value), `[:lacks, id, attr, value]` (it
+  does not), or `[:unset, id, attr]` (it has no value at all). There is no `[:tmp, n]` here: a new
+  entity has no state to ask about.
+
+  When one does not hold nothing is written, and the answer is `{:error, {:app, :conflict, message}}`;
+  the message is the conditions that failed, as EDN (`Hosi.Edn.decode/1` reads it). Read again, and try again.
+  """
+  def write(conn, ops, opts \\ []) do
+    args = %{ops: ops}
+    args = if conds = Keyword.get(opts, :when), do: Map.put(args, :when, conds), else: args
+    request(conn, :write, args)
+  end
+
   def write_many(conn, batches), do: request(conn, :"write-many", %{batches: batches})
   def seal(conn), do: request(conn, :seal)
   def get_entities(conn, ids), do: request(conn, :"get-entities", %{ids: ids})
