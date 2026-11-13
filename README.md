@@ -82,6 +82,7 @@ Tested with GHC 9.10.3 on macOS arm64.
 - [x] Phase 1: events, chunks, the khana, restart-safe
 - [x] Phase 2, first half: the filter, and reading a chunk by ranges
 - [x] A C interface, `libhosi`, written by [setu](docs/guide.md#from-other-languages-setu-hosigraph-abi) (seen working on macOS only)
+- [x] Phase 3, the local part: `erase` (ids, a span of ids or time, or what an account owns), `clean`, `freeze` (cold chunks), also through the C door
 - [ ] S3 ([plan](TODO.md))
 
 Speed is only roughly measured, and the guide lists the limits.

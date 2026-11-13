@@ -40,6 +40,7 @@ library
     , takka
     , containers  >=0.6  && <0.8
     , text        >=1.2  && <2.2
+    , time        >=1.9  && <1.14
 
 -- Writes gen/ (--out) or checks that it is as it should be (--check).
 executable hosigraph-abi-gen
@@ -64,5 +65,5 @@ test-suite spec
   type:             exitcode-stdio-1.0
   hs-source-dirs:   test
   main-is:          Spec.hs
-  build-depends:    base, hosigraph-abi, hosigraph, setu, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text
+  build-depends:    base, hosigraph-abi, hosigraph, setu, takka, QuickCheck >=2.14, bytestring, containers, directory, filepath, process, text, time
   ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4"

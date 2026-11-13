@@ -41,6 +41,9 @@ data Backend = Backend
   , bVerify         :: IO [String]
   , bStats          :: IO Stats
   , bRebuildKhana   :: IO ()
+  , bErase          :: [Erasure] -> IO EraseReport
+  , bClean          :: CleanOptions -> IO CleanReport
+  , bFreeze         :: FreezeOptions -> IO FreezeReport
   }
 
 realBackend :: Hosi -> Backend
@@ -48,7 +51,8 @@ realBackend h = Backend
   { bWrite = write h, bWriteMany = writeMany h, bSeal = seal h
   , bGetEntities = getEntities h, bQueryMany = queryMany h, bQueryCellsMany = queryCellsMany h
   , bHistory = history h, bHistoryTrace = historyTrace h
-  , bVerify = verify h, bStats = stats h, bRebuildKhana = rebuildKhana h }
+  , bVerify = verify h, bStats = stats h, bRebuildKhana = rebuildKhana h
+  , bErase = erase h, bClean = clean h, bFreeze = freeze h }
 
 -- | The backend of a connection that was opened without a database: every operation is refused
 -- (the reserved @ping@ and @abi@ are the dispatcher's, and still answer).
@@ -56,7 +60,8 @@ unattached :: Backend
 unattached = Backend
   { bWrite = no1, bWriteMany = no1, bSeal = no0, bGetEntities = no1, bQueryMany = no1
   , bQueryCellsMany = no1, bHistory = no1, bHistoryTrace = no1
-  , bVerify = no0, bStats = no0, bRebuildKhana = no0 }
+  , bVerify = no0, bStats = no0, bRebuildKhana = no0
+  , bErase = no1, bClean = no1, bFreeze = no1 }
   where
     no0 :: IO b
     no0 = E.throwIO (BadArgument "this connection has no database: open was not given :dir")
@@ -77,6 +82,9 @@ handlers b =
   , ("verify",           run none        (const (bVerify b)) toEdn)
   , ("stats",            run none        (const (bStats b))  toEdn)
   , ("rebuild-khana",    run none        (const (bRebuildKhana b)) (const ENil))
+  , ("erase",            run decErasures (bErase b)          encEraseReport)
+  , ("clean",            run decCleanOptions  (bClean b)     encCleanReport)
+  , ("freeze",           run decFreezeOptions (bFreeze b)    encFreezeReport)
   ]
   where none _ = Right ()
 

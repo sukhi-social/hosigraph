@@ -29,6 +29,7 @@ library
     Hosigraph.Bin
     Hosigraph.BinaryFuse
     Hosigraph.Chunk
+    Hosigraph.Erase
     Hosigraph.Events
     Hosigraph.Khana
     Hosigraph.Khana.Dtlv
