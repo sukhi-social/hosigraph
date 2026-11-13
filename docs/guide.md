@@ -161,6 +161,10 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datale
 * `KhanaDatalevinJvm` talks to the JVM one line at a time. `closeHosi` ends it, and so does the end of your process.
   If the JVM dies, that one call fails (a write fails with `WriteRejected`), and the next call starts a new JVM.
   Nothing is lost, because the khana can be built again from the events.
+* `KhanaDatalevinJvm` opens the khana with Datalevin's **write-ahead log in the relaxed profile** (small segments, small retention), and writes with `transact-ack!`.
+  A write waits for the log once, not for the log and LMDB's own sync as well; measured, one write per transaction is about 3 times faster (batches, `writeMany`, are the same speed).
+  If the process dies, the khana may lose its last few writes; the folded seq is in the same transaction as the facts, so the next open sees that the khana is behind the tail log and folds the rest in.
+  `KhanaDtlv` is left as it was: one process per operation, with `transact!`.
 * The schema maps to the Datalevin schema (`:db/valueType`, `:db/cardinality`, `:db/unique`). `TAny` has no type.
 * Your EDN Datalog goes to Datalevin as it is, and `pull` works in `queryCells`.
 
@@ -347,7 +351,10 @@ the chunks that got a record, how many facts left "now", and the ids that `Erase
 ### Clean: let it go from the disk
 
 `erase` hides at once, but the bytes are still in the chunk, and the retracted facts are still in the khana's file. (This was measured: after a retract, a marker text was still in Datalevin's
-`data.mdb` twice, in the native `dtlv` and in the JVM alike. LMDB reuses freed pages *sometime*, which is luck, not a promise. A plain copy keeps the bytes; a compacted copy has none.)
+`data.mdb` twice, in the native `dtlv` and in the JVM alike. LMDB reuses freed pages *sometime*, which is luck, not a promise. A plain copy keeps the bytes; a compacted copy has none.
+With the JVM khana's write-ahead log the bytes are also in `txlog/segment-*.wal` and in `snapshots/*/data.mdb`, and *stay there until `clean`* (retracting, writing more, closing: none of it removes them).
+So the promise is the same, "after `clean` it is nowhere", but the time in between is different: without the log it was sometimes gone by luck, with it it is there for sure. The compacted copy has neither
+directory, and the old khana directory is replaced as a whole, so the log goes with it.)
 `clean` finishes the job, in this order:
 
 1. **Rewrite the chunks that have a record.** For each one: read its events (leaving out the erased), write a **new** chunk (new zone map, filter and MPHF), and, under the lock, if the old entry

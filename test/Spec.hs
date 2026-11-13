@@ -2326,7 +2326,20 @@ nativeTests exe =
 -- | Only the resident JVM.
 jvmTests :: FilePath -> FilePath -> [Test]
 jvmTests java jar =
-  [ ("a missing java, or a missing jar, is found before anything is touched", withTmp $ \dir -> do
+  [ ("the khana has a write-ahead log: an erased value is in txlog/ until clean, and in no file after it", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith ((backendCfg (KhanaDatalevinJvm java jar)) { hcClock = clock }) dir schema
+      _ <- person h (T.pack (marker 1)) 1
+      b <- person h (T.pack (marker 2)) 2
+      check "the khana's txlog directory is there" =<< doesDirectoryExist (dir </> "khana-dtlv" </> "txlog")
+      _ <- erase h [EraseIds [b]]
+      check "erased, not cleaned: the value is still in the khana's log" . (> 0) =<< markerCount (BC.pack (marker 2)) (dir </> "khana-dtlv" </> "txlog")
+      _ <- clean h defaultCleanOptions
+      checkEq "cleaned: it is in no file" 0 =<< markerCount (BC.pack (marker 2)) dir
+      check "the other one is" . (> 0) =<< markerCount (BC.pack (marker 1)) dir
+      closeHosi h)
+
+  , ("a missing java, or a missing jar, is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let bad be d = do r <- try (openHosiWith ((backendCfg be) { hcClock = clock }) d schema) :: IO (Either HosiError Hosi)
                         pure (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
