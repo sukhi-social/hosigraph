@@ -55,7 +55,9 @@ case "$(uname -s)" in
     i=0
     while [ "$i" -lt "${#todo[@]}" ]; do
       f=${todo[$i]}; i=$((i + 1))
-      for dep in $(ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $3}'); do
+      # musl's ldd loads the library by itself and complains of every symbol only the RTS (or
+      # the BEAM) will give it; the list on stdout is right all the same
+      for dep in $(ldd "$f" 2>/dev/null | awk '/=>/ && $3 ~ /^\// {print $3}'); do
         name=$(basename "$dep")
         if [[ $name =~ $system ]] || [ -e "$out/$name" ]; then continue; fi
         cp -f "$dep" "$out/$name"; chmod u+w "$out/$name"
