@@ -40,7 +40,7 @@ module Hosigraph.Events
     -- * Finding them again
   , history, historyTrace, historyTraceAfter, LookupTrace(..), Probe(..)
     -- * For whoever folds the events into "now"
-  , lastSeq, eventsAfter, tailBatches, resetTailTo
+  , lastSeq, eventsAfter, eventsAfterEach, tailBatches, resetTailTo
     -- * Checking
   , verifyEvents, EventsStats(..), eventsStats
   ) where
@@ -878,14 +878,33 @@ lastSeq k = subtract 1 <$> readIORef (xNextSeq k)
 -- records one after the other.
 eventsAfter :: Events -> Word64 -> IO [Event]
 eventsAfter k after = do
+  acc <- newIORef []
+  eventsAfterEach k after (\g -> modifyIORef' acc (g :))
+  concat . reverse <$> readIORef acc
+
+-- | The same events as 'eventsAfter', in the same order, but handed over one group at a time, so only one
+-- group is in memory at once.  A group is a run of chunks whose seq ranges overlap (a chunk that starts at
+-- or before the largest seq so far joins the run); groups do not overlap each other, so they come in seq
+-- order and each one is sorted by seq.  Same rules for the lock as 'eventsAfter'.  A group is as big as
+-- its chunks together, so chunks with wide, overlapping ranges bring the memory back up.
+eventsAfterEach :: Events -> Word64 -> ([Event] -> IO ()) -> IO ()
+eventsAfterEach k after each = do
   mf <- readIORef (xManifest k)
   erased <- readIORef (xErased k)
-  sortOn evSeq . concat <$> forM [ c | c <- mfChunks mf, ceMaxSeq c > after ] (\c -> do
-    cr <- readerFor k c
-    let goneHere = case M.lookup (ceName c) (erByChunk erased) of
-          Nothing -> const False
-          Just s  -> (`Erase.member` s)
-    filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr)
+  let live = sortOn ceMinSeq [ c | c <- mfChunks mf, ceMaxSeq c > after ]
+      groups = map reverse (reverse (foldl step [] live))
+      step [] c = [[c]]
+      step (g : gs) c
+        | ceMinSeq c <= maximum (map ceMaxSeq g) = (c : g) : gs
+        | otherwise                              = [c] : g : gs
+  forM_ groups $ \g -> do
+    evs <- forM g $ \c -> do
+      cr <- readerFor k c
+      let goneHere = case M.lookup (ceName c) (erByChunk erased) of
+            Nothing -> const False
+            Just s  -> (`Erase.member` s)
+      filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr
+    each (sortOn evSeq (concat evs))
 
 -- | The unsealed batches, oldest first.  One batch = one 'record' = all or nothing.
 tailBatches :: Events -> IO [[Event]]

@@ -39,6 +39,19 @@ defmodule HosiTest do
              Hosi.write(db, [[:create, 1, :a, 2]], when: [[:holds, 1, :a, 2], [:lacks, 1, :b, 3], [:unset, 1, :c]])
   end
 
+  test "erase, clean and freeze: a request that is not the shape is :protocol, one that is reaches the library", %{db: db} do
+    # (no database here: a request of the right shape is refused as :app)
+    assert {:error, {:protocol, _, _}} = Hosi.erase(db, [[:everything]])
+    assert {:error, {:protocol, _, _}} = Hosi.erase(db, [[:ids, "x"]])
+    assert {:error, {:app, :"bad-argument", _}} =
+             Hosi.erase(db, [[:ids, [1, 2]], [:range, 1, 9], [:between, 0, 10], [:"owned-by", [:a], [3]], [:"owned-by-between", [:a], [3], 0, 10]])
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.clean(db)
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.clean(db, max_chunks: 2)
+    assert {:error, {:protocol, _, _}} = Hosi.clean(db, max_chunks: "two")
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.freeze(db)
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.freeze(db, max_units: 1)
+  end
+
   test "an address that is not the shape is said at the first request" do
     {:ok, db} = Hosi.start_link(open: %{dir: 5})
     assert {:error, {:protocol, :"bad-open", msg}} = Hosi.ping(db)

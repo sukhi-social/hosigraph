@@ -114,6 +114,42 @@ defmodule Hosi do
   def stats(conn), do: request(conn, :stats)
   def rebuild_khana(conn), do: request(conn, :"rebuild-khana")
 
+  @doc """
+  Make entities gone, from the events and from now, in one step however many erasures are given. It
+  hides them at once; their bytes leave the disk when `clean/2` has run. Each erasure is one of
+
+      [:ids, [id, ...]]                               # these entities
+      [:range, first_id, last_id]                     # every id from the first to the last, inclusive
+      [:between, from_ms, to_ms]                      # every entity created in [from, to), ms since 1970
+      [:"owned-by", [attr, ...], [owner, ...]]        # whatever has one of the attributes with an owner as its value
+      [:"owned-by-between", [attr, ...], [owner, ...], from_ms, to_ms]
+
+  The answer has `:generation`, `:dropped`, `:recorded`, `:retracted` and `:owned` (the ids the
+  `:"owned-by"` parts matched, whether or not they were erased before).
+  """
+  def erase(conn, erasures), do: request(conn, :erase, %{erasures: erasures})
+
+  @doc """
+  Let what `erase/2` took out go from the disk: the chunks are written again without the erased
+  events, then the khana becomes a new file. `max_chunks:` limits one call (all, if left out);
+  `:"records-left"` above 0 in the answer means call again. Call it when the host is quiet; writes go on meanwhile.
+  """
+  def clean(conn, opts \\ []), do: request(conn, :clean, limit(opts, :max_chunks, :"max-chunks"))
+
+  @doc """
+  Put a month nobody has read or written for `cold-after-ms` (see `open`) into one cold chunk: a
+  smaller footprint, the same answers from `history/2`. Does nothing when `open` was not given
+  `cold-after-ms`. `max_units:` limits one call to that many (kind, month) units (all, if left out).
+  """
+  def freeze(conn, opts \\ []), do: request(conn, :freeze, limit(opts, :max_units, :"max-units"))
+
+  defp limit(opts, key, wire) do
+    case Keyword.get(opts, key) do
+      nil -> nil
+      n -> %{wire => n}
+    end
+  end
+
   ## ---- the process
 
   @impl true

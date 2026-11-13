@@ -191,17 +191,20 @@ recoverKhana h lastS = do
       (conn, _) <- buildKhana h (khanaDir h)
       pure conn
     catchUp conn fs = do
-      sealedEvs <- E.eventsAfter ev fs
-      applyBatched 2000 conn sealedEvs
+      top <- newIORef fs
+      E.eventsAfterEach ev fs (foldGroup top conn)
       batches <- E.tailBatches ev
-      refused <- foldTail conn (foldedAfter fs sealedEvs) batches
+      fs' <- readIORef top
+      refused <- foldTail conn fs' batches
       -- a logged batch the khana refuses was never acknowledged (see 'write'): take it out of the log
       unless (null refused) $ E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
 
--- | Where the khana's bookkeeping stands after these events went in on top of @fs@ (what 'applyEvents'
+-- | Fold one group of sealed events into the khana and remember the largest seq seen (what 'applyEvents'
 -- wrote last), so nobody has to ask the khana again.
-foldedAfter :: Word64 -> [Event] -> Word64
-foldedAfter = foldl (\m e -> max m (evSeq e))
+foldGroup :: IORef Word64 -> Khana -> [Event] -> IO ()
+foldGroup top conn evs = do
+  applyBatched 2000 conn evs
+  modifyIORef' top (\m -> foldl (\a e -> max a (evSeq e)) m evs)
 
 -- | Fold unsealed batches (those the khana has not seen: seq after @fs@) and return the ones it refused.
 -- All of them go in one transaction first (one round trip, one fsync); only if the khana refuses that,
@@ -228,13 +231,14 @@ foldTail conn fs batches = case [ b | b <- batches, evSeq (last b) > fs ] of
 buildKhana :: Hosi -> FilePath -> IO (Khana, [[Event]])
 buildKhana h target = do
   let ev = hEvents h
-  sealedEvs <- E.eventsAfter ev 0
   conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) target (hSchema h)
-  applyBatched 2000 conn sealedEvs
+  top <- newIORef 0
+  E.eventsAfterEach ev 0 (foldGroup top conn)
   mgen <- E.eraseGeneration ev                         -- the events left the erased ids out, so this khana is up to date with them
   when (mgen > 0) (setEraseGen conn mgen)
   batches <- E.tailBatches ev
-  refused <- foldTail conn (foldedAfter 0 sealedEvs) batches
+  top' <- readIORef top
+  refused <- foldTail conn top' batches
   pure (conn, refused)
 
 -- ---------------------------------------------------------------------------
