@@ -19,10 +19,10 @@
 -- by the dispatcher against the result's 'Setu.Spec.Ty'.
 module Hosigraph.Abi.Codec
   ( -- * The arguments of each operation
-    decOps, decBatches, decIds, decId, decQueries
+    decWrite, decBatches, decIds, decId, decQueries
   , decErasures, decCleanOptions, decFreezeOptions
     -- * The answers that are not one instance
-  , encWriteResult, encTrace, errorKind
+  , encWriteResult, encTrace, errorKind, conflictMessage
   , encEraseReport, encCleanReport, encFreezeReport
   ) where
 
@@ -37,7 +37,7 @@ import           Hosigraph
 import           Hosigraph.Event (kindName)
 import           Hosigraph.Manifest (ChunkEntry(..), FileEntry(..))
 import           Setu.Codec
-import           Takka.Edn (Edn(..))
+import           Takka.Edn (Edn(..), renderEdn)
 import           Takka.Syntax (Pulled(..))
 
 deriving instance Generic Op
@@ -51,6 +51,20 @@ deriving instance Generic FileEntry
 
 -- ---------------------------------------------------------------------------
 -- In
+
+-- | @[:holds id attr value]@, @[:lacks id attr value]@ or @[:unset id attr]@.
+instance FromEdn Cond where
+  fromEdn e = case e of
+    EVec [EKw "holds", i, a, v] -> Holds <$> fromEdn i <*> fromEdn a <*> fromEdn v
+    EVec [EKw "lacks", i, a, v] -> Lacks <$> fromEdn i <*> fromEdn a <*> fromEdn v
+    EVec [EKw "unset", i, a]    -> Unset <$> fromEdn i <*> fromEdn a
+    _                           -> Left "not a condition"
+
+instance ToEdn Cond where
+  toEdn c = case c of
+    Holds i a v -> EVec [EKw "holds", toEdn i, toEdn a, toEdn v]
+    Lacks i a v -> EVec [EKw "lacks", toEdn i, toEdn a, toEdn v]
+    Unset i a   -> EVec [EKw "unset", toEdn i, toEdn a]
 
 -- | By its shape: an integer, a float, a string, a boolean or a keyword.
 instance FromEdn Value where
@@ -93,8 +107,18 @@ field k e = case e of
   EMap ps -> maybe ENil id (lookup (EKw k) ps)
   _       -> ENil
 
-decOps :: Edn -> Either Text [Op]
-decOps = fromEdn . field "ops"
+-- | The batch, and the conditions it waits for (@:when@ may be left out, or nil: none).
+decWrite :: Edn -> Either Text ([Cond], [Op])
+decWrite e = do
+  ops <- fromEdn (field "ops" e)
+  conds <- case field "when" e of
+    ENil -> Right []
+    c    -> fromEdn c
+  Right (conds, ops)
+
+-- | What a @:conflict@ says: the conditions that did not hold, as EDN text.
+conflictMessage :: [Cond] -> Text
+conflictMessage = renderEdn . toEdn
 
 decBatches :: Edn -> Either Text [[Op]]
 decBatches = fromEdn . field "batches"

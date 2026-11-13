@@ -38,7 +38,7 @@
 module Hosigraph.Abi.Api
   ( api
   , openTy
-  , tyValue, tyRef, tyVal, tyOp, tyInput, tyCell, tyEntity, tyEvent
+  , tyValue, tyRef, tyVal, tyOp, tyCond, tyInput, tyCell, tyEntity, tyEvent
   , tyWriteReport, tyChunk, tySealReport, tyTrace, tyStats
   , tyErasure, tyEraseReport, tyCleanReport, tyFreezeReport
   ) where
@@ -53,8 +53,8 @@ api = Api
   , apiAppErrDoc = "hosigraph refused the request: a write it would not keep, a query it could not run, a file that is corrupt"
   , apiOps       =
       [ Op "write"
-          "Write one batch, all of it or none. Gives the ids that the [:tmp n] names got."
-          (TMap [Field "ops" (TVec tyOp)])
+          "Write one batch, all of it or none. Gives the ids that the [:tmp n] names got. With :when, only if every condition still holds in now, checked and written under one lock, so that no other writer comes between: read, then write with :when what you read. If one does not hold nothing is written and the answer is the error kind :conflict, whose message is the conditions that failed, as EDN (read again, and try again)."
+          (TMap [Field "ops" (TVec tyOp), Field "when" (TOpt (TVec tyCond))])
           tyWriteReport
       , Op "write-many"
           "Write several batches at once, each as if written alone; the answers come in the order given. A batch that is refused is an [:error kind message] in its place."
@@ -130,6 +130,15 @@ tyOp :: Ty
 tyOp = TTag
   [ Variant "create" [tyRef, TKw, tyVal]
   , Variant "delete" [tyRef, TKw, tyVal]
+  ]
+
+-- | A fact about now that a write asks to still be true: this entity has this value for this attribute,
+-- does not have it, or has no value at all for the attribute.  No @[:tmp n]@: a new entity has no state.
+tyCond :: Ty
+tyCond = TTag
+  [ Variant "holds" [TInt, TKw, tyValue]
+  , Variant "lacks" [TInt, TKw, tyValue]
+  , Variant "unset" [TInt, TKw]
   ]
 
 tyInput :: Ty

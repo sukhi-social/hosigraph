@@ -30,7 +30,7 @@ import           Takka.Types (TakkaError(..))
 
 -- | The functions of "Hosigraph" that the operations use, without the 'Hosi' they work on.
 data Backend = Backend
-  { bWrite          :: [Op] -> IO WriteReport
+  { bWrite          :: [Cond] -> [Op] -> IO (Either [Cond] WriteReport)
   , bWriteMany      :: [[Op]] -> IO [Either HosiError WriteReport]
   , bSeal           :: IO (Maybe SealReport)
   , bGetEntities    :: [HosiId] -> IO [M.Map Keyword [Value]]
@@ -48,7 +48,7 @@ data Backend = Backend
 
 realBackend :: Hosi -> Backend
 realBackend h = Backend
-  { bWrite = write h, bWriteMany = writeMany h, bSeal = seal h
+  { bWrite = writeIf h, bWriteMany = writeMany h, bSeal = seal h
   , bGetEntities = getEntities h, bQueryMany = queryMany h, bQueryCellsMany = queryCellsMany h
   , bHistory = history h, bHistoryTrace = historyTrace h
   , bVerify = verify h, bStats = stats h, bRebuildKhana = rebuildKhana h
@@ -58,7 +58,7 @@ realBackend h = Backend
 -- (the reserved @ping@ and @abi@ are the dispatcher's, and still answer).
 unattached :: Backend
 unattached = Backend
-  { bWrite = no1, bWriteMany = no1, bSeal = no0, bGetEntities = no1, bQueryMany = no1
+  { bWrite = \_ _ -> no0, bWriteMany = no1, bSeal = no0, bGetEntities = no1, bQueryMany = no1
   , bQueryCellsMany = no1, bHistory = no1, bHistoryTrace = no1
   , bVerify = no0, bStats = no0, bRebuildKhana = no0
   , bErase = no1, bClean = no1, bFreeze = no1 }
@@ -71,7 +71,7 @@ unattached = Backend
 -- | The handlers, by the names of the operations in the 'Hosigraph.Abi.Api.api'.
 handlers :: Backend -> [(Text, Handler)]
 handlers b =
-  [ ("write",            run decOps      (bWrite b)          toEdn)
+  [ ("write",            writeHandler b)
   , ("write-many",       run decBatches  (bWriteMany b)      (EVec . map encWriteResult))
   , ("seal",             run none        (const (bSeal b))   toEdn)
   , ("get-entities",     run decIds      (bGetEntities b)    toEdn)
@@ -87,6 +87,19 @@ handlers b =
   , ("freeze",           run decFreezeOptions (bFreeze b)    encFreezeReport)
   ]
   where none _ = Right ()
+
+-- | @write@, with the conditions it may carry: when one does not hold, the answer is the error kind
+-- @conflict@ (the call is refused on purpose, as any other, so it is @HOSI_ERR_APP@), and the message
+-- is the conditions that failed.
+writeHandler :: Backend -> Handler
+writeHandler b args = case decWrite args of
+  Left why -> pure (Left (Failure StInternal "decode" ("the arguments passed their shape but could not be read: " <> why)))
+  Right (conds, ops) -> do
+    r <- guarded (bWrite b conds ops)
+    pure $ case r of
+      Left f                -> Left f
+      Right (Left failed)   -> Left (Failure StApp "conflict" (conflictMessage failed))
+      Right (Right report)  -> Right (toEdn report)
 
 -- | A query whose text takka cannot read is the caller's mistake, and is refused here (@parse-error@),
 -- before any backend is asked. The real backend refuses it too, but with a 'Hosigraph.Khana.Dtlv.DtlvError',

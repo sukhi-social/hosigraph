@@ -30,6 +30,7 @@ module Hosigraph
   , KhanaBackend(..), khanaDirName
     -- * Writing
   , Op(..), Ref(..), Val(..), WriteReport(..), write, writeMany
+  , Cond(..), writeIf
   , SealReport(..), seal
     -- * Erasing (an id, a span of ids, a span of time)
   , Erasure(..), EraseReport(..), erase
@@ -259,6 +260,44 @@ data WriteReport = WriteReport
 -- or dropped if the khana refuses it).  Nothing was acknowledged, so either is fair.
 write :: Hosi -> [Op] -> IO WriteReport
 write h ops = E.withEventsLock (hEvents h) (writeLocked h ops)
+
+-- | 'write', but only if every condition still holds in "now".  The conditions are checked with the
+-- events lock held, and the batch goes in under the same lock, so no other writer can come between
+-- the look and the write: what 'getEntity' showed is what the check sees.
+--
+-- * @Right report@: the conditions held, and the batch was written (as 'write' does).
+-- * @Left conds@: these conditions did not hold (in the order given), and nothing was written (no seq
+--   was used).  Read again and try again.  It is the caller's retry, not ours: this is for
+--   "add one to the likes", "only if nobody has taken it", "set it up once".
+-- * Bad input is an exception, as in 'write' (and a condition on a reserved id, up to 1, is a 'BadArgument').
+--   If the conditions fail and the batch is also bad, you hear about the conditions first.
+--
+-- 'writeMany' has no conditions: a later batch may depend on what an earlier one did.
+writeIf :: Hosi -> [Cond] -> [Op] -> IO (Either [Cond] WriteReport)
+writeIf h conds ops = E.withEventsLock (hEvents h) $ do
+  forM_ conds $ \c -> when (condId c <= 1) $
+    throwIO (BadArgument ("writeIf: " ++ show (condId c) ++ " is not an entity id"))
+  failed <- failedConds h conds
+  if null failed then Right <$> writeLocked h ops else pure (Left failed)
+
+condId :: Cond -> HosiId
+condId (Holds i _ _) = i
+condId (Lacks i _ _) = i
+condId (Unset i _)   = i
+
+-- | The conditions that do not hold now, in order.  One read of the khana, for all the entities named.
+failedConds :: Hosi -> [Cond] -> IO [Cond]
+failedConds _ [] = pure []
+failedConds h conds = do
+  conn <- readIORef (hKhana h)
+  let ids = S.toAscList (S.fromList (map condId conds))
+  facts <- M.fromList . zip ids <$> khanaEntities conn ids
+  let valuesOf i a = M.findWithDefault [] a (M.findWithDefault M.empty i facts)
+      holds c = case c of
+        Holds i a v -> v `elem` valuesOf i a
+        Lacks i a v -> v `notElem` valuesOf i a
+        Unset i a   -> null (valuesOf i a)
+  pure (filter (not . holds) conds)
 
 -- | 'write' without taking the lock (the caller holds it).
 writeLocked :: Hosi -> [Op] -> IO WriteReport

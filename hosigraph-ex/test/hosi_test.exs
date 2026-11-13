@@ -31,6 +31,14 @@ defmodule HosiTest do
     assert {:error, {:app, :"bad-argument", _}} = Hosi.write(db, [])
   end
 
+  test "write takes when: conditions; a condition that is not the shape is :protocol, one that is reaches the library", %{db: db} do
+    # (no database here: a request of the right shape is refused as :app, and that is how we know it got there)
+    assert {:error, {:protocol, _, _}} = Hosi.write(db, [[:create, 1, :a, 2]], when: [[:equals, 1, :a, 2]])
+    assert {:error, {:protocol, _, _}} = Hosi.write(db, [[:create, 1, :a, 2]], when: [[:holds, [:tmp, 1], :a, 2]])
+    assert {:error, {:app, :"bad-argument", _}} =
+             Hosi.write(db, [[:create, 1, :a, 2]], when: [[:holds, 1, :a, 2], [:lacks, 1, :b, 3], [:unset, 1, :c]])
+  end
+
   test "an address that is not the shape is said at the first request" do
     {:ok, db} = Hosi.start_link(open: %{dir: 5})
     assert {:error, {:protocol, :"bad-open", msg}} = Hosi.ping(db)

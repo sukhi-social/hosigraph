@@ -139,7 +139,8 @@ askErr d req wantedSt wantedKind = do
 -- | The backend of the tests: it notes what it was asked, and answers with fixed things.
 fake :: IORef [String] -> Backend
 fake logRef = Backend
-  { bWrite = \ops -> note ("write " ++ show ops) >> pure report1
+  { bWrite = \cs ops -> note ("write " ++ show ops ++ (if null cs then "" else " when " ++ show cs))
+      >> pure (if any ((== 13) . condIdT) cs then Left [ c | c <- cs, condIdT c == 13 ] else Right report1)
   , bWriteMany = \bs -> note ("write-many " ++ show bs)
       >> pure [Right report2, Left (WriteRejected "the unique value is taken"), Left (BadArgument "empty batch")]
   , bSeal = note "seal" >> pure (Just sealed)
@@ -157,6 +158,9 @@ fake logRef = Backend
   , bFreeze = \o -> note ("freeze " ++ show (foMaxUnits o)) >> pure freezeRep1
   }
   where note s = atomicModifyIORef' logRef (\xs -> (xs ++ [s], ()))
+
+condIdT :: Cond -> HosiId
+condIdT c = case c of Holds i _ _ -> i; Lacks i _ _ -> i; Unset i _ -> i
 
 report1, report2 :: WriteReport
 report1 = WriteReport (M.fromList [(1, 1001), (2, 1002)]) 1 2 False
@@ -308,6 +312,34 @@ opTests =
                           , Create (Tmp 1) "person/friend" (RefTo (Tmp 2))
                           , Delete (Id 7) "person/age" (Lit (VInt 70)) ]]
         calls)
+
+  , ("op write: :when is read, and handed to the backend with the ops", withLog $ \ref d -> do
+      askOk d "{:op :write :args {:ops [[:create 5 :post/likes 4]] :when [[:holds 5 :post/likes 3] [:lacks 5 :post/liked-by 9] [:unset 5 :post/pinned]]}}"
+              "{:temps [[1 1001] [2 1002]] :first-seq 1 :last-seq 2 :sealed false}"
+      calls <- readIORef ref
+      checkEq "what the backend was asked"
+        ["write " ++ show [Create (Id 5) "post/likes" (Lit (VInt 4))]
+          ++ " when " ++ show [Holds 5 "post/likes" (VInt 3), Lacks 5 "post/liked-by" (VInt 9), Unset 5 "post/pinned"]]
+        calls
+      -- :when left out, or nil, or empty: the same as write
+      _ <- askOk d "{:op :write :args {:ops [[:create 5 :a 1]] :when nil}}" "{:temps [[1 1001] [2 1002]] :first-seq 1 :last-seq 2 :sealed false}"
+      _ <- askOk d "{:op :write :args {:ops [[:create 5 :a 1]] :when []}}" "{:temps [[1 1001] [2 1002]] :first-seq 1 :last-seq 2 :sealed false}"
+      calls2 <- readIORef ref
+      checkEq "no conditions: asked with none" (replicate 2 ("write " ++ show [Create (Id 5) "a" (Lit (VInt 1))])) (drop 1 calls2))
+
+  , ("op write: a condition that does not hold is HOSI_ERR_APP, kind conflict, and the message is the failed ones as EDN", withLog $ \ref d -> do
+      m <- askErr d "{:op :write :args {:ops [[:create 13 :post/likes 4]] :when [[:holds 5 :post/likes 3] [:holds 13 :post/likes 3] [:unset 13 :post/pinned]]}}" StApp "conflict"
+      checkEq "the failed conditions, in the order given" (edn "[[:holds 13 :post/likes 3] [:unset 13 :post/pinned]]") (edn m)
+      calls <- readIORef ref
+      checkEq "the backend was asked once" 1 (length calls))
+
+  , ("op write: a :when that is not the shape is refused before the backend is asked", withLog $ \ref d -> do
+      _ <- askErr d "{:op :write :args {:ops [[:create 1 :a 2]] :when [[:equals 1 :a 2]]}}" StProtocol "bad-args"
+      _ <- askErr d "{:op :write :args {:ops [[:create 1 :a 2]] :when [[:holds [:tmp 1] :a 2]]}}" StProtocol "bad-args"
+      _ <- askErr d "{:op :write :args {:ops [[:create 1 :a 2]] :when [[:holds 1 :a]]}}" StProtocol "bad-args"
+      _ <- askErr d "{:op :write :args {:ops [[:create 1 :a 2]] :when [[:unset 1 :a 2]]}}" StProtocol "bad-args"
+      _ <- askErr d "{:op :write :args {:ops [[:create 1 :a 2]] :when \"x\"}}" StProtocol "bad-args"
+      checkEq "the backend was not asked" [] =<< readIORef ref)
 
   , ("op write: a request that is not the shape is refused before the backend is asked", withLog $ \ref d -> do
       _ <- askErr d "{:op :write :args {:ops [[:update 1 :a 2]]}}" StProtocol "bad-args"
@@ -614,6 +646,31 @@ realTests khana =
         case broken of
           ReplyErr k _ -> check ("the kind of a broken query: " ++ T.unpack k) (k `elem` ["parse-error", "query-error"])
           ReplyOk v    -> throwIO (userError ("a broken query was answered: " ++ show v)))
+        `finally` release)
+
+  , ("real: write with :when through the door; a stale condition is a conflict that names it, and changes nothing", withTmp $ \dir -> do
+      let uri = "{:dir " <> T.pack (show dir) <> " :schema {:person/name {:type :string :unique :identity} :person/age {:type :long}} :config {:khana " <> khana <> "}}"
+      r <- libConnect library uri
+      (d, release) <- either (\f -> throwIO (userError (show f))) pure r
+      (do
+        (st, w) <- ask d "{:op :write :args {:ops [[:create [:tmp 1] :person/name \"Frege\"] [:create [:tmp 1] :person/age 70]]}}"
+        checkEq "write status" StOk st
+        frege <- case w of
+          ReplyOk (EMap ps) | Just (EVec [EVec [_, EInt i]]) <- lookup (EKw "temps") ps -> pure (T.pack (show i))
+          other -> throwIO (userError ("write: " ++ show other))
+        let age n = "{:op :write :args {:ops [[:create " <> frege <> " :person/age " <> n <> "]] :when [[:holds " <> frege <> " :person/age 70]]}}"
+            ageNow = ask d ("{:op :get-entities :args {:ids [" <> frege <> "]}}")
+        (st1, _) <- ask d (age "71")
+        checkEq "the current value: written" StOk st1
+        m <- askErr d (age "99") StApp "conflict"
+        checkEq "the stale one is named" (edn ("[[:holds " <> frege <> " :person/age 70]]")) (edn m)
+        (_, now) <- ageNow
+        case now of
+          ReplyOk (EVec [EMap a]) -> checkEq "the age is 71" (Just (EVec [EInt 71])) (lookup (EKw "person/age") a)
+          other -> throwIO (userError ("get-entities: " ++ show other))
+        m2 <- askErr d ("{:op :write :args {:ops [[:create " <> frege <> " :person/age 5]] :when [[:unset " <> frege <> " :person/name]]}}") StApp "conflict"
+        checkEq "Unset on an attribute that has a value" (edn ("[[:unset " <> frege <> " :person/name]]")) (edn m2)
+        askOk d "{:op :verify}" "[]")
         `finally` release)
 
   , ("real: erase what a friend owns, clean it off the disk, freeze the quiet month (through the door)", withTmp $ \dir -> do

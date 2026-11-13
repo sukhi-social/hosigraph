@@ -4,7 +4,7 @@
 -- Description : The vocabulary of hosigraph: ids, events (Create / Delete), and their bytes.
 module Hosigraph.Event
   ( HosiId, Kind(..), kindName, kindFromName
-  , Event(..), Ref(..), Val(..), Op(..)
+  , Event(..), Ref(..), Val(..), Op(..), Cond(..)
   , putValue, getValue, getValueBody, putEvent, getEvent
   , HosiError(..)
   ) where
@@ -56,6 +56,14 @@ data Val = Lit !Value | RefTo !Ref deriving (Eq, Show)
 data Op
   = Create Ref Keyword Val
   | Delete Ref Keyword Val
+  deriving (Eq, Show)
+
+-- | A fact about "now" that a write can ask to still be true when it goes in ('Hosigraph.writeIf').
+-- There is no @Tmp@ here: a fresh entity has no state to ask about.
+data Cond
+  = Holds !HosiId Keyword Value   -- ^ this entity has this value for this attribute
+  | Lacks !HosiId Keyword Value   -- ^ ...does not have this value
+  | Unset !HosiId Keyword         -- ^ ...has no value at all for this attribute
   deriving (Eq, Show)
 
 data HosiError
