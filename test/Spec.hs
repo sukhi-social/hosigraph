@@ -910,6 +910,12 @@ pureTests =
       check "the generation moved" (mfGeneration mf1 > mfGeneration mf0)
       checkEq "history is the same for everyone" hist0 =<< mapM (Ev.history ev) everyone
       checkEq "and so is eventsAfter" after0 =<< Ev.withEventsLock ev (Ev.eventsAfter ev 0)
+      groupsRef <- newIORef []
+      Ev.withEventsLock ev (Ev.eventsAfterEach ev 0 (\g -> modifyIORef groupsRef (g :)))
+      groups <- reverse <$> readIORef groupsRef
+      checkEq "eventsAfterEach hands over the same events in the same order, one group at a time" after0 (concat groups)
+      check "and each group is sorted, and the groups follow each other" (all (\g -> map evSeq g == sort (map evSeq g)) groups
+        && and (zipWith (\a b -> maximum (map evSeq a) < minimum (map evSeq b)) groups (drop 1 groups)))
       (_, tr) <- Ev.historyTrace ev (head ids1)
       checkEq "history asks the cold chunk and finds it there" True (ceName c0 `elem` [ n | (n, Star _) <- Ev.ltProbed tr ])
       checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
