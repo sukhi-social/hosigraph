@@ -110,7 +110,7 @@ dtlvTransact :: Dtlv -> [DtlvOp] -> IO ()
 dtlvTransact _ [] = pure ()
 dtlvTransact d ops = do
   forms <- either (throwIO . DtlvError) pure (mapM opEdn ops)
-  void (runWith d (Just ("[" <> T.unwords forms <> "]")) "(transact! c data) nil")
+  void (runWith d (Just ("[" <> T.unwords forms <> "]")) ("(" <> transactFn d <> " c data) nil"))
 
 opEdn :: DtlvOp -> Either String Text
 opEdn op = case op of
@@ -152,13 +152,14 @@ dtlvRetractRanges d ranges extra = do
           dat  = "[" <> T.unwords [ "[" <> T.pack (show lo) <> " " <> T.pack (show hi) <> "]" | (lo, hi) <- g ] <> "]"
           body = "(let [ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
                  <> "(take-while (fn [x] (<= (:e x) hi)) (seek-datoms @c :eav lo)))) data))] "
-                 <> (if lastGroup then "(transact! c (conj ops " <> extraForm <> "))" else "(when (seq ops) (transact! c ops))")
+                 <> (if lastGroup then "(" <> tx <> " c (conj ops " <> extraForm <> "))" else "(when (seq ops) (" <> tx <> " c ops))")
                  <> " (count ops))"
       r <- readReplyWith d dat body
       case r of
         EInt k -> pure k
         _      -> bad ("a count of retracted facts: " ++ T.unpack (T.take 200 (renderEdn r))))
   where
+    tx = transactFn d
     groupsOf _ [] = []
     groupsOf m xs = let (a, b) = splitAt m xs in a : groupsOf m b
 
@@ -306,6 +307,28 @@ script d dat body = T.unlines
   , "       (catch Exception e [:err (str (ex-message e))])"
   , "       (finally (close c))))" ]
 
+-- | How the resident JVM opens a khana: with Datalevin's write-ahead log, in its /relaxed/ durability profile.
+--
+-- The khana can be built again from the events (and the folded seq is in the same transaction as the facts, so a
+-- khana that lost its last few writes is caught up when it opens), so it does not need to wait for LMDB's own sync
+-- at every write; the tail log is the one that is fsynced.  (Measured: one write per transaction, about 3 times
+-- faster.)  The segments and the retention are kept small so the log does not grow on the disk.
+--
+-- /What this changes for erase./ With the log, the bytes of a retracted fact stay in @txlog\/@ (and in
+-- @snapshots\/@) until the khana is made a new file; without it they stay in @data.mdb@ until LMDB happens to reuse the page.
+-- 'dtlvCompactTo' copies neither, so @clean@ still leaves them nowhere.
+--
+-- Only the resident JVM gets this.  The native @dtlv@ is one process per operation and is left as it was.
+walOpts :: Text
+walOpts = "{:wal? true :wal-durability-profile :relaxed :wal-segment-max-bytes 4194304 :wal-retention-bytes 8388608 :wal-retention-ms 60000}"
+
+-- | The function that applies a transaction and comes back when it is done.  @transact-ack!@ does the same as
+-- @transact!@ and does not build the report we throw away.  (Resident only; the native @dtlv@ keeps @transact!@.)
+transactFn :: Dtlv -> Text
+transactFn d = case dtlvRunner d of
+  Resident _ -> "transact-ack!"
+  Native _   -> "transact!"
+
 -- | Run a body with the connection @c@ in scope; return the text of its value.
 run :: Dtlv -> Text -> IO Text
 run d = runWith d Nothing
@@ -339,7 +362,7 @@ runResident sc d dat body = do
     _ -> throwIO (DtlvError ("an answer we did not expect: " ++ T.unpack (T.take 400 line)))
   where
     request = "{:dir " <> ednStr (T.pack (dtlvDir d)) <> " :schema " <> ednStr (schemaEdn (dtlvSchema d))
-              <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> "}"
+              <> " :opts " <> walOpts <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> "}"
 
 -- | Run a body and read its value as EDN.
 readReply :: Dtlv -> Text -> IO Edn
