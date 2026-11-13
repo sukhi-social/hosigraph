@@ -5,7 +5,7 @@
 > In these notes, "core material" means the khana (see "What the names mean" in docs/guide.md).
 
 These notes list the open points of the Phase 1 prototype of the [design document v0.2.0-draft](hosiDB-design-v0.2.0-draft.md).
-Each note says what the prototype does and asks what the design document wants.
+Each note says what the prototype does and asks what the design document wants. Item 9 was added for Phase 3 (the local part: Erase, cleaning, freezing).
 
 ## 1. A chunk also needs a seq
 
@@ -62,8 +62,8 @@ In the prototype, **the core material answers "now", and the MPHF answers "the l
 * `getEntity` (now) → the core material
 * `history` (the past) → narrow by month → narrow by ID range → MPHF → fingerprint → key in the body
 
-In Phase 3, the invalidation record (Erase) has the read order "filter → MPHF → key → invalidation", so it joins the `history` path.
-How Erase works on the "now" path (does the data stay in the core material until the cleanup?) is a question for that phase.
+In Phase 3, the invalidation record (Erase) joins the `history` path (and asks earlier than the design says: see item 9).
+How Erase works on the "now" path (does the data stay in the core material until the cleanup?) is answered in item 9 too: yes, it stays until `clean`.
 
 ## 6. Nobody stores the schema
 
@@ -102,3 +102,44 @@ The code has two parts that the design document does not name.
 `Events` has an interface of **three beats: write (record) → see if the khana accepts → confirm (commit) or cancel (rollback)**.
 Suggestion: name these three beats (especially the cancel) in the "write flow" of the design document.
 They make it easy to put another khana on top.
+
+## 9. Phase 3 (the local part): where the prototype differs from the design document
+
+What `erase`, `clean` and `freeze` do is in [the guide](guide.md#phase-3-so-far). These are the places where the prototype chose differently from the design document,
+or where the document says nothing. Each one asks the design document to take the choice, or to say why not.
+
+1. **The erase record is asked right after the zone map, not last.** The design's read order is "filter → MPHF → key → invalidation". Here it is "zone map → record → filter → MPHF → key".
+   The record is in memory, so an erased ID is turned away with no file read at all; asked last, the same ID would first cost a filter and a block. The answer is the same, and
+   `LookupTrace` has a field of its own for it (`ltSkippedByErase`).
+2. **The record is not part of the chunk's hash.** `ceHash` stays the identity of the chunk's content, which the design wants for distribution (the same chunk, the same hash, on every node).
+   The record belongs to the *world*: it is a file of its own (`events/erase/<chunk>-<generation>.bin`), listed in the manifest next to the chunk and not inside the chunk's directory.
+   That also means it works the same when the chunk is on S3. `verify` checks the record's own hash.
+3. **The manifest is `/2` once the world has ever erased.** An old build must *refuse* such a manifest, not ignore the field it does not know and show what was erased. A world that never erased
+   is still written as `/1`, byte for byte as before. It is `/2` when the erase generation is above 0, not only when a record exists, because the counter must only go up: if `/2` depended on the
+   records alone, `clean` taking away the last record would write a `/1` without the counter, and it would start again at 0. The price is that a world that erased once stays `/2`.
+   The other way would be to reset the counter in memory when the last record goes. Which one does the design want?
+4. **One manifest swap for each rewritten chunk, not one for the whole run.** The design says one swap per run. Small steps keep each swap cheap, and they let a host call `clean` a little at a time,
+   in each quiet moment (`coMaxChunks`). The price is more swaps; a crash between two leaves a world in which some chunks are clean and some are not, which is a good world.
+5. **Ranges, not Roaring bitmaps.** The design suggests a Roaring bitmap for single IDs. An ID is 63 bits and a month holds about 2^52 of them, so a million erased IDs are a density of 2^-32:
+   a Roaring container would hold one ID each. A list of sorted ranges (a single ID is a range of one) took 4 to 8 bytes for each ID, and a lookup took 70 to 160 ns, for 1,000 to
+   1,000,000 IDs (a probe, in the plan; the guide gives the table). A whole day or a whole month is one range. A flag for "single ID" would save about one byte an ID (17 %); not worth
+   a second file format until a number asks for it.
+6. **"Now": the entity's own facts go, and the file is made new.** The khana retracts the *entity's own* facts only (not `:db/retractEntity`, which would also take other entities' references to it), so
+   that "now" stays equal to a fold of the events minus the erased ones, and `verify` agrees. A retract leaves the bytes in Datalevin's LMDB file (measured, on the native `dtlv` and on the JVM),
+   so `clean` ends by making the khana a new file: a compacted copy, and a full rebuild when the copy cannot be made. The crash recovery is a rebuild too: if the khana's `erase-gen` is behind the
+   manifest's, the khana is built again at open. This is where the design's question "does the data stay in the core material until the cleanup?" is answered: it does.
+7. **The user unit is found in the events, not in "now".** An account's things are not one range of IDs (an ID is a time), and a post the account already deleted is gone from "now" but its Create and
+   Delete are still in the chunks. So `EraseOwnedBy` reads the Create chunks for the attributes the caller names. This costs a scan of the chunks it reaches; the design's "a range suits everything
+   of this user" fits the date unit, not the user unit. (If the design wants this to be cheap, it needs an index from owner to IDs; the plan has a proposal for per-owner objects, not built.)
+8. **Freezing and note 2.** A late write into a frozen month makes a new hot chunk (the month is that of the entity, note 2). The prototype lets the next freeze turn it into a second cold chunk,
+   and never merges cold chunks, and has no thaw. Whether a month that is written again should be thawed, or its cold chunks merged, is not decided; it needs the numbers of a real world.
+   The first rule of freezing is the design's version 1 (last read or write older than a threshold); the other rules are not here.
+9. **After a record goes, the guard goes.** While a chunk has a record, a write to an erased ID is refused. When the chunk is written again, or was dropped whole, there is no record, and the ID is
+   free: a write would make a new, lonely entity. Keeping the erased IDs for ever would stop that, but the list would grow without bound; the design's "pruning horizon" is the place to decide it,
+   together with distribution (a node that was away must still learn what was erased).
+10. **What "physically gone" does and does not mean.** It means gone from hosigraph's own files (chunks, records, tail log, the khana); a test puts a marker text in the data and looks in every file.
+    It does not mean gone from freed disk blocks, SSD wear-levelling, snapshots and backups, an S3 bucket's old versions, or a copy the caller made. An ID carries its creation time, so while a record
+    exists it says that something was created at that moment and erased; there is no content in it, but it is a trace, and it goes with its chunk's rewrite. The design document should say this
+    in plain words wherever it promises that Erase makes data gone.
+11. **A pointer to an erased entity stays as a number.** Someone else's reply to an erased post, or a mention of an erased account, keeps the ID it points at, which now points at nothing.
+    Blanking such pointers rewrites other people's entities, a different and bigger operation, and it is not planned.
