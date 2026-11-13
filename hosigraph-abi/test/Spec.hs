@@ -12,6 +12,7 @@
 --  * the generated files are the ones the description gives.
 module Main (main) where
 
+import           Control.Concurrent (threadDelay)
 import           Control.Exception
 import           Control.Monad
 import           Data.IORef
@@ -20,6 +21,8 @@ import qualified Data.Map.Strict as M
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import           Data.Time.Clock (UTCTime)
+import           Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import           System.Directory (createDirectory, getTemporaryDirectory, removeFile, removePathForcibly)
 import           System.Environment (lookupEnv)
 import           System.Exit
@@ -149,6 +152,9 @@ fake logRef = Backend
   , bVerify = note "verify" >> pure ["manifest: a signature does not match"]
   , bStats = note "stats" >> pure stats1
   , bRebuildKhana = note "rebuild-khana"
+  , bErase = \es -> note ("erase " ++ show es) >> pure eraseRep1
+  , bClean = \o -> note ("clean " ++ show (coMaxChunks o)) >> pure cleanRep1
+  , bFreeze = \o -> note ("freeze " ++ show (foMaxUnits o)) >> pure freezeRep1
   }
   where note s = atomicModifyIORef' logRef (\xs -> (xs ++ [s], ()))
 
@@ -167,16 +173,33 @@ chunk1 :: ChunkEntry
 chunk1 = ChunkEntry
   { ceName = "c-2026-11-create", ceTier = "hot", ceKind = KCreate, ceMonth = (2026, 11)
   , ceEvents = 4, ceIds = 2, ceMinId = 10, ceMaxId = 20, ceMinSeq = 1, ceMaxSeq = 4
-  , ceFiles = [], ceHash = "abcd" }
+  , ceFiles = [], ceHash = "abcd", ceErase = Nothing }
 
 sealed :: SealReport
 sealed = SealReport { srEvents = 4, srChunks = [chunk1], srGeneration = 3 }
 
 trace1 :: LookupTrace
 trace1 = LookupTrace
-  { ltMonth = (2026, 11), ltChunks = 5, ltSkippedByMonth = 2, ltSkippedByRange = 1, ltSkippedByFilter = 1
+  { ltMonth = (2026, 11), ltChunks = 5, ltSkippedByMonth = 2, ltSkippedByRange = 1, ltSkippedByErase = 0, ltSkippedByFilter = 1
   , ltProbed = [("c-2026-11-create", Star 2), ("c-2026-11-delete", LookAlike), ("old", NotStar), ("empty", EmptySky)]
   , ltTailEvents = 1 }
+
+eraseRep1 :: EraseReport
+eraseRep1 = EraseReport { erGeneration = 2, erDropped = ["c-2026-10-create"], erRecorded = ["c-2026-11-create"], erRetracted = 7, erOwned = [1001, 1002] }
+
+cleanRep1 :: CleanReport
+cleanRep1 = CleanReport
+  { crRewritten = [("c-2026-11-create", Just "c-2026-11-create-2"), ("c-2026-10-delete", Nothing)]
+  , crSkipped = ["c-2026-09-create"], crRecordsLeft = 1, crKhanaCleaned = False, crKhanaRebuilt = False }
+
+freezeRep1 :: FreezeReport
+freezeRep1 = FreezeReport
+  { frFrozen = [((KCreate, (2026, 9)), Just "c-2026-09-create-3"), ((KDelete, (2026, 8)), Nothing)]
+  , frSkipped = [(KCreate, (2026, 7))] }
+
+-- | A moment given as the door gives it: milliseconds since 1970.
+atMs :: Integer -> UTCTime
+atMs ms = posixSecondsToUTCTime (fromInteger ms / 1000)
 
 stats1 :: Stats
 stats1 = Stats { stGeneration = 3, stChunks = 5, stSealedSeq = 40, stNextSeq = 45, stTailEvents = 4
@@ -205,6 +228,12 @@ apiTests =
         EMap ps | Just t <- lookup (EKw "trace") ps -> fits "trace" tyTrace t
         other -> throwIO (userError ("encTrace: " ++ show other))
       fits "stats" tyStats (toEdn stats1)
+      fits "erase report" tyEraseReport (encEraseReport eraseRep1)
+      fits "clean report" tyCleanReport (encCleanReport cleanRep1)
+      fits "clean report (nothing to do)" tyCleanReport (encCleanReport (CleanReport [] [] 0 False False))
+      fits "freeze report" tyFreezeReport (encFreezeReport freezeRep1)
+      forM_ [ "[:ids [1 2]]", "[:range 3 9]", "[:between 0 1000]", "[:owned-by [:post/author] [7]]", "[:owned-by-between [:post/author :media/owner] [7] 0 1000]" ] $ \e ->
+        fits ("erasure " ++ T.unpack e) tyErasure (edn e)
       fits "cell: a pulled tree" tyCell (toEdn (CPull (PEntity [("a", PMany [PScalar (VInt 1)])])))
       fits "val: a reference" tyVal (EVec [EKw "ref", EVec [EKw "tmp", EInt 1]])
       fits "op" tyOp (EVec [EKw "create", EVec [EKw "tmp", EInt 1], EKw "person/name", EStr "x"])
@@ -241,6 +270,23 @@ codecTests =
       checkEq "tree" (canon (edn "[:pull {:person/name \"Frege\" :person/tag [\"a\" \"b\"]}]"))
         (canon (toEdn (CPull (PEntity [("person/name", PScalar (VStr "Frege")), ("person/tag", PMany [PScalar (VStr "a"), PScalar (VStr "b")])]))))
       checkEq "value" (EInt 3) (toEdn (CVal (VInt 3))))
+
+  , ("codec: an erasure is read as written, and a time is milliseconds since 1970", do
+      checkEq "ids" (Right (EraseIds [7, 8])) (fromEdn (edn "[:ids [7 8]]"))
+      checkEq "range" (Right (EraseRange 10 20)) (fromEdn (edn "[:range 10 20]"))
+      checkEq "between" (Right (EraseBetween (atMs 1700000000123) (atMs 1700000009000))) (fromEdn (edn "[:between 1700000000123 1700000009000]"))
+      checkEq "owned-by" (Right (EraseOwnedBy ["post/author", "media/owner"] [5] Nothing)) (fromEdn (edn "[:owned-by [:post/author :media/owner] [5]]"))
+      checkEq "owned-by-between" (Right (EraseOwnedBy ["post/author"] [5] (Just (atMs 1000, atMs 2500)))) (fromEdn (edn "[:owned-by-between [:post/author] [5] 1000 2500]"))
+      checkEq "a moment before 1970" (Right (EraseBetween (atMs (-1500)) (atMs 0))) (fromEdn (edn "[:between -1500 0]"))
+      checkEq "no tag of ours" (Left "not an erasure" :: Either Text Erasure) (fromEdn (edn "[:everything]")))
+
+  , ("codec: the options of clean and freeze may be left out, and so may their one field", do
+      checkEq "clean, no args" (Right (coMaxChunks defaultCleanOptions)) (coMaxChunks <$> decCleanOptions ENil)
+      checkEq "clean, empty map" (Right (coMaxChunks defaultCleanOptions)) (coMaxChunks <$> decCleanOptions (edn "{}"))
+      checkEq "clean, nil" (Right (coMaxChunks defaultCleanOptions)) (coMaxChunks <$> decCleanOptions (edn "{:max-chunks nil}"))
+      checkEq "clean, 3" (Right 3) (coMaxChunks <$> decCleanOptions (edn "{:max-chunks 3}"))
+      checkEq "freeze, no args" (Right (foMaxUnits defaultFreezeOptions)) (foMaxUnits <$> decFreezeOptions ENil)
+      checkEq "freeze, 2" (Right 2) (foMaxUnits <$> decFreezeOptions (edn "{:max-units 2}")))
 
   , ("codec: what a failed batch of write-many is told as", do
       checkEq "rejected" (edn "[:error :write-rejected \"no\"]") (encWriteResult (Left (WriteRejected "no")))
@@ -307,7 +353,7 @@ opTests =
 
   , ("op history-trace", withLog $ \_ d ->
       askOk d "{:op :history-trace :args {:id 1001}}"
-              ("{:events [{:seq 1 :kind :create :id 1001 :attr :person/name :val \"Frege\"}] :trace {:month \"2026-11\" :chunks 5 :skipped-by-month 2 :skipped-by-range 1 :skipped-by-filter 1 "
+              ("{:events [{:seq 1 :kind :create :id 1001 :attr :person/name :val \"Frege\"}] :trace {:month \"2026-11\" :chunks 5 :skipped-by-month 2 :skipped-by-range 1 :skipped-by-erase 0 :skipped-by-filter 1 "
                <> ":probed [{:chunk \"c-2026-11-create\" :says :star :found 2} {:chunk \"c-2026-11-delete\" :says :look-alike :found nil} {:chunk \"old\" :says :not-star :found nil} {:chunk \"empty\" :says :empty-sky :found nil}] :tail-events 1}}"))
 
   , ("op verify, stats, rebuild-khana", withLog $ \ref d -> do
@@ -315,6 +361,53 @@ opTests =
       askOk d "{:op :stats}" "{:generation 3 :chunks 5 :sealed-seq 40 :next-seq 45 :tail-events 4 :tail-bytes 512 :folded-seq 44 :khana-datoms 99}"
       askOk d "{:op :rebuild-khana}" "nil"
       checkEq "what the backend was asked" ["verify", "stats", "rebuild-khana"] =<< readIORef ref)
+
+  , ("op erase: every kind of erasure is read, and the report comes back", withLog $ \ref d -> do
+      askOk d "{:op :erase :args {:erasures [[:ids [7 8]] [:range 10 20] [:between 1000 2500] [:owned-by [:post/author :media/owner] [5]] [:owned-by-between [:post/author] [5] 1000 2500]]}}"
+              "{:generation 2 :dropped [\"c-2026-10-create\"] :recorded [\"c-2026-11-create\"] :retracted 7 :owned [1001 1002]}"
+      checkEq "what the backend was asked"
+        ["erase " ++ show [ EraseIds [7, 8], EraseRange 10 20, EraseBetween (atMs 1000) (atMs 2500)
+                          , EraseOwnedBy ["post/author", "media/owner"] [5] Nothing
+                          , EraseOwnedBy ["post/author"] [5] (Just (atMs 1000, atMs 2500)) ]]
+        =<< readIORef ref)
+
+  , ("op erase: no erasure at all is a call that is made", withLog $ \ref d -> do
+      askOk d "{:op :erase :args {:erasures []}}" "{:generation 2 :dropped [\"c-2026-10-create\"] :recorded [\"c-2026-11-create\"] :retracted 7 :owned [1001 1002]}"
+      checkEq "what the backend was asked" ["erase []"] =<< readIORef ref)
+
+  , ("op clean: with its argument, or without any", withLog $ \ref d -> do
+      let wanted = "{:rewritten [{:chunk \"c-2026-11-create\" :into \"c-2026-11-create-2\"} {:chunk \"c-2026-10-delete\" :into nil}] :skipped [\"c-2026-09-create\"] :records-left 1 :khana-cleaned false :khana-rebuilt false}"
+      askOk d "{:op :clean}" wanted
+      askOk d "{:op :clean :args nil}" wanted
+      askOk d "{:op :clean :args {}}" wanted
+      askOk d "{:op :clean :args {:max-chunks 3}}" wanted
+      checkEq "what the backend was asked" (map (\n -> "clean " ++ n) [show (maxBound :: Int), show (maxBound :: Int), show (maxBound :: Int), "3"]) =<< readIORef ref)
+
+  , ("op freeze: with its argument, or without any", withLog $ \ref d -> do
+      let wanted = "{:frozen [{:kind :create :month \"2026-09\" :into \"c-2026-09-create-3\"} {:kind :delete :month \"2026-08\" :into nil}] :skipped [{:kind :create :month \"2026-07\"}]}"
+      askOk d "{:op :freeze}" wanted
+      askOk d "{:op :freeze :args {:max-units 2}}" wanted
+      checkEq "what the backend was asked" ["freeze " ++ show (maxBound :: Int), "freeze 2"] =<< readIORef ref)
+
+  , ("op erase, clean, freeze: what is not the shape is refused before the backend is asked", withLog $ \ref d -> do
+      forM_ [ "{:op :erase}"                                                   -- the erasures are not optional
+            , "{:op :erase :args {:erasures [[:all]]}}"                        -- no such tag
+            , "{:op :erase :args {:erasures [[:between 1000]]}}"               -- one time is not a span
+            , "{:op :erase :args {:erasures [[:between 1000 \"2000\"]]}}"      -- a time is a number
+            , "{:op :erase :args {:erasures [[:owned-by [\"post/author\"] [5]]]}}"   -- an attribute is a keyword
+            , "{:op :erase :args {:erasures [[:ids [1]]] :soon true}}"
+            , "{:op :clean :args {:max-chunk 3}}"                              -- a mistyped key is not passed in silence
+            , "{:op :clean :args {:max-chunks \"3\"}}"
+            , "{:op :freeze :args [1]}"
+            , "{:op :freeze :args {:max-units 1.5}}" ] $ \req ->
+        void (askErr d req StProtocol "bad-args")
+      checkEq "the backend was not asked" [] =<< readIORef ref)
+
+  , ("op erase: what hosigraph refuses is the application's refusal, with its kind", do
+      ref <- newIORef []
+      let d = dispatchOver (fake ref) { bErase = \_ -> throwIO (BadArgument "erase: the time span ends before it starts") }
+      m <- askErr d "{:op :erase :args {:erasures [[:between 2000 1000]]}}" StApp "bad-argument"
+      check ("the message: " ++ T.unpack m) ("time span" `T.isInfixOf` m))
 
   , ("op: arguments given to an operation that takes none are refused", withLog $ \ref d -> do
       _ <- askErr d "{:op :stats :args {:x 1}}" StProtocol "bad-args"
@@ -379,7 +472,8 @@ failureTests =
 
   , ("failure: a connection opened without a database refuses every operation but ping and abi", do
       let d = dispatchOver unattached
-      forM_ ["{:op :stats}", "{:op :seal}", "{:op :verify}", "{:op :rebuild-khana}", "{:op :history :args {:id 1}}", "{:op :write :args {:ops []}}"] $ \req ->
+      forM_ ["{:op :stats}", "{:op :seal}", "{:op :verify}", "{:op :rebuild-khana}", "{:op :history :args {:id 1}}", "{:op :write :args {:ops []}}"
+                 , "{:op :erase :args {:erasures []}}", "{:op :clean}", "{:op :freeze}"] $ \req ->
         void (askErr d req StApp "bad-argument")
       askOk d "{:op :ping :args 1}" "1")
 
@@ -400,7 +494,7 @@ openTests =
       Left e  -> throwIO (userError (T.unpack e)))
 
   , ("open: the whole argument is read", case parseOpen
-        "{:dir \"/var/lib/hosi\" :schema {:person/name {:type :string :unique :identity} :person/friend {:type :ref :card :many} :x {}} :config {:khana [:jvm \"java\" \"/opt/d.jar\"] :sync false :seal-events 50 :seal-age-ms 1000 :block-events 8 :reader-cache-bytes 1024}}" of
+        "{:dir \"/var/lib/hosi\" :schema {:person/name {:type :string :unique :identity} :person/friend {:type :ref :card :many} :x {}} :config {:khana [:jvm \"java\" \"/opt/d.jar\"] :sync false :seal-events 50 :seal-age-ms 1000 :block-events 8 :reader-cache-bytes 1024 :cold-after-ms 86400000 :cold-block-events 64}}" of
       Left e  -> throwIO (userError (T.unpack e))
       Right a -> do
         checkEq "dir" (Just "/var/lib/hosi") (oaDir a)
@@ -411,7 +505,9 @@ openTests =
         checkEq "seal-events" 50 (hcSealEvents c)
         checkEq "seal-age-ms" (Just 1000) (hcSealAgeMs c)
         checkEq "block-events" 8 (hcBlockEvents c)
-        checkEq "reader-cache-bytes" 1024 (hcReaderCacheBytes c))
+        checkEq "reader-cache-bytes" 1024 (hcReaderCacheBytes c)
+        checkEq "cold-after-ms" (Just 86400000) (hcColdAfterMs c)
+        checkEq "cold-block-events" 64 (hcColdBlockEvents c))
 
   , ("open: what is left out is hosigraph's default", case parseOpen "{:dir \"d\" :config {:khana [:dtlv \"/bin/dtlv\"]}}" of
       Left e  -> throwIO (userError (T.unpack e))
@@ -421,12 +517,15 @@ openTests =
         checkEq "sync" (hcSync dc) (hcSync c)
         checkEq "seal-events" (hcSealEvents dc) (hcSealEvents c)
         checkEq "block-events" (hcBlockEvents dc) (hcBlockEvents c)
+        checkEq "cold-after-ms: nothing is cold unless asked" Nothing (hcColdAfterMs c)
+        checkEq "cold-block-events" (hcColdBlockEvents dc) (hcColdBlockEvents c)
         checkEq "schema" M.empty (oaSchema a))
 
   , ("open: what is not the shape is said at once, with where", do
       forM_ [ ("not edn (", "not EDN"), ("{:dir 5}", ":dir"), ("{:dir \"d\" :surprise 1}", "surprise")
             , ("{:dir \"d\" :schema {:a {:type :text}}}", "type"), ("{:dir \"d\" :config {:khana [:s3 \"x\"]}}", "khana")
-            , ("{:dir \"d\" :config {:sync 1}}", "sync"), ("[1 2]", "map") ] $ \(txt, needle) ->
+            , ("{:dir \"d\" :config {:sync 1}}", "sync"), ("[1 2]", "map")
+            , ("{:dir \"d\" :config {:cold-after-ms \"1d\"}}", "cold-after-ms") ] $ \(txt, needle) ->
         case parseOpen txt of
           Left e  -> check ("the message names " ++ needle ++ ": " ++ T.unpack e) (T.pack needle `T.isInfixOf` e)
           Right _ -> throwIO (userError ("accepted: " ++ T.unpack txt)))
@@ -515,6 +614,76 @@ realTests khana =
         case broken of
           ReplyErr k _ -> check ("the kind of a broken query: " ++ T.unpack k) (k `elem` ["parse-error", "query-error"])
           ReplyOk v    -> throwIO (userError ("a broken query was answered: " ++ show v)))
+        `finally` release)
+
+  , ("real: erase what a friend owns, clean it off the disk, freeze the quiet month (through the door)", withTmp $ \dir -> do
+      let uri = "{:dir " <> T.pack (show dir) <> " :schema {:person/name {:type :string :unique :identity} :person/friend {:type :ref :card :many}} :config {:khana "
+                <> khana <> " :cold-after-ms 1 :cold-block-events 4}}"
+          field' k r = case r of
+            ReplyOk (EMap ps) | Just v <- lookup (EKw k) ps -> pure v
+            other -> throwIO (userError ("no :" ++ T.unpack k ++ " in " ++ show other))
+          idText = T.pack . show
+          okReply (st, r) what = checkEq (what ++ ": status") StOk st >> pure r
+      r <- libConnect library uri
+      (d, release) <- either (\f -> throwIO (userError (show f))) pure r
+      (do
+        w <- ask d "{:op :write :args {:ops [[:create [:tmp 1] :person/name \"Frege\"] [:create [:tmp 2] :person/name \"Russell\"] [:create [:tmp 2] :person/friend [:ref [:tmp 1]]] [:create [:tmp 3] :person/name \"Cantor\"]]}}" >>= (`okReply` "write")
+        ids <- field' "temps" w >>= \v -> case v of
+          EVec ts -> pure [ i | EVec [_, EInt i] <- ts ]
+          other   -> throwIO (userError ("temps: " ++ show other))
+        (frege, russell, cantor) <- case ids of
+          [a, b, c] -> pure (a, b, c)
+          _         -> throwIO (userError ("wanted three ids, got " ++ show ids))
+        s <- ask d "{:op :seal}" >>= (`okReply` "seal")
+        month <- case s of
+          ReplyOk (EMap ps) | Just (EVec cs) <- lookup (EKw "chunks") ps
+                            , [m] <- [ m | EMap c <- cs, lookup (EKw "kind") c == Just (EKw "create"), Just m <- [lookup (EKw "month") c] ] -> pure m
+          other -> throwIO (userError ("seal: " ++ show other))
+
+        -- Russell is Frege's friend: what [:person/friend] has Frege as its value is Russell, and only him
+        e <- ask d ("{:op :erase :args {:erasures [[:owned-by [:person/friend] [" <> idText frege <> "]]]}}") >>= (`okReply` "erase")
+        checkEq "the owned" (EVec [EInt (toInteger russell)]) =<< field' "owned" e
+        gen <- field' "generation" e
+        check ("a new generation: " ++ show gen) (gen /= EInt 0)
+        askOk d ("{:op :history :args {:id " <> idText russell <> "}}") "[]"
+        (hf, past) <- ask d ("{:op :history :args {:id " <> idText frege <> "}}")
+        checkEq "frege's past: status" StOk hf
+        case past of
+          ReplyOk (EVec [_]) -> pure ()
+          other -> throwIO (userError ("frege's past is whole, one event: " ++ show other))
+        ents <- ask d ("{:op :get-entities :args {:ids [" <> idText russell <> " " <> idText cantor <> "]}}") >>= (`okReply` "get-entities")
+        case ents of
+          ReplyOk (EVec [EMap gone, EMap kept]) -> do
+            checkEq "russell is gone from now" [] gone
+            check "cantor is not" (not (null kept))
+          other -> throwIO (userError ("get-entities: " ++ show other))
+        askOk d "{:op :verify}" "[]"
+
+        -- the bytes leave the disk
+        c1 <- ask d "{:op :clean}" >>= (`okReply` "clean")
+        checkEq "no record is left" (EInt 0) =<< field' "records-left" c1
+        checkEq "one chunk was written again" 1 . length . (\v -> case v of EVec xs -> xs; _ -> []) =<< field' "rewritten" c1
+        checkEq "the khana was made new" (EBool True) =<< field' "khana-cleaned" c1
+        askOk d "{:op :clean}" "{:rewritten [] :skipped [] :records-left 0 :khana-cleaned false :khana-rebuilt false}"
+        askOk d "{:op :verify}" "[]"
+
+        -- nobody has read the month since: after a moment it goes cold, and the past is as it was
+        threadDelay 50000
+        f1 <- ask d "{:op :freeze}" >>= (`okReply` "freeze")
+        case f1 of
+          ReplyOk (EMap ps) | Just (EVec [EMap u]) <- lookup (EKw "frozen") ps -> do
+            checkEq "the unit" (Just (EKw "create"), Just month) (lookup (EKw "kind") u, lookup (EKw "month") u)
+            check "it became a chunk" (case lookup (EKw "into") u of Just (EStr _) -> True; _ -> False)
+          other -> throwIO (userError ("freeze: " ++ show other))
+        checkEq "nothing was skipped" (EVec []) =<< field' "skipped" f1
+        askOk d "{:op :freeze}" "{:frozen [] :skipped []}"
+        (hf2, evs) <- ask d ("{:op :history :args {:id " <> idText frege <> "}}")
+        checkEq "frege's past, from a cold chunk" StOk hf2
+        case evs of
+          ReplyOk (EVec [EMap ev]) -> checkEq "frege's name" (Just (EStr "Frege")) (lookup (EKw "val") ev)
+          other -> throwIO (userError ("history: " ++ show other))
+        askOk d ("{:op :history :args {:id " <> idText russell <> "}}") "[]"
+        askOk d "{:op :verify}" "[]")
         `finally` release)
   ]
 

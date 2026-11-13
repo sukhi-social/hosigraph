@@ -30,6 +30,10 @@ module Hosigraph.Khana.Dtlv
   , openDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomCount, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
+    -- * Taking out whole entities
+  , dtlvRetractRanges
+    -- * A new file
+  , dtlvCompactTo
     -- * Text we send and read (pure; exposed for the tests)
   , ednStr, ednKw, ednVal, schemaEdn, tameEdn
   ) where
@@ -47,8 +51,9 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Encoding.Error as TE
 import           Numeric (showHex)
-import           System.Directory (createDirectoryIfMissing, makeAbsolute)
-import           System.Exit (ExitCode)
+import           System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
+import           System.Exit (ExitCode(..))
+import           System.FilePath ((</>))
 import           System.IO (hClose)
 import           System.Process
 
@@ -127,6 +132,56 @@ dtlvEntities d es = do
   case e of
     EVec xs | length xs == length es -> mapM entityOf xs
     _ -> bad ("entities: " ++ T.unpack (T.take 200 (renderEdn e)))
+
+-- | Take out every fact of every entity whose id is in one of the ranges (inclusive), and put one more
+-- fact in with the last of them.  The facts are found by a seek in the index (from the range's start, while
+-- the id is still inside), not by a scan, and taken out inside the database, so nothing big travels.
+-- Only the entity's /own/ facts go (@:db/retract@ of each): a fact of /another/ entity that holds this id as a
+-- value stays, a number that points at nothing (@:db/retractEntity@ would take those too).
+--
+-- Ranges go in groups, one transaction each; the extra fact is in the last one.  If we die in between, the
+-- extra fact is missing: that is how the caller knows to do it again, and taking out a fact that is gone
+-- is no error.  Returns the number of facts taken out.
+dtlvRetractRanges :: Dtlv -> [(EntityId, EntityId)] -> DtlvOp -> IO Integer
+dtlvRetractRanges d ranges extra = do
+  extraForm <- either (throwIO . DtlvError) pure (opEdn extra)
+  case groupsOf 2000 ranges of
+    [] -> dtlvTransact d [extra] >> pure 0
+    gs -> sum <$> forM (zip [1 :: Int ..] gs) (\(n, g) -> do
+      let lastGroup = n == length gs
+          dat  = "[" <> T.unwords [ "[" <> T.pack (show lo) <> " " <> T.pack (show hi) <> "]" | (lo, hi) <- g ] <> "]"
+          body = "(let [ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
+                 <> "(take-while (fn [x] (<= (:e x) hi)) (seek-datoms @c :eav lo)))) data))] "
+                 <> (if lastGroup then "(transact! c (conj ops " <> extraForm <> "))" else "(when (seq ops) (transact! c ops))")
+                 <> " (count ops))"
+      r <- readReplyWith d dat body
+      case r of
+        EInt k -> pure k
+        _      -> bad ("a count of retracted facts: " ++ T.unpack (T.take 200 (renderEdn r))))
+  where
+    groupsOf _ [] = []
+    groupsOf m xs = let (a, b) = splitAt m xs in a : groupsOf m b
+
+-- | Copy the database, /compacted/, into a directory that does not exist yet or is empty.  Datalevin (LMDB) keeps the
+-- bytes of a retracted fact in its file until the page is used again; a compacted copy writes only what is alive, so the
+-- bytes of what was taken out are not in it.  It is a copy of one snapshot, with no replay.  The destination is not
+-- opened or changed afterwards: that is for the caller.
+--
+-- Native: @dtlv -d DIR -c copy NEW@.  Resident: @(copy (db c) NEW true)@.  The native @dtlv@ says \"Copy error: ...\" and
+-- still exits with 0 (when the destination is not empty, say), so the exit code is not believed: the words are looked
+-- for, and the copy must hold a @data.mdb@.  A failure is a 'DtlvError'.
+dtlvCompactTo :: Dtlv -> FilePath -> IO ()
+dtlvCompactTo d dst = do
+  absDst <- makeAbsolute dst
+  case dtlvRunner d of
+    Native exe -> do
+      (code, out, err) <- runBytes exe ["-d", dtlvDir d, "-c", "copy", absDst] B.empty
+      let said = TE.decodeUtf8With TE.lenientDecode (out <> err)
+      when (code /= ExitSuccess || "Copy error" `T.isInfixOf` said) $
+        bad ("compact copy: " ++ T.unpack (T.take 400 said))
+    Resident _ -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
+  made <- doesFileExist (absDst </> "data.mdb")
+  unless made $ bad "compact copy: the copy has no data.mdb"
 
 -- | One entity's bookkeeping together with the number of datoms: two answers, one round trip, one snapshot.
 dtlvEntityAndCount :: Dtlv -> EntityId -> IO (M.Map Keyword [Value], Integer)

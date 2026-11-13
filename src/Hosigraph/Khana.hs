@@ -35,9 +35,11 @@
 module Hosigraph.Khana
   ( KhanaBackend(..), khanaDirName, Khana
   , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
-  , metaEntity, foldedSeqAttr, khanaSchema
+  , metaEntity, foldedSeqAttr, eraseGenAttr, khanaSchema
   , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, khanaDatoms, khanaDatomCount
   , khanaFoldedAndCount
+    -- * Erasing
+  , foldedState, setEraseGen, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
   , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany
   ) where
 
@@ -89,9 +91,22 @@ metaEntity = 1
 foldedSeqAttr :: Keyword
 foldedSeqAttr = "hosi.meta/folded-seq"
 
--- | The caller's schema plus the bookkeeping attribute.
+-- | How many erases the khana has followed (the manifest's @mfEraseGen@ it has caught up with).  It is written
+-- in the same transaction that takes the erased entities out, so a khana that is behind the manifest knows it
+-- (an erase committed, then we died) and is made again from the events, which leave the erased ids out.
+eraseGenAttr :: Keyword
+eraseGenAttr = "hosi.meta/erase-gen"
+
+-- | The erase number at which this khana /file/ was last known to hold nothing that an erase took out: a file just
+-- made from the events (which left the erased ids out from the start) is clean at the erase it was made for.
+-- An erase retracts the facts, but Datalevin (LMDB) keeps the old bytes in its file until the pages are reused; so
+-- while this is behind 'eraseGenAttr', the file may still hold erased values, and 'Hosigraph.clean' makes a new file.
+cleanGenAttr :: Keyword
+cleanGenAttr = "hosi.meta/clean-gen"
+
+-- | The caller's schema plus the bookkeeping attributes.
 khanaSchema :: Schema -> Schema
-khanaSchema = M.insert foldedSeqAttr (attr TLong)
+khanaSchema = M.insert cleanGenAttr (attr TLong) . M.insert eraseGenAttr (attr TLong) . M.insert foldedSeqAttr (attr TLong)
 
 -- | Open (creating if needed) a khana in a directory.
 openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> IO Khana
@@ -116,16 +131,60 @@ seqIn m = case M.lookup foldedSeqAttr m of
   Just (VInt n : _) -> fromIntegral n
   _                 -> 0
 
+genIn :: M.Map Keyword [Value] -> Int
+genIn m = case M.lookup eraseGenAttr m of
+  Just (VInt n : _) -> fromIntegral n
+  _                 -> 0
+
+-- | Where the khana stands, from one read of its bookkeeping entity: the seq of the last event folded in, and the
+-- number of the last erase it has followed (0: none).  Open asks this, and a process costs time, so it is one question.
+foldedState :: Khana -> IO (Word64, Int)
+foldedState k = case k of
+  DtlvKhana d -> (\m -> (seqIn m, genIn m)) <$> dtlvEntity d metaEntity
+
+-- | Say that the khana has followed the erases up to this one, and holds nothing they took out: for a khana just
+-- made from the events, which left the erased ids out from the start (so both numbers are this one).
+setEraseGen :: Khana -> Int -> IO ()
+setEraseGen k n = case k of
+  DtlvKhana d -> dtlvTransact d [ DAdd metaEntity eraseGenAttr (VInt (fromIntegral n))
+                                , DAdd metaEntity cleanGenAttr (VInt (fromIntegral n)) ]
+
+-- | The erase number this khana file was last clean at (0: never an erase, or a file from before the number was kept).
+cleanGenOf :: Khana -> IO Int
+cleanGenOf k = case k of
+  DtlvKhana d -> (\m -> case M.lookup cleanGenAttr m of Just (VInt n : _) -> fromIntegral n; _ -> 0) <$> dtlvEntity d metaEntity
+
+-- | Say that this khana file holds nothing that erases up to number @n@ took out: for a file that was made by copying
+-- the khana compacted ('khanaCompactTo'), after which the erased bytes are not in it.
+setCleanGen :: Khana -> Int -> IO ()
+setCleanGen k n = case k of
+  DtlvKhana d -> dtlvTransact d [ DAdd metaEntity cleanGenAttr (VInt (fromIntegral n)) ]
+
+-- | Copy this khana, compacted, into a directory that does not exist yet or is empty ('dtlvCompactTo').  The copy is
+-- not opened here.
+khanaCompactTo :: Khana -> FilePath -> IO ()
+khanaCompactTo k dst = case k of
+  DtlvKhana d -> dtlvCompactTo d dst
+
+-- | Take out every fact of the entities whose ids are in these ranges (inclusive), and say in the same
+-- transaction (the last one, if there are very many ranges) that the khana has followed erase number @gen@.
+-- Only the entities' own facts go: what another entity says with such an id as its value stays.  Returns the number
+-- of facts taken out.  Ranges must not reach the bookkeeping entity (ids above 'metaEntity').
+eraseRanges :: Khana -> Int -> [(EntityId, EntityId)] -> IO Integer
+eraseRanges k gen ranges = case k of
+  DtlvKhana d -> dtlvRetractRanges d ranges (DAdd metaEntity eraseGenAttr (VInt (fromIntegral gen)))
+
 -- | 'foldedSeq' and 'khanaDatomCount' together: with Datalevin it is one round trip, not two.
 khanaFoldedAndCount :: Khana -> IO (Word64, Word64)
 khanaFoldedAndCount k = case k of
   DtlvKhana d  -> do
     (m, n) <- dtlvEntityAndCount d metaEntity
-    pure (seqIn m, minusMeta (fromInteger n))
+    pure (seqIn m, minusMeta m (fromInteger n))
 
--- | The bookkeeping fact is not the caller's.
-minusMeta :: Word64 -> Word64
-minusMeta n = if n > 0 then n - 1 else 0
+-- | The bookkeeping facts are not the caller's (the folded seq, and the erase number once there was an erase):
+-- they are on the entity @m@ describes.
+minusMeta :: M.Map Keyword [Value] -> Word64 -> Word64
+minusMeta m n = n - min n (fromIntegral (sum (map length (M.elems m))))
 
 eventToDtlv :: Event -> DtlvOp
 eventToDtlv e = case evKind e of
@@ -157,10 +216,10 @@ khanaDatoms k = filter ((/= metaEntity) . dE) <$> case k of
   DtlvKhana d     -> dtlvDatoms d
 
 khanaDatomCount :: Khana -> IO Word64
-khanaDatomCount k = do
-  n <- case k of
-    DtlvKhana d     -> fromInteger <$> dtlvDatomCount d
-  pure (minusMeta n)
+khanaDatomCount k = case k of
+  DtlvKhana d -> do
+    (m, n) <- dtlvEntityAndCount d metaEntity
+    pure (minusMeta m (fromInteger n))
 
 -- | Everything the khana knows about one entity: attribute -> values.
 khanaEntity :: Khana -> EntityId -> IO (M.Map Keyword [Value])

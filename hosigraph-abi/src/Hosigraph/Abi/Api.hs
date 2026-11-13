@@ -40,6 +40,7 @@ module Hosigraph.Abi.Api
   , openTy
   , tyValue, tyRef, tyVal, tyOp, tyInput, tyCell, tyEntity, tyEvent
   , tyWriteReport, tyChunk, tySealReport, tyTrace, tyStats
+  , tyErasure, tyEraseReport, tyCleanReport, tyFreezeReport
   ) where
 
 import           Setu.Spec
@@ -95,6 +96,18 @@ api = Api
           "Throw the khana away and fold it again from the chunks and the tail."
           TNil
           TNil
+      , Op "erase"
+          "Make entities gone, from the events and from now, in one step however many erasures are given. It hides them at once; their bytes leave the disk when clean has run. Gives the ids that owned-by matched, whether or not they were erased before."
+          (TMap [Field "erasures" (TVec tyErasure)])
+          tyEraseReport
+      , Op "clean"
+          "Let what erase took out go from the disk: write the chunks again without the erased events, then make the khana a new file. At most max-chunks chunks per call (all, if left out); records-left above 0 means call again. Call it when the host is quiet; writes go on meanwhile."
+          (TOpt (TMap [Field "max-chunks" (TOpt TInt)]))
+          tyCleanReport
+      , Op "freeze"
+          "Put a month that nobody has read or written for cold-after-ms (see open) into one cold chunk: a smaller footprint, and the same answers from history. Does nothing when open was not given cold-after-ms. At most max-units (kind, month) units per call (all, if left out)."
+          (TOpt (TMap [Field "max-units" (TOpt TInt)]))
+          tyFreezeReport
       ]
   }
 
@@ -159,12 +172,39 @@ tySealReport = TOpt (TMap [Field "events" TInt, Field "generation" TInt, Field "
 tyTrace :: Ty
 tyTrace = TMap
   [ Field "month" TStr, Field "chunks" TInt
-  , Field "skipped-by-month" TInt, Field "skipped-by-range" TInt, Field "skipped-by-filter" TInt
+  , Field "skipped-by-month" TInt, Field "skipped-by-range" TInt, Field "skipped-by-erase" TInt, Field "skipped-by-filter" TInt
   , Field "probed" (TVec (TMap
       [ Field "chunk" TStr
       , Field "says" (TEnum ["not-star", "look-alike", "star", "empty-sky"])
       , Field "found" (TOpt TInt) ]))
   , Field "tail-events" TInt ]
+
+-- | What to erase.  Times are milliseconds since 1970-01-01T00:00Z, and a span is @[from, to)@ on the
+-- time an entity was /created/ (an id is a creation time).
+tyErasure :: Ty
+tyErasure = TTag
+  [ Variant "ids"              [TVec TInt]                        -- these entities
+  , Variant "range"            [TInt, TInt]                       -- every id from the first to the last, inclusive
+  , Variant "between"          [TInt, TInt]                       -- every entity created in the span
+  , Variant "owned-by"         [TVec TKw, TVec TInt]              -- attributes, owners: whatever has one of them with an owner as its value
+  , Variant "owned-by-between" [TVec TKw, TVec TInt, TInt, TInt]  -- ...and was created in the span
+  ]
+
+tyEraseReport :: Ty
+tyEraseReport = TMap
+  [ Field "generation" TInt, Field "dropped" (TVec TStr), Field "recorded" (TVec TStr)
+  , Field "retracted" TInt, Field "owned" (TVec TInt) ]
+
+tyCleanReport :: Ty
+tyCleanReport = TMap
+  [ Field "rewritten" (TVec (TMap [Field "chunk" TStr, Field "into" (TOpt TStr)]))   -- into nil: nothing of it was left
+  , Field "skipped" (TVec TStr), Field "records-left" TInt
+  , Field "khana-cleaned" TBool, Field "khana-rebuilt" TBool ]
+
+tyFreezeReport :: Ty
+tyFreezeReport = TMap
+  [ Field "frozen" (TVec (TMap [Field "kind" (TEnum ["create", "delete"]), Field "month" TStr, Field "into" (TOpt TStr)]))
+  , Field "skipped" (TVec (TMap [Field "kind" (TEnum ["create", "delete"]), Field "month" TStr])) ]
 
 tyStats :: Ty
 tyStats = TMap
@@ -188,6 +228,8 @@ openTy = TMap
       [ Field "seal-events"       (TOpt TInt)
       , Field "seal-age-ms"       (TOpt TInt)
       , Field "block-events"      (TOpt TInt)
+      , Field "cold-block-events" (TOpt TInt)
+      , Field "cold-after-ms"     (TOpt TInt)
       , Field "sync"              (TOpt TBool)
       , Field "reader-cache-bytes" (TOpt TInt)
       , Field "khana" (TOpt (TTag [Variant "dtlv" [TStr], Variant "jvm" [TStr, TStr]])) ]

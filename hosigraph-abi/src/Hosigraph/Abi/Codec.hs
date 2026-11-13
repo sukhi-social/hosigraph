@@ -20,13 +20,17 @@
 module Hosigraph.Abi.Codec
   ( -- * The arguments of each operation
     decOps, decBatches, decIds, decId, decQueries
+  , decErasures, decCleanOptions, decFreezeOptions
     -- * The answers that are not one instance
   , encWriteResult, encTrace, errorKind
+  , encEraseReport, encCleanReport, encFreezeReport
   ) where
 
 import qualified Data.Map.Strict as M
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Data.Time.Clock (UTCTime)
+import           Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import           GHC.Generics (Generic)
 
 import           Hosigraph
@@ -101,6 +105,36 @@ decIds = fromEdn . field "ids"
 decId :: Edn -> Either Text HosiId
 decId = fromEdn . field "id"
 
+-- | By hand: the tags are not the names of the constructors, and a time is milliseconds here, a
+-- 'UTCTime' there.
+instance FromEdn Erasure where
+  fromEdn e = case e of
+    EVec [EKw "ids", is]       -> EraseIds <$> fromEdn is
+    EVec [EKw "range", lo, hi] -> EraseRange <$> fromEdn lo <*> fromEdn hi
+    EVec [EKw "between", a, b] -> EraseBetween <$> time a <*> time b
+    EVec [EKw "owned-by", attrs, owners] ->
+      (\as os -> EraseOwnedBy as os Nothing) <$> fromEdn attrs <*> fromEdn owners
+    EVec [EKw "owned-by-between", attrs, owners, a, b] ->
+      (\as os from to -> EraseOwnedBy as os (Just (from, to))) <$> fromEdn attrs <*> fromEdn owners <*> time a <*> time b
+    _ -> Left "not an erasure"
+    where
+      time :: Edn -> Either Text UTCTime
+      time x = (\ms -> posixSecondsToUTCTime (fromInteger ms / 1000)) <$> fromEdn x
+
+decErasures :: Edn -> Either Text [Erasure]
+decErasures = fromEdn . field "erasures"
+
+-- | The arguments of @clean@ may be left out altogether; so may @:max-chunks@.
+decCleanOptions :: Edn -> Either Text CleanOptions
+decCleanOptions e = do
+  n <- fromEdn (field "max-chunks" e)
+  pure defaultCleanOptions { coMaxChunks = maybe (coMaxChunks defaultCleanOptions) id n }
+
+decFreezeOptions :: Edn -> Either Text FreezeOptions
+decFreezeOptions e = do
+  n <- fromEdn (field "max-units" e)
+  pure defaultFreezeOptions { foMaxUnits = maybe (foMaxUnits defaultFreezeOptions) id n }
+
 decQueries :: Edn -> Either Text [(Text, [Input])]
 decQueries e = do
   qs <- fromEdn (field "queries" e)
@@ -155,9 +189,10 @@ instance ToEdn Event where toEdn = genericToEdn defaultStyle
 instance ToEdn SealReport where toEdn = genericToEdn defaultStyle
 instance ToEdn LookupTrace where toEdn = genericToEdn defaultStyle
 
--- | What the chunk is, not the files it is made of (they are not offered).
+-- | What the chunk is, not the files it is made of (they are not offered), and not its erase record
+-- (a file of the world's, which the doors do not show yet).
 instance ToEdn ChunkEntry where
-  toEdn = genericToEdn defaultStyle { styleSkip = (== "ceFiles") }
+  toEdn = genericToEdn defaultStyle { styleSkip = (`elem` ["ceFiles", "ceErase"]) }
 
 -- | Never written (see 'ChunkEntry'); here because the instance of 'ChunkEntry' needs the
 -- instances of all its fields.
@@ -192,3 +227,28 @@ errorKind e = case e of
 -- | @{:events [...] :trace {...}}@
 encTrace :: ([Event], LookupTrace) -> Edn
 encTrace (evs, t) = EMap [(EKw "events", toEdn evs), (EKw "trace", toEdn t)]
+
+encEraseReport :: EraseReport -> Edn
+encEraseReport r = EMap
+  [ (EKw "generation", toEdn (erGeneration r)), (EKw "dropped", names (erDropped r))
+  , (EKw "recorded", names (erRecorded r)), (EKw "retracted", toEdn (erRetracted r))
+  , (EKw "owned", toEdn (erOwned r)) ]
+
+-- | A chunk that was rewritten, and the one written in its place (nil: nothing of it was left).
+encCleanReport :: CleanReport -> Edn
+encCleanReport r = EMap
+  [ (EKw "rewritten", EVec [ EMap [(EKw "chunk", name old), (EKw "into", maybe ENil name new)] | (old, new) <- crRewritten r ])
+  , (EKw "skipped", names (crSkipped r)), (EKw "records-left", toEdn (crRecordsLeft r))
+  , (EKw "khana-cleaned", EBool (crKhanaCleaned r)), (EKw "khana-rebuilt", EBool (crKhanaRebuilt r)) ]
+
+-- | A unit (kind, month) that went cold, and the cold chunk it became (nil: nothing of it was left).
+encFreezeReport :: FreezeReport -> Edn
+encFreezeReport r = EMap
+  [ (EKw "frozen", EVec [ EMap [(EKw "kind", toEdn k), (EKw "month", toEdn m), (EKw "into", maybe ENil name new)] | ((k, m), new) <- frFrozen r ])
+  , (EKw "skipped", EVec [ EMap [(EKw "kind", toEdn k), (EKw "month", toEdn m)] | (k, m) <- frSkipped r ]) ]
+
+name :: String -> Edn
+name = EStr . T.pack
+
+names :: [String] -> Edn
+names = EVec . map name

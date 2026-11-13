@@ -23,6 +23,7 @@
 -- >
 -- > mphf.idx
 -- >   MPHF over the entity ids, then per slot: fingerprint:4  offset-of-run:8
+-- >   (a cold chunk, 'writeColdChunk', does not have this file; it is read by the deep path below)
 -- >
 -- > filter.bin
 -- >   magic, version, a Binary Fuse filter ("Hosigraph.BinaryFuse") over the entity ids
@@ -53,7 +54,7 @@
 -- Not yet here, on purpose: compression, an S3 'ChunkSource', the erase sidecar.
 -- The layout leaves room (the version field, and the footer).
 module Hosigraph.Chunk
-  ( ChunkInfo(..), writeChunk, writeChunkVersion, chunkDataFile, chunkMphfFile, chunkFilterFile
+  ( ChunkInfo(..), writeChunk, writeChunkVersion, writeColdChunk, chunkDataFile, chunkMphfFile, chunkFilterFile
   , ChunkSource(..), localSource
   , ChunkReader, crInfo, crDir, readerBytes, openChunkReader, openChunkReaderWith, readChunkEvents
   , readChunkFilter, readChunkFilterWith, filterMayHave
@@ -123,7 +124,17 @@ writeChunk = writeChunkVersion 2
 -- Version 1 is here to make old-format chunks for tests and for measuring, and for
 -- nothing else; any other number is a 'BadArgument'.
 writeChunkVersion :: Word32 -> FilePath -> Int -> Kind -> Month -> [Event] -> IO ChunkInfo
-writeChunkVersion version dir blockEvents kind month@(yr, mo) events0 = do
+writeChunkVersion = writeChunkWith True
+
+-- | A cold chunk: the same @chunk.hosi@ and @filter.bin@ (the caller chooses the block size, and a cold chunk
+-- has big blocks), and no @mphf.idx@.  A lookup in it goes the deep way, by the footer's block table, and reads one
+-- block; that is the price of leaving out the slot table (12 bytes an id).
+writeColdChunk :: FilePath -> Int -> Kind -> Month -> [Event] -> IO ChunkInfo
+writeColdChunk = writeChunkWith False 2
+
+-- | The one writer behind them: @withMphf@ says whether @mphf.idx@ is written.
+writeChunkWith :: Bool -> Word32 -> FilePath -> Int -> Kind -> Month -> [Event] -> IO ChunkInfo
+writeChunkWith withMphf version dir blockEvents kind month@(yr, mo) events0 = do
   when (null events0) $ throwIO (BadArgument "writeChunk: no events")
   when (version `notElem` [1, 2]) $ throwIO (BadArgument ("writeChunk: no such chunk version " ++ show version))
   createDirectoryIfMissing True dir
@@ -187,19 +198,20 @@ writeChunkVersion version dir blockEvents kind month@(yr, mo) events0 = do
           <> putU64 minSeq <> putU64 maxSeq
       trailer = build (putU64 (fromIntegral footerStart) <> put magicFooter)
   BL.writeFile (dir </> chunkDataFile) (BL.fromChunks [header, body, footer, trailer])
-  -- the MPHF index: function, then (fingerprint, offset) per slot
+  -- the MPHF index: function, then (fingerprint, offset) per slot (a cold chunk has none)
   let keys = map (fromIntegral . fst) runsL :: [Word64]
-      mp   = buildMphf keys
-      bySlot = IM.fromList [ (mphfSlot mp (fromIntegral i), (fingerprint (fromIntegral i), o)) | (i, o) <- runOffsets ]
-      slots  = [ bySlot IM.! s | s <- [0 .. mphfSize mp - 1] ]
-  BL.writeFile (dir </> chunkMphfFile) . BL.fromStrict . build $
-    put magicMphf <> putU32 1 <> putMphf mp
-      <> mconcat [ putU32 fp <> putU64 (fromIntegral o) | (fp, o) <- slots ]
+  when withMphf $ do
+    let mp     = buildMphf keys
+        bySlot = IM.fromList [ (mphfSlot mp (fromIntegral i), (fingerprint (fromIntegral i), o)) | (i, o) <- runOffsets ]
+        slots  = [ bySlot IM.! s | s <- [0 .. mphfSize mp - 1] ]
+    BL.writeFile (dir </> chunkMphfFile) . BL.fromStrict . build $
+      put magicMphf <> putU32 1 <> putMphf mp
+        <> mconcat [ putU32 fp <> putU64 (fromIntegral o) | (fp, o) <- slots ]
   -- the filter: a first guess about an id, before anything else is read
   BL.writeFile (dir </> chunkFilterFile) . BL.fromStrict . build $
     put magicFilter <> putU32 1 <> putBinaryFuse (buildBinaryFuse keys)
   syncFile (dir </> chunkDataFile)
-  syncFile (dir </> chunkMphfFile)
+  when withMphf $ syncFile (dir </> chunkMphfFile)
   syncFile (dir </> chunkFilterFile)
   syncDir dir
   pure info
@@ -555,11 +567,13 @@ lookupByBlock cr i
         else either failGet (pure . Just) (runGet (replicateM (fromIntegral cnt) (getRunEvent cr kind i)) payload 0)
 
 
--- | (file name, size, sha256) of every file in a chunk directory, for the manifest.  The data file and
--- the MPHF must be there (a missing one throws); the filter is listed only if the chunk has one.
+-- | (file name, size, sha256) of every file in a chunk directory, for the manifest.  The data file must be
+-- there (a missing one throws); the MPHF (a cold chunk has none) and the filter (an old one has none) are
+-- listed only if the chunk has them.
 hashChunkFiles :: FilePath -> IO [(String, Int, String)]
 hashChunkFiles dir = do
+  mphfThere   <- doesFileExist (dir </> chunkMphfFile)
   filterThere <- doesFileExist (dir </> chunkFilterFile)
-  forM ([chunkDataFile, chunkMphfFile] ++ [ chunkFilterFile | filterThere ]) $ \f -> do
+  forM (chunkDataFile : [ chunkMphfFile | mphfThere ] ++ [ chunkFilterFile | filterThere ]) $ \f -> do
     bs <- B.readFile (dir </> f)
     pure (f, B.length bs, sha256Hex bs)

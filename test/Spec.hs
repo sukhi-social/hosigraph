@@ -10,11 +10,15 @@ import           Control.Exception hiding (assert)
 import           Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
+import           Data.Bits (xor)
 import           Data.IORef
+import           Data.Int (Int64)
 import           Data.List (sort, sortOn, nub, isInfixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
+import           Data.Time.Calendar (fromGregorian)
+import           Data.Time.Clock (UTCTime(..))
 import           Data.Time.Clock.POSIX (getPOSIXTime)
 import           Data.Word
 import           System.Directory
@@ -30,9 +34,10 @@ import           Hosigraph
 import           Hosigraph.Bin
 import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
+import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
-import           Hosigraph.Id (epochMs, idMs, makeId)
+import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
 import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
@@ -142,6 +147,13 @@ person h n a = do
   r <- write h [ Create (Tmp 1) "person/name" (Lit (VStr n)), Create (Tmp 1) "person/age" (Lit (VInt (fromIntegral a))) ]
   pure (wrTemps r M.! 1)
 
+-- | Create one thing that points at its owner by @person/friend@, with marker @n@ for its name and @n@ for its age (three facts); returns the id.
+ownedThing :: Hosi -> HosiId -> Int -> IO HosiId
+ownedThing h who n = do
+  r <- write h [ Create (Tmp 1) "person/name" (Lit (VStr (T.pack (marker n)))), Create (Tmp 1) "person/age" (Lit (VInt (fromIntegral n)))
+               , Create (Tmp 1) "person/friend" (RefTo (Id who)) ]
+  pure (wrTemps r M.! 1)
+
 ageOf :: Hosi -> HosiId -> IO (Maybe [Value])
 ageOf h i = M.lookup "person/age" <$> getEntity h i
 
@@ -150,6 +162,131 @@ reopen cfg dir h = closeHosi h >> openHosiWith cfg dir schema
 
 -- ---------------------------------------------------------------------------
 -- The tests
+
+-- | A range of small ids, so that ranges overlap and touch often; a negative length makes an upside-down pair.
+genEraseRange :: Gen (HosiId, HosiId)
+genEraseRange = do
+  a <- choose (0, 60)
+  len <- choose (-1, 9)
+  pure (a, a + len)
+
+-- | A range anywhere in the whole of an Int64: the extremes are on purpose.
+genWideRange :: Gen (HosiId, HosiId)
+genWideRange = do
+  let one = frequency [ (4, arbitrary), (2, elements [minBound, minBound + 1, -1, 0, 1, 2, maxBound - 1, maxBound]), (2, choose (0, 1000)) ]
+  a <- one
+  b <- one
+  pure (min a b, max a b)
+
+-- | A chunk entry and an erase record entry to put into manifests (nothing here is read from disk).
+manifestChunk :: ChunkEntry
+manifestChunk =
+  let files = [FileEntry "chunk.hosi" 100 (sha256Hex "a")]
+  in ChunkEntry { ceName = "c000001-create-2026-11", ceTier = "hot", ceKind = KCreate, ceMonth = (2026, 11)
+                , ceEvents = 4, ceIds = 2, ceMinId = 10, ceMaxId = 20, ceMinSeq = 1, ceMaxSeq = 4
+                , ceFiles = files, ceHash = chunkEntryHash files, ceErase = Nothing }
+
+manifestRecord :: FileEntry
+manifestRecord = FileEntry "c000001-create-2026-11-1.bin" 40 (sha256Hex "x")
+
+-- | Replace the first @from@ in the bytes by @to@ (it must be there).
+swapBytes :: B.ByteString -> B.ByteString -> B.ByteString -> B.ByteString
+swapBytes from to bs = case B.breakSubstring from bs of
+  (a, b) | B.null b  -> error ("swapBytes: no " ++ show from)
+         | otherwise -> a <> to <> B.drop (B.length from) b
+
+-- | Change the body of the manifest file and sign it again, as a program that edited it would.
+resignManifest :: FilePath -> (B.ByteString -> B.ByteString) -> IO ()
+resignManifest dir f = do
+  bs <- B.readFile (dir </> manifestFile)
+  let body = f (BC.takeWhile (/= '\n') bs)
+  B.writeFile (dir </> manifestFile) (B.concat [body, "\n", "sha256:", BC.pack (sha256Hex body), "\n"])
+
+-- | Give every chunk of the world in @dir@ (closed) an erase record that holds these ids: what the writer of
+-- an Erase will do, by hand.  The record is the same for every chunk and not cut to the chunk's range; the
+-- reader cuts it.
+writeRecordsByHand :: FilePath -> Erase.EraseSet -> IO ()
+writeRecordsByHand dir set = do
+  mf <- readManifest dir
+  createDirectoryIfMissing True (dir </> "erase")
+  let bytes = Erase.encode set
+  chunks <- forM (mfChunks mf) $ \c -> do
+    let fe = FileEntry (ceName c ++ "-1.bin") (B.length bytes) (sha256Hex bytes)
+    B.writeFile (dir </> "erase" </> feName fe) bytes
+    pure c { ceErase = Just fe }
+  writeManifest dir mf { mfChunks = chunks, mfEraseGen = 1 }
+
+-- | A small world on disk, closed: three entities a < b < c made together, and a Delete of one fact of b, sealed
+-- into two chunks (Create and Delete).  Every chunk has a record that erases a..b, so c is the one that stays.
+erasedWorld :: FilePath -> IO (HosiId, HosiId, HosiId)
+erasedWorld dir = do
+  (_, clock) <- newClock nov11
+  ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+  r <- Ev.withEventsLock ev (Ev.record ev [ Create (Tmp n) "x" (Lit (VInt (fromIntegral n))) | n <- [1, 2, 3] ])
+  Ev.withEventsLock ev (Ev.commit ev r)
+  let a = Ev.rcTemps r M.! 1
+      b = Ev.rcTemps r M.! 2
+      c = Ev.rcTemps r M.! 3
+  r2 <- Ev.withEventsLock ev (Ev.record ev [Delete (Id b) "x" (Lit (VInt 2))])
+  Ev.withEventsLock ev (Ev.commit ev r2)
+  _ <- Ev.seal ev
+  Ev.closeEvents ev
+  writeRecordsByHand dir (Erase.fromRanges [(a, b)])
+  pure (a, b, c)
+
+-- | An events world (no khana): three entities made in November, two in December, then one of the November ones
+-- deleted; all sealed.  Three chunks: the creations of November (ids n1..n3), its deletion (just n2), the creations of December.
+-- Gives the events, left open, and the ids.
+twoMonths :: FilePath -> IO (Ev.Events, [HosiId], [HosiId])
+twoMonths dir = do
+  (clk, clock) <- newClock nov11
+  ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+  let put ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)
+  r1 <- put [ Create (Tmp n) "x" (Lit (VInt (fromIntegral n))) | n <- [1, 2, 3] ]
+  writeIORef clk dec05
+  r2 <- put [ Create (Tmp n) "x" (Lit (VInt (fromIntegral n))) | n <- [1, 2] ]
+  let ns = M.elems (Ev.rcTemps r1)
+  _ <- put [Delete (Id (ns !! 1)) "x" (Lit (VInt 2))]
+  _ <- Ev.seal ev
+  pure (ev, ns, M.elems (Ev.rcTemps r2))
+
+-- | How many times these bytes stand in the files under a directory (all of them, however deep).  The tail log is
+-- left out when it is open (GHC does not let one read a file another handle of the same process has open
+-- for writing): the tests that count with an open world check that its tail is empty.
+markerCount :: B.ByteString -> FilePath -> IO Int
+markerCount marker root = do
+  names <- filter (/= "tail.log") <$> listDirectory root
+  fmap sum . forM names $ \n -> do
+    let p = root </> n
+    isDir <- doesDirectoryExist p
+    if isDir then markerCount marker p else do
+      countIn 0 <$> B.readFile p
+  where
+    countIn n hay =
+      let rest = snd (B.breakSubstring marker hay)
+      in if B.null rest then n else countIn (n + 1 :: Int) (B.drop (B.length marker) rest)
+
+-- | Copy a directory of plain files.
+copyFlat :: FilePath -> FilePath -> IO ()
+copyFlat from to = do
+  createDirectoryIfMissing True to
+  listDirectory from >>= mapM_ (\n -> copyFile (from </> n) (to </> n))
+
+-- | An events world with one chunk of Create events whose values carry a marker text each (the first is the one
+-- to keep, the others are for erasing), made at one clock time.  Left open.
+markedWorld :: FilePath -> Int -> IO (Ev.Events, [HosiId])
+markedWorld dir n = do
+  (_, clock) <- newClock nov11
+  ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+  r <- Ev.withEventsLock ev (Ev.record ev [ Create (Tmp i) "x" (Lit (VStr (T.pack (marker i)))) | i <- [1 .. n] ] >>= \rc -> Ev.commit ev rc >> pure rc)
+  _ <- Ev.seal ev
+  pure (ev, [ Ev.rcTemps r M.! i | i <- [1 .. n] ])
+
+marker :: Int -> String
+marker i = "marker-" ++ show i ++ "-do-not-leave-me-on-the-disk"
+
+pad6 :: Int -> String
+pad6 n = let s = show n in replicate (6 - length s) '0' ++ s
 
 -- | Tests that need no khana at all.
 pureTests :: [Test]
@@ -222,6 +359,701 @@ pureTests =
                  , ("no segments for keys", B.concat [B.take 16 good, be32 0, B.drop 20 good]) ]
       forM_ bad $ \(what, bs) ->
         check what (either (const True) (const False) (runGet getBinaryFuse bs 0)))
+
+  , ("erase set: members, ranges and the normal form agree with a plain Set of ids (QuickCheck)", prop 500 $
+      forAll (listOf genEraseRange) $ \rs ->
+        let s = Erase.fromRanges rs
+            naive = S.fromList [ i | (a, b) <- rs, i <- [a .. b] ]
+            out = Erase.toRanges s
+            sorted = and [ a <= b | (a, b) <- out ] && and (zipWith (\(_, b) (c, _) -> b + 1 < c) out (drop 1 out))
+        in counterexample ("ranges: " ++ show out) sorted
+           .&&. conjoin [ Erase.member i s === S.member i naive | i <- [-3 .. 80] ]
+           .&&. S.fromList [ i | (a, b) <- out, i <- [a .. b] ] === naive
+           .&&. Erase.fromRanges (reverse (rs ++ rs)) === s            -- order and repeats do not matter
+           .&&. Erase.null s === S.null naive)
+  , ("erase set: ranges that overlap or touch become one, at the edges of the number line too", do
+      checkEq "touching" [(1, 6)] (Erase.toRanges (Erase.fromRanges [(4, 6), (1, 3)]))
+      checkEq "overlapping" [(1, 9)] (Erase.toRanges (Erase.fromRanges [(1, 5), (3, 9), (2, 4)]))
+      checkEq "one apart stays two" [(1, 3), (5, 6)] (Erase.toRanges (Erase.fromRanges [(1, 3), (5, 6)]))
+      checkEq "inside another" [(1, 9)] (Erase.toRanges (Erase.fromRanges [(1, 9), (4, 5)]))
+      checkEq "an upside-down pair holds nothing" [] (Erase.toRanges (Erase.fromRanges [(5, 1)]))
+      checkEq "at the top (maxBound + 1 would wrap)" [(maxBound - 1, maxBound)]
+        (Erase.toRanges (Erase.fromRanges [(maxBound, maxBound), (maxBound - 1, maxBound)]))
+      checkEq "at the bottom" [(minBound, 5)] (Erase.toRanges (Erase.fromRanges [(minBound + 2, 5), (minBound, minBound + 1)]))
+      check "the largest id is a member" (Erase.member maxBound (Erase.fromIds [maxBound]))
+      check "...and its neighbour is not" (not (Erase.member (maxBound - 1) (Erase.fromIds [maxBound]))))
+  , ("erase set: union is associative, commutative, idempotent, and has the empty set for zero (QuickCheck)", prop 300 $
+      forAll (listOf genEraseRange) $ \xs -> forAll (listOf genEraseRange) $ \ys -> forAll (listOf genEraseRange) $ \zs ->
+        let a = Erase.fromRanges xs; b = Erase.fromRanges ys; c = Erase.fromRanges zs
+        in Erase.union (Erase.union a b) c === Erase.union a (Erase.union b c)
+           .&&. Erase.union a b === Erase.union b a
+           .&&. Erase.union a a === a
+           .&&. Erase.union a Erase.empty === a
+           .&&. Erase.union a b === Erase.fromRanges (xs ++ ys)
+           .&&. conjoin [ Erase.member i (Erase.union a b) === (Erase.member i a || Erase.member i b) | i <- [-3 .. 80] ])
+  , ("erase set: restrictTo and overlaps agree with a plain Set (QuickCheck)", prop 500 $
+      forAll (listOf genEraseRange) $ \rs -> forAll (choose (-3, 70)) $ \lo -> forAll (choose (-3, 14)) $ \len ->
+        let s = Erase.fromRanges rs
+            hi = lo + len                                                 -- len < 0 asks about an upside-down window
+            naive = S.fromList [ i | (a, b) <- rs, i <- [a .. b] ]
+            inWindow = S.filter (\i -> lo <= i && i <= hi) naive
+            r = Erase.restrictTo (lo, hi) s
+        in S.fromList [ i | (a, b) <- Erase.toRanges r, i <- [a .. b] ] === inWindow
+           .&&. r === Erase.fromRanges [ (i, i) | i <- S.toList inWindow ]    -- in normal form too
+           .&&. Erase.overlaps (lo, hi) s === not (S.null inWindow))
+  , ("erase file: any set round-trips, whatever the numbers are, even the whole range of an Int64 (QuickCheck)", prop 500 $
+      forAll (listOf genWideRange) $ \rs ->
+        let s = Erase.fromRanges rs
+        in Erase.decode (Erase.encode s) === Right s)
+  , ("erase file: HOSIERS1 is the magic, the numbers are counted from the one before, and a CRC-32 closes it", do
+      let body = "HOSIERS1" <> B.pack [2, 5, 0, 4, 2]                       -- two ranges: 5..5, then 4 further on: 10..12
+          file = Erase.encode (Erase.fromRanges [(5, 5), (10, 12)])
+      checkEq "the bytes" (body <> be32 (crc32 body)) file
+      checkEq "the empty set" (Right Erase.empty) (Erase.decode (Erase.encode Erase.empty))
+      checkEq "...is 13 bytes" 13 (B.length (Erase.encode Erase.empty)))
+  , ("erase file: a changed byte, a cut or longer file, a foreign file, a number that does not fit are all refused", do
+      let s = Erase.fromRanges [(2, 2), (300, 70000), (maxBound - 5, maxBound), (minBound, minBound + 3)]
+          good = Erase.encode s
+          refused = either (const True) (const False) . Erase.decode
+          sealed body = body <> be32 (crc32 body)                           -- a file with the right CRC, to reach the other checks
+      checkEq "the good one reads" (Right s) (Erase.decode good)
+      forM_ [0 .. B.length good - 1] $ \k -> forM_ [0x01, 0xff] $ \m ->
+        check ("changing byte " ++ show k ++ " by xor " ++ show m)
+          (refused (B.take k good <> B.singleton (B.index good k `xor` m) <> B.drop (k + 1) good))
+      forM_ [0 .. B.length good - 1] $ \k -> check ("cut to " ++ show k ++ " bytes") (refused (B.take k good))
+      check "one byte more" (refused (good <> B.singleton 0))
+      check "another magic" (refused (sealed ("HOSIERS2" <> build (putVar 0))))
+      check "a count with nothing behind it" (refused (sealed ("HOSIERS1" <> build (putVar 5))))
+      check "a count too large to be true" (refused (sealed ("HOSIERS1" <> build (putVar (2 ^ (40 :: Int))))))
+      check "bytes after the last range" (refused (sealed ("HOSIERS1" <> build (putVar 0) <> B.singleton 7)))
+      check "a range that touches the one before it"
+        (refused (sealed ("HOSIERS1" <> build (putVar 2 <> putVar 5 <> putVar 0 <> putVar 0 <> putVar 0))))
+      check "a range past the largest id"
+        (refused (sealed ("HOSIERS1" <> build (putVar 1 <> putVar (fromIntegral (maxBound :: Int64)) <> putVar 1))))
+      check "a second range past the largest id"
+        (refused (sealed ("HOSIERS1" <> build (putVar 2 <> putVar 1 <> putVar 0 <> putVar (fromIntegral (maxBound :: Int64)) <> putVar 0))))
+      checkEq "the largest id alone is fine" (Right (Erase.fromIds [maxBound]))
+        (Erase.decode (sealed ("HOSIERS1" <> build (putVar 1 <> putVar (fromIntegral (maxBound :: Int64)) <> putVar 0)))))
+
+  , ("manifest: with no erase record nothing changes (hosi-manifest/1, no new key); a record makes it /2; both read back as they were", withTmp $ \dir -> do
+      let plain   = Manifest 3 7 4 [manifestChunk] 0
+          withRec = plain { mfChunks = [manifestChunk { ceErase = Just manifestRecord }], mfEraseGen = 1 }
+          emptied = plain { mfEraseGen = 1 }                   -- the record is gone again, the counter is not
+          onDisk m = writeManifest dir m >> B.readFile (dir </> manifestFile)
+          has needle = (needle `B.isInfixOf`)
+      bs1 <- onDisk plain
+      check "a world that never had a record is /1" (has "\"format\":\"hosi-manifest/1\"" bs1)
+      check "and shows no trace of erase at all" (not (has "erase" bs1 || has "Erase" bs1))
+      checkEq "reads back" plain =<< readManifest dir
+      bs2 <- onDisk withRec
+      check "a world with a record is /2" (has "\"format\":\"hosi-manifest/2\"" bs2)
+      check "with the counter, and the record on its chunk" (has "\"eraseGen\":1" bs2 && has "\"erase\":{" bs2)
+      checkEq "reads back" withRec =<< readManifest dir
+      bs3 <- onDisk emptied
+      check "when the last record is gone the counter keeps the world /2 (so memory and disk say the same)" (has "hosi-manifest/2" bs3)
+      checkEq "reads back" emptied =<< readManifest dir)
+
+  , ("manifest: a /1 that lists a record or a counter, a /2 without its counter, and a format from the future are refused", withTmp $ \dir -> do
+      let withRec = Manifest 3 7 4 [manifestChunk { ceErase = Just manifestRecord }] 1
+          emptied = Manifest 3 7 4 [manifestChunk] 1
+          refused what m edit = do
+            writeManifest dir m
+            resignManifest dir edit
+            r <- try (readManifest dir)
+            case r of
+              Left (Corrupt _) -> pure ()
+              Left e           -> throwIO (userError (what ++ ": the wrong error: " ++ show e))
+              Right _          -> throwIO (userError (what ++ ": was accepted"))
+          toV1 = swapBytes "hosi-manifest/2" "hosi-manifest/1"
+      refused "a /1 with a record" withRec toV1
+      refused "a /1 with a counter" emptied toV1
+      refused "a /2 without its counter" withRec (swapBytes "eraseGen" "eraseGeX")
+      -- the same refusal is what a build that knows only /1 does with a /2: it reads the format first
+      refused "a format from the future" withRec (swapBytes "hosi-manifest/2" "hosi-manifest/3")
+      -- and a change nobody signed is still refused, as before
+      writeManifest dir withRec
+      bs <- B.readFile (dir </> manifestFile)
+      B.writeFile (dir </> manifestFile) (swapBytes "\"eraseGen\":1" "\"eraseGen\":2" bs)
+      r <- try (readManifest dir)
+      check "an unsigned change to the counter is refused" (case r of Left (Corrupt _) -> True; _ -> False))
+
+  , ("events: the manifest lists a chunk's erase record; open sweeps the files it does not list; verify checks the listed one", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+      ev <- Ev.openEvents cfg dir
+      r <- Ev.withEventsLock ev (Ev.record ev [Create (Tmp 1) "a" (Lit (VInt 1))])
+      Ev.withEventsLock ev (Ev.commit ev r)
+      Just sr <- Ev.seal ev
+      Ev.closeEvents ev
+      checkEq "a world that never erased has no erase directory" False =<< doesDirectoryExist (dir </> "erase")
+      -- a record for the one chunk, written by hand: the id it holds is gone
+      let c     = head (Ev.srChunks sr)
+          bytes = Erase.encode (Erase.fromIds [Ev.rcTemps r M.! 1])
+          fe    = FileEntry (ceName c ++ "-1.bin") (B.length bytes) (sha256Hex bytes)
+          path  = dir </> "erase" </> feName fe
+          list m g = writeManifest dir m { mfChunks = [ x { ceErase = Just g } | x <- mfChunks m ], mfEraseGen = 1 }
+          verify ev' = snd <$> Ev.withEventsLock ev' (Ev.verifyEvents ev')
+      createDirectoryIfMissing True (dir </> "erase")
+      B.writeFile path bytes
+      readManifest dir >>= \m -> list m fe
+      B.writeFile (dir </> "erase" </> "stray-2.bin") bytes                      -- an Erase that never reached the manifest
+      B.writeFile (path ++ ".tmp") bytes
+      ev2 <- Ev.openEvents cfg dir
+      checkEq "the listed record stays; the stray and the temp file go" [feName fe] =<< listDirectory (dir </> "erase")
+      checkEq "verify: clean (the chunk's own hash does not mind the record)" [] =<< verify ev2
+      -- a byte changed
+      let flipAt n b = B.take n b <> B.singleton (B.index b n `xor` 1) <> B.drop (n + 1) b
+      B.writeFile path (flipAt 10 bytes)
+      ps1 <- verify ev2
+      check "a changed byte: the hash does not match" (any ("does not match its recorded hash" `isInfixOf`) ps1)
+      check "and it is not an erase record any more (its CRC)" (any ("is not an erase record" `isInfixOf`) ps1)
+      B.writeFile path bytes
+      checkEq "put back: clean again" [] =<< verify ev2
+      -- gone
+      removeFile path
+      ps2 <- verify ev2
+      check "a missing record is reported" (any ("is missing" `isInfixOf`) ps2)
+      Ev.closeEvents ev2)
+
+  , ("erase, read side: history and eventsAfter leave out an erased id, its chunks are not even asked, and the other ids stay", withTmp $ \dir -> do
+      (a, b, c) <- erasedWorld dir
+      ev <- Ev.openEvents Ev.defaultEventsConfig dir
+      -- b has a Create and a Delete, in two chunks; both chunks' records have it
+      (esB, trB) <- Ev.historyTrace ev b
+      checkEq "b: nothing" [] esB
+      checkEq "b: both chunks turn it away by their record, before any filter or reader" (2, 0, [])
+        (Ev.ltSkippedByErase trB, Ev.ltSkippedByFilter trB, map fst (Ev.ltProbed trB))
+      (esA, trA) <- Ev.historyTrace ev a
+      checkEq "a: nothing" [] esA
+      checkEq "a: only the Create chunk's range holds it, and that chunk's record has it" (1, 0) (Ev.ltSkippedByErase trA, length (Ev.ltProbed trA))
+      checkEq "no chunk reader was opened for any of this" 0 . Ev.xsReadersOpen =<< Ev.eventsStats ev
+      -- c was not erased
+      (esC, trC) <- Ev.historyTrace ev c
+      checkEq "c: found" 1 (length esC)
+      checkEq "c: nothing was skipped on account of an erase" 0 (Ev.ltSkippedByErase trC)
+      -- the events a khana is folded from
+      evs <- Ev.eventsAfter ev 0
+      checkEq "eventsAfter: only c's event is left" [c] (map evId evs)
+      evs' <- Ev.eventsAfter ev (maximum (map evSeq evs) - 1)
+      checkEq "and with a seq to start from, the same filter" [c] (map evId evs')
+      Ev.closeEvents ev)
+
+  , ("erase, read side: a write to an erased entity is refused, and nothing is written; any other write, even one that only points at it, goes in", withTmp $ \dir -> do
+      (a, b, c) <- erasedWorld dir
+      (_, clock) <- newClock nov11
+      ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      let attempt ops = try (Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)) :: IO (Either HosiError Ev.Recorded)
+          wasErased = either (\e -> case e of BadArgument m -> "was erased" `isInfixOf` m; _ -> False) (const False)
+          wentIn    = either (const False) (const True)
+      forM_ [ ("a Create on an erased entity", [Create (Id a) "x" (Lit (VInt 9))])
+            , ("a Delete on one", [Delete (Id b) "x" (Lit (VInt 2))])
+            , ("one erased operation among good ones", [Create (Id c) "x" (Lit (VInt 9)), Create (Id b) "x" (Lit (VInt 9))]) ] $ \(what, ops) ->
+        check (what ++ " is refused") . wasErased =<< attempt ops
+      checkEq "the refused batches wrote nothing" 0 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      check "a write to c, which was not erased, goes in" . wentIn =<< attempt [Create (Id c) "x" (Lit (VInt 9))]
+      check "a new entity goes in" . wentIn =<< attempt [Create (Tmp 1) "x" (Lit (VInt 1))]
+      check "and so does one that only points at an erased entity: a number may stay" . wentIn =<< attempt [Create (Tmp 1) "ref" (RefTo (Id b))]
+      checkEq "three events in the tail" 3 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      -- recordMany: the erased batch is a Left in its own place and the next one still goes in
+      rs <- Ev.withEventsLock ev (Ev.recordMany ev [[Create (Id a) "x" (Lit (VInt 9))], [Create (Tmp 1) "x" (Lit (VInt 5))]])
+      check "recordMany: Left, then Right" (case rs of [Left (BadArgument _), Right _] -> True; _ -> False)
+      forM_ (take 1 [ r | Right r <- rs ]) (Ev.withEventsLock ev . Ev.rollback ev)
+      Ev.closeEvents ev)
+
+  , ("erase, read side: open refuses a world whose listed erase record is missing, changed, or not an erase record", withTmp $ \dir -> do
+      _ <- erasedWorld dir
+      mf <- readManifest dir
+      let c0   = head (mfChunks mf)
+          fe   = maybe (error "erasedWorld lists a record on every chunk") id (ceErase c0)
+          path = dir </> "erase" </> feName fe
+          relist g = writeManifest dir mf { mfChunks = c0 { ceErase = Just g } : tail (mfChunks mf) }
+          refused what = do
+            r <- try (Ev.openEvents Ev.defaultEventsConfig dir)
+            case r of
+              Left (Corrupt msg) -> check (what ++ ": the message names the file (" ++ msg ++ ")") (feName fe `isInfixOf` msg)
+              Left e             -> throwIO (userError (what ++ ": the wrong error: " ++ show e))
+              Right ev           -> Ev.closeEvents ev >> throwIO (userError (what ++ ": the world opened without its record"))
+      bytes <- B.readFile path
+      removeFile path
+      refused "missing"
+      B.writeFile path (B.take 10 bytes <> B.singleton (B.index bytes 10 `xor` 1) <> B.drop 11 bytes)
+      refused "a byte changed"
+      let junk = "this is not an erase record at all" :: B.ByteString
+      B.writeFile path junk
+      relist fe { feBytes = B.length junk, feSha256 = sha256Hex junk }
+      refused "signed by the manifest, but not an erase record"
+      -- put back as it was: it opens again
+      B.writeFile path bytes
+      writeManifest dir mf
+      ev <- Ev.openEvents Ev.defaultEventsConfig dir
+      Ev.closeEvents ev)
+
+  , ("idRangeBetween: a span of time is one range of ids, from the first of its first millisecond to the last before its end", do
+      let t0 = UTCTime (fromGregorian 2026 11 1) 0
+          t1 = UTCTime (fromGregorian 2026 12 1) 0
+      case idRangeBetween t0 t1 of
+        Nothing       -> throwIO (userError "November has ids")
+        Just (lo, hi) -> do
+          checkEq "the first id is in November, at sequence 0" ((2026, 11), 0) (idMonth lo, idSeqNo lo)
+          checkEq "the last is still November" (2026, 11) (idMonth hi)
+          checkEq "the next one is December" (2026, 12) (idMonth (hi + 1))
+      checkEq "a span that ends where it starts has no ids" Nothing (idRangeBetween t0 t0)
+      checkEq "nor one that ends before it starts" Nothing (idRangeBetween t1 t0)
+      checkEq "before the first id the generator gives, it starts at the first" (Just (makeId 1 0))
+        (fst <$> idRangeBetween (UTCTime (fromGregorian 2000 1 1) 0) t0))
+
+  , ("erase, write side: a record for part of a chunk, the chunk dropped when everything it could hold is covered; each step swaps the manifest once and tidies the files", withTmp $ \dir -> do
+      (ev, ns, ds) <- twoMonths dir
+      let [n1, n2, n3] = ns
+          [d1, _]      = ds
+          eraseSet s   = Ev.withEventsLock ev (Ev.eraseNow ev s)
+          files d      = sort <$> listDirectory (dir </> d)
+          history1 i   = length <$> Ev.history ev i
+      -- one id in the middle of the November creations (a record), which is also the whole of the deletion chunk (dropped)
+      done1 <- eraseSet (Erase.fromIds [n2])
+      checkEq "one chunk dropped, one recorded, generation 1" (1, 1, 1) (length (Ev.edDropped done1), length (Ev.edRecorded done1), Ev.edGeneration done1)
+      checkEq "n2 is gone, the others are not" [0, 1, 1, 1] =<< mapM history1 [n2, n1, n3, d1]
+      mf1 <- readManifest dir
+      checkEq "two chunks left, generation 1" (2, 1) (length (mfChunks mf1), mfEraseGen mf1)
+      checkEq "the dropped chunk's directory is gone" 2 . length =<< files "chunks"
+      checkEq "one record, named for the chunk and the generation" [ceName c ++ "-1.bin" | c <- mfChunks mf1, ceErase c /= Nothing] =<< files "erase"
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      -- the same again: nothing to do, nothing written
+      m1 <- B.readFile (dir </> manifestFile)
+      done2 <- eraseSet (Erase.fromIds [n2])
+      checkEq "nothing new: nothing dropped, nothing recorded, still generation 1" ([], [], 1) (Ev.edDropped done2, Ev.edRecorded done2, Ev.edGeneration done2)
+      checkEq "and the manifest is the same bytes" m1 =<< B.readFile (dir </> manifestFile)
+      -- a second id: the chunk's record is replaced by a bigger one in the new generation
+      done3 <- eraseSet (Erase.fromIds [n1])
+      checkEq "recorded again, generation 2" (1, 2) (length (Ev.edRecorded done3), Ev.edGeneration done3)
+      mf3 <- readManifest dir
+      checkEq "only the new record is left" [ceName c ++ "-2.bin" | c <- mfChunks mf3, ceErase c /= Nothing] =<< files "erase"
+      -- all of November's creations: the chunk is covered whole, so it goes, and its record with it
+      done4 <- eraseSet (Erase.fromRanges [(n1, n3)])
+      checkEq "dropped, nothing recorded, generation 3" (1, 0, 3) (length (Ev.edDropped done4), length (Ev.edRecorded done4), Ev.edGeneration done4)
+      checkEq "no record is left" [] =<< files "erase"
+      mf4 <- readManifest dir
+      checkEq "December is all that is left" (1, [ (2026, 12) ]) (length (mfChunks mf4), map ceMonth (mfChunks mf4))
+      checkEq "December is untouched" 1 =<< history1 d1
+      -- and the same on a world opened again
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "after reopen: November gone, December there" [0, 0, 0, 1] =<< mapM (fmap length . Ev.history ev2) [n1, n2, n3, d1]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+      Ev.closeEvents ev2)
+
+  , ("erase, write side: the tail is sealed first; a world that only dropped chunks has no erase/", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      r <- Ev.withEventsLock ev (Ev.record ev [ Create (Tmp n) "x" (Lit (VInt 1)) | n <- [1, 2] ] >>= \rc -> Ev.commit ev rc >> pure rc)
+      let [x, y] = M.elems (Ev.rcTemps r)
+      checkEq "two events wait in the tail" 2 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      done <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromRanges [(0, maxBound)]))
+      check "the tail was sealed first" (maybe False (const True) (Ev.edSealed done))
+      checkEq "the tail is empty" 0 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      checkEq "the one chunk was covered whole: dropped, no record" (1, 0, 1) (length (Ev.edDropped done), length (Ev.edRecorded done), Ev.edGeneration done)
+      checkEq "x and y are gone" [0, 0] =<< mapM (fmap length . Ev.history ev) [x, y]
+      checkEq "there was never a record, so there is no erase/" False =<< doesDirectoryExist (dir </> "erase")
+      mf <- readManifest dir
+      checkEq "the world is /2 all the same, with its counter" 1 (mfEraseGen mf)
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev)
+
+  , ("ownedBy: the entities that name an owner in a Create, in any month and even if deleted since; only the attributes asked; the window is on the creation time; the tail is sealed first; nothing is erased", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      let put ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)
+          idOf rc n = Ev.rcTemps rc M.! n
+          owned attrs owners rng = Ev.withEventsLock ev (Ev.ownedBy ev attrs owners rng)
+          everything = (minBound, maxBound)
+          authored = ["post/author", "media/owner"]
+      who <- put [Create (Tmp 1) "name" (Lit (VStr "A")), Create (Tmp 2) "name" (Lit (VStr "B"))]
+      let (a, b) = (idOf who 1, idOf who 2)
+      nov <- put [ Create (Tmp 1) "post/author" (RefTo (Id a)), Create (Tmp 1) "post/text" (Lit (VStr "p1"))     -- a's post
+                 , Create (Tmp 2) "post/author" (RefTo (Id b))                                                   -- b's post
+                 , Create (Tmp 3) "post/author" (RefTo (Id a)), Create (Tmp 3) "post/text" (Lit (VStr "gone"))   -- a's post, deleted below
+                 , Create (Tmp 4) "media/owner" (RefTo (Id a))                                                   -- a's media
+                 , Create (Tmp 5) "post/mention" (RefTo (Id a)) ]                                                -- mentions a, is not a's
+      let [p1, p2, p3, m1, p5] = map (idOf nov) [1 .. 5]
+      _ <- put [Delete (Id p3) "post/author" (RefTo (Id a)), Delete (Id p3) "post/text" (Lit (VStr "gone"))]
+      writeIORef clk (day 324)
+      late <- put [Create (Tmp 1) "post/author" (RefTo (Id a))]                                                  -- a's post of the 21st: the same chunk as the others
+      let p6 = idOf late 1
+      _ <- Ev.seal ev
+      writeIORef clk dec05
+      dec <- put [Create (Tmp 1) "post/author" (RefTo (Id a))]                                                   -- a's post of December, still in the tail
+      let pd = idOf dec 1
+      checkEq "before: one event waits in the tail" 1 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      checkEq "a's posts and media, the deleted one too, the December one from the tail; not b's, not the mention"
+        (sort [p1, p3, m1, p6, pd]) =<< owned authored [a] everything
+      checkEq "...and the tail is sealed now" 0 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      let Just novRange = idRangeBetween (UTCTime (fromGregorian 2026 11 1) 0) (UTCTime (fromGregorian 2026 12 1) 0)
+          Just decRange = idRangeBetween (UTCTime (fromGregorian 2026 12 1) 0) (UTCTime (fromGregorian 2027 1 1) 0)
+          Just firstHalf  = idRangeBetween (UTCTime (fromGregorian 2026 11 1) 0) (UTCTime (fromGregorian 2026 11 15) 0)
+          Just secondHalf = idRangeBetween (UTCTime (fromGregorian 2026 11 15) 0) (UTCTime (fromGregorian 2026 12 1) 0)
+      checkEq "the window of November" (sort [p1, p3, m1, p6]) =<< owned authored [a] novRange
+      checkEq "the window of December" [pd] =<< owned authored [a] decRange
+      -- the first half and the second half of November are in one chunk: the window cuts inside it
+      checkEq "the first half of November" (sort [p1, p3, m1]) =<< owned authored [a] firstHalf
+      checkEq "the second half of November" [p6] =<< owned authored [a] secondHalf
+      checkEq "only the attribute asked" [m1] =<< owned ["media/owner"] [a] everything
+      checkEq "a mention is found when it is the attribute asked" [p5] =<< owned ["post/mention"] [a] everything
+      checkEq "the other owner" [p2] =<< owned authored [b] everything
+      checkEq "both owners, in order, once each" (sort [p1, p2, p3, m1, p6, pd]) =<< owned authored [a, b] everything
+      checkEq "no attributes: nothing" [] =<< owned [] [a] everything
+      checkEq "no owners: nothing" [] =<< owned authored [] everything
+      checkEq "an owner nobody names: nothing" [] =<< owned authored [12345] everything
+      checkEq "a value that is not a reference to the owner does not count" [] =<< owned ["name"] [a] everything
+      checkEq "none of this erased anything" 0 =<< Ev.eraseGeneration ev
+      Ev.closeEvents ev)
+
+  , ("rewrite: the chunk with a record is written again without what was erased; the old chunk and the record go; the marker is in no file", withTmp $ \dir -> do
+      (ev, [a, b, c]) <- markedWorld dir 3
+      let m i = BC.pack (marker i)
+          erasing s = Ev.withEventsLock ev (Ev.eraseNow ev s)
+          files d = sort <$> listDirectory (dir </> d)
+      checkEq "the tail is empty (the chunk was sealed), so the files below are all there is" 0 . Ev.xsTailEvents =<< Ev.eventsStats ev
+      checkEq "the three markers are in the chunk" [1, 1, 1] =<< mapM (\i -> markerCount (m i) dir) [1, 2, 3]
+      _ <- erasing (Erase.fromIds [c])
+      checkEq "erased, not yet rewritten: the bytes are still in the file" 1 =<< markerCount (m 3) dir
+      checkEq "c is gone from history all the same" 0 . length =<< Ev.history ev c
+      mf0 <- readManifest dir
+      let [old] = mfChunks mf0
+      -- nothing to rewrite when nothing has a record: a call that does nothing writes nothing
+      done <- Ev.rewriteErased ev 10
+      checkEq "one chunk rewritten, into the next number" [(ceName old, Just ("c" ++ pad6 (mfNextChunk mf0) ++ drop 7 (ceName old)))] (Ev.rwRewritten done)
+      checkEq "nothing skipped, nothing left" (0 :: Int, [] :: [String]) (Ev.rwLeft done, Ev.rwSkipped done)
+      mf1 <- readManifest dir
+      let [new] = mfChunks mf1
+      checkEq "the new chunk holds a and b only: a tighter zone map" (2, 2, a, b) (ceEvents new, ceIds new, ceMinId new, ceMaxId new)
+      checkEq "no record any more; the counter stays" (Nothing, 1) (ceErase new, mfEraseGen mf1)
+      check "the generation moved" (mfGeneration mf1 > mfGeneration mf0)
+      checkEq "chunks/ holds the new chunk only" [ceName new] =<< files "chunks"
+      checkEq "erase/ holds nothing" [] =<< files "erase"
+      checkEq "the marker of c is in no file; the other two are" [1, 1, 0] =<< mapM (\i -> markerCount (m i) dir) [1, 2, 3]
+      checkEq "a and b are found, c is not" [1, 1, 0] =<< mapM (fmap length . Ev.history ev) [a, b, c]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      m1 <- B.readFile (dir </> manifestFile)
+      done2 <- Ev.rewriteErased ev 10
+      checkEq "again: nothing to do" ([] :: [String], [] :: [String], 0 :: Int) (map fst (Ev.rwRewritten done2), Ev.rwSkipped done2, Ev.rwLeft done2)
+      checkEq "and the manifest is the same bytes" m1 =<< B.readFile (dir </> manifestFile)
+      -- the guard went with the record: the id is a bare number, and a write to it is let in again
+      r <- Ev.withEventsLock ev (Ev.record ev [Create (Id c) "x" (Lit (VInt 9))])
+      Ev.withEventsLock ev (Ev.commit ev r)
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "after reopen: a and b as before; c has only the new write" [1, 1, 1] =<< mapM (fmap length . Ev.history ev2) [a, b, c]
+      Ev.closeEvents ev2)
+
+  , ("rewrite: a chunk none of whose events is left is taken out; a limit rewrites a few at a time", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir
+      let put ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)
+          erasing s = Ev.withEventsLock ev (Ev.eraseNow ev s)
+      -- x and y a second apart in November: the ids between them are nobody's, so erasing x and y is not "the whole zone map"
+      rx <- put [Create (Tmp 1) "x" (Lit (VInt 1))]
+      modifyIORef' clk (+ 1000)
+      ry <- put [Create (Tmp 1) "x" (Lit (VInt 2))]
+      writeIORef clk dec05
+      rz <- put [Create (Tmp 1) "x" (Lit (VInt 3))]
+      _ <- Ev.seal ev
+      let [x] = M.elems (Ev.rcTemps rx); [y] = M.elems (Ev.rcTemps ry); [z] = M.elems (Ev.rcTemps rz)
+      done1 <- erasing (Erase.fromIds [x, y, z])
+      checkEq "the November chunk has a record (a gap), the December one went whole" (1, 1) (length (Ev.edRecorded done1), length (Ev.edDropped done1))
+      mf0 <- readManifest dir
+      checkEq "one chunk, with a record" 1 (length [ () | c <- mfChunks mf0, ceErase c /= Nothing ])
+      done <- Ev.rewriteErased ev 10
+      checkEq "nothing was left of it: no chunk takes its place" 1 (length [ () | (_, Nothing) <- Ev.rwRewritten done ])
+      mf1 <- readManifest dir
+      checkEq "the world has no chunk" 0 (length (mfChunks mf1))
+      checkEq "no directory is left in chunks/" [] =<< listDirectory (dir </> "chunks")
+      checkEq "the counter for names did not move for a chunk that was not made" (mfNextChunk mf0) (mfNextChunk mf1)
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev
+      -- a limit: two chunks with records, one at a time
+      withTmp $ \dir2 -> do
+        (ev2, ns, ds) <- twoMonths dir2
+        let [_, _, n3] = ns
+            [_, d2] = ds
+        _ <- Ev.withEventsLock ev2 (Ev.eraseNow ev2 (Erase.fromIds [n3, d2]))
+        r1 <- Ev.rewriteErased ev2 1
+        checkEq "one at a time: one done, one left" (1, 1) (length (Ev.rwRewritten r1), Ev.rwLeft r1)
+        r2 <- Ev.rewriteErased ev2 1
+        checkEq "the next call does the other" (1, 0) (length (Ev.rwRewritten r2), Ev.rwLeft r2)
+        checkEq "n3 and d2 are gone, the rest is there" [0, 0, 1, 1] =<< mapM (fmap length . Ev.history ev2) [n3, d2, head ns, head ds]
+        checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+        Ev.closeEvents ev2)
+
+  , ("rewrite: where it can stop; a directory made, a swap done and the old chunk not yet removed: open sweeps them, and the world is the one the manifest names", withTmp $ \dir -> do
+      (ev, [a, b, c]) <- markedWorld dir 3
+      _ <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [c]))
+      mf0 <- readManifest dir
+      let [old] = mfChunks mf0
+          Just fe = ceErase old
+      -- what the old world's files are, kept aside
+      copyFlat (dir </> "chunks" </> ceName old) (dir </> "aside-chunk")
+      copyFlat (dir </> "erase") (dir </> "aside-erase")
+      -- 1. died after writing the new directory, before the swap: a scratch directory and a named one nobody lists
+      Ev.closeEvents ev
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> ".rewrite-someone")
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> "c000099-create-2026-11")
+      ev1 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "open swept both: the old chunk is all that is in chunks/" [ceName old] =<< listDirectory (dir </> "chunks")
+      checkEq "the world is the old one: a and b, not c" [1, 1, 0] =<< mapM (fmap length . Ev.history ev1) [a, b, c]
+      -- 2. the swap done, the old chunk and its record not yet removed
+      done <- Ev.rewriteErased ev1 10
+      checkEq "rewritten" 1 (length (Ev.rwRewritten done))
+      mf1 <- readManifest dir
+      Ev.closeEvents ev1
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> ceName old)
+      copyFlat (dir </> "aside-erase") (dir </> "erase")
+      ev2 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "open swept the old chunk and its record" (map ceName (mfChunks mf1)) =<< listDirectory (dir </> "chunks")
+      checkEq "no record is left" False . elem (feName fe) =<< listDirectory (dir </> "erase")
+      checkEq "the world is the new one" [1, 1, 0] =<< mapM (fmap length . Ev.history ev2) [a, b, c]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+      Ev.closeEvents ev2)
+
+  , ("freeze rule: cold is no use for ecColdAfterMs and a hot chunk; a read warms the month; the stamps reach the disk and survive a reopen; a lost or unreadable access.json makes every unit just used; with Nothing nothing is kept", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      let days n = n * 86400000
+          cfg = Ev.defaultEventsConfig { Ev.ecClock = clock, Ev.ecColdBlockEvents = 4, Ev.ecColdAfterMs = Just (days 10) }
+          nov = (KCreate, (2026, 11))
+          dec = (KCreate, (2026, 12))
+      ev <- Ev.openEvents cfg dir
+      let put ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)
+      r1 <- put [Create (Tmp 1) "x" (Lit (VInt 1))]
+      _ <- Ev.seal ev
+      writeIORef clk dec05
+      _ <- put [Create (Tmp 1) "x" (Lit (VInt 2))]
+      _ <- Ev.seal ev
+      let n1 = Ev.rcTemps r1 M.! 1
+      checkEq "a seal stamps the write of each unit it made a chunk of" (M.fromList [(nov, Ev.Stamp 0 nov11), (dec, Ev.Stamp 0 dec05)]) =<< Ev.stampsOf ev
+      checkEq "it is on the disk already" True =<< doesFileExist (dir </> "access.json")
+      writeIORef clk (dec05 + days 1)
+      checkEq "a day after December's write: November has been quiet for 25 days" [nov] =<< Ev.coldUnits ev
+      _ <- Ev.history ev n1
+      checkEq "asking about a November entity warms November (both kinds of it)" [(nov, Ev.Stamp (dec05 + days 1) nov11), ((KDelete, (2026, 11)), Ev.Stamp (dec05 + days 1) 0)] . filter (\((_, m), _) -> m == (2026, 11)) . M.toList =<< Ev.stampsOf ev
+      checkEq "...so nothing is cold" [] =<< Ev.coldUnits ev
+      writeIORef clk (dec05 + days 11 - 1)
+      checkEq "one millisecond short of 10 days from the read: November is warm, December (11 days) is cold" [dec] =<< Ev.coldUnits ev
+      writeIORef clk (dec05 + days 11)
+      checkEq "exactly 10 days from the read: November is cold too; in order" [nov, dec] =<< Ev.coldUnits ev
+      -- the first one only: November, and it has no hot chunk afterwards
+      done <- Ev.freezeCold ev 1
+      checkEq "freezeCold 1 froze the first unit" [nov] (map Ev.fzUnit done)
+      checkEq "the other is left" [dec] =<< Ev.coldUnits ev
+      _ <- Ev.history ev n1                                    -- a read after the last write of the file: only a close can bring it to the disk
+      before <- Ev.stampsOf ev
+      Ev.closeEvents ev
+      B.writeFile (dir </> "access.json.tmp") "half a file"      -- a write that died before its rename
+      ev2 <- Ev.openEvents cfg dir
+      checkEq "open swept the temp file" False =<< doesFileExist (dir </> "access.json.tmp")
+      checkEq "after reopen: the same stamps for the units that have a chunk (the Delete one has none, and is left out)" (M.filterWithKey (\(kd, _) _ -> kd == KCreate) before) =<< Ev.stampsOf ev2
+      checkEq "and December is still cold: the stamps were not forgotten" [dec] =<< Ev.coldUnits ev2
+      Ev.closeEvents ev2
+      removeFile (dir </> "access.json")
+      ev3 <- Ev.openEvents cfg dir
+      checkEq "access.json lost: every unit is just used" (M.fromList [(nov, Ev.Stamp (dec05 + days 11) (dec05 + days 11)), (dec, Ev.Stamp (dec05 + days 11) (dec05 + days 11))]) =<< Ev.stampsOf ev3
+      checkEq "...so nothing is cold" [] =<< Ev.coldUnits ev3
+      Ev.closeEvents ev3
+      B.writeFile (dir </> "access.json") "{ not json"
+      ev4 <- Ev.openEvents cfg dir
+      checkEq "access.json unreadable: the same" [] =<< Ev.coldUnits ev4
+      writeIORef clk (dec05 + days 40)
+      checkEq "and it goes cold with time as before" [dec] =<< Ev.coldUnits ev4
+      Ev.closeEvents ev4
+      -- without ecColdAfterMs: nothing is kept, nothing is cold, nothing is written
+      withTmp $ \dir2 -> do
+        (_, clock2) <- newClock nov11
+        let cfg2 = Ev.defaultEventsConfig { Ev.ecClock = clock2 }
+        evN <- Ev.openEvents cfg2 dir2
+        rN <- Ev.withEventsLock evN (Ev.record evN [Create (Tmp 1) "x" (Lit (VInt 1))] >>= \rc -> Ev.commit evN rc >> pure rc)
+        _ <- Ev.seal evN
+        _ <- Ev.history evN (Ev.rcTemps rN M.! 1)
+        checkEq "no stamps; no unit is cold; freezeCold does nothing" (M.empty, [], 0 :: Int) =<< ((,,) <$> Ev.stampsOf evN <*> Ev.coldUnits evN <*> (length <$> Ev.freezeCold evN 10))
+        Ev.closeEvents evN
+        checkEq "no access.json on the disk" False =<< doesFileExist (dir2 </> "access.json"))
+
+  , ("freeze: the hot chunks of one unit become one cold chunk with no MPHF; the other units stay; history and eventsAfter answer the same; a late write makes a hot chunk, the next freeze a second cold one", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock, Ev.ecColdBlockEvents = 4 }
+      ev <- Ev.openEvents cfg dir
+      let put ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure rc)
+          idOf rc n = Ev.rcTemps rc M.! n
+          unit = (KCreate, (2026, 11))
+          isCold c = ceTier c == "cold"
+      -- November, sealed twice (two hot Create chunks, and one Delete chunk), and December once
+      r1 <- put [ Create (Tmp n) "x" (Lit (VInt (fromIntegral n))) | n <- [1 .. 6] ]
+      let ids1 = [ idOf r1 n | n <- [1 .. 6] ]
+      _ <- Ev.seal ev
+      modifyIORef' clk (+ 1000)
+      r2 <- put ([ Create (Id i) "y" (Lit (VStr "more")) | i <- take 3 ids1 ] ++ [ Create (Tmp 1) "x" (Lit (VInt 7)), Delete (Id (head ids1)) "x" (Lit (VInt 1)) ])
+      let n7 = idOf r2 1
+      _ <- Ev.seal ev
+      writeIORef clk dec05
+      r3 <- put [ Create (Tmp n) "x" (Lit (VInt 100)) | n <- [1 .. 3] ]
+      _ <- Ev.seal ev
+      let everyone = ids1 ++ [n7] ++ [ idOf r3 n | n <- [1 .. 3] ]
+      mf0 <- readManifest dir
+      let hots = [ ceName c | c <- mfChunks mf0, ceKind c == KCreate, ceMonth c == (2026, 11) ]
+      checkEq "before: two hot Create chunks in November, four chunks in all" (2, 4) (length hots, length (mfChunks mf0))
+      hist0  <- mapM (Ev.history ev) everyone
+      after0 <- Ev.withEventsLock ev (Ev.eventsAfter ev 0)
+      fz <- Ev.freezeUnit ev unit
+      checkEq "the two were put together, into one" (hots, 1, False) (Ev.fzMerged fz, length (Ev.fzInto fz), Ev.fzSkipped fz)
+      mf1 <- readManifest dir
+      let [c0] = filter isCold (mfChunks mf1)
+      checkEq "one cold chunk; the Delete chunk and December's are still hot; three chunks in all" (2, 3) (length (filter (not . isCold) (mfChunks mf1)), length (mfChunks mf1))
+      checkEq "the cold chunk holds all of November's Creates (10 events, 7 ids), and only chunk.hosi and filter.bin" (10, 7, [chunkDataFile, chunkFilterFile]) (ceEvents c0, ceIds c0, sort (map feName (ceFiles c0)))
+      checkEq "chunks/ holds what the manifest lists, and no scratch" (sort (map ceName (mfChunks mf1))) . sort =<< listDirectory (dir </> "chunks")
+      check "the generation moved" (mfGeneration mf1 > mfGeneration mf0)
+      checkEq "history is the same for everyone" hist0 =<< mapM (Ev.history ev) everyone
+      checkEq "and so is eventsAfter" after0 =<< Ev.withEventsLock ev (Ev.eventsAfter ev 0)
+      (_, tr) <- Ev.historyTrace ev (head ids1)
+      checkEq "history asks the cold chunk and finds it there" True (ceName c0 `elem` [ n | (n, Star _) <- Ev.ltProbed tr ])
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      -- again: no hot chunk is left in the unit
+      m1 <- B.readFile (dir </> manifestFile)
+      fz2 <- Ev.freezeUnit ev unit
+      checkEq "again: nothing to do" ([] :: [String], 0 :: Int, False) (Ev.fzMerged fz2, length (Ev.fzInto fz2), Ev.fzSkipped fz2)
+      checkEq "and the manifest is the same bytes" m1 =<< B.readFile (dir </> manifestFile)
+      -- a late write to a November entity: a new hot chunk in the frozen month; the next freeze puts it in a second cold chunk
+      writeIORef clk (day 345)
+      _ <- put [Create (Id (ids1 !! 1)) "z" (Lit (VInt 5))]
+      _ <- Ev.seal ev
+      mf2 <- readManifest dir
+      checkEq "a hot chunk again in the frozen month" 1 (length [ () | c <- mfChunks mf2, ceKind c == KCreate, ceMonth c == (2026, 11), not (isCold c) ])
+      fz3 <- Ev.freezeUnit ev unit
+      mf3 <- readManifest dir
+      checkEq "a second cold chunk; the first one is the same entry" (2, True) (length (filter isCold (mfChunks mf3)), c0 `elem` mfChunks mf3)
+      checkEq "the entity has its new event too, from the other cold chunk" (length (hist0 !! 1) + 1) . length =<< Ev.history ev (ids1 !! 1)
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents cfg dir
+      checkEq "after reopen: the same answers" (hist0 !! 0 : [], True) . (\hs -> (take 1 hs, length (hs !! 1) == length (hist0 !! 1) + 1)) =<< mapM (Ev.history ev2) everyone
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+      Ev.closeEvents ev2)
+
+  , ("freeze: it reads through the erase records: what was erased is in no file afterwards and the records go; a unit with nothing left makes no cold chunk", withTmp $ \dir -> do
+      (ev, [a, b, c]) <- markedWorld dir 3
+      let m i = BC.pack (marker i)
+      _ <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [c]))
+      checkEq "erased, still hot: the bytes of c are in the chunk" 1 =<< markerCount (m 3) dir
+      fz <- Ev.freezeUnit ev (KCreate, (2026, 11))
+      checkEq "one hot chunk put into one cold chunk" (1, 1) (length (Ev.fzMerged fz), length (Ev.fzInto fz))
+      checkEq "the marker of c is in no file; the other two are" [1, 1, 0] =<< mapM (\i -> markerCount (m i) dir) [1, 2, 3]
+      checkEq "erase/ holds nothing" [] =<< listDirectory (dir </> "erase")
+      mf <- readManifest dir
+      let [cold] = mfChunks mf
+      checkEq "cold, no record, a and b only" ("cold", Nothing, 2) (ceTier cold, ceErase cold, ceEvents cold)
+      checkEq "a and b are found, c is not" [1, 1, 0] =<< mapM (fmap length . Ev.history ev) [a, b, c]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev
+      -- two entities a second apart: erasing both leaves a gap in the zone map, so it is a record and not a drop; and nothing is left of the chunk
+      withTmp $ \dir2 -> do
+        (clk, clock) <- newClock nov11
+        ev2 <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } dir2
+        let put ops = Ev.withEventsLock ev2 (Ev.record ev2 ops >>= \rc -> Ev.commit ev2 rc >> pure rc)
+        rx <- put [Create (Tmp 1) "x" (Lit (VInt 1))]
+        modifyIORef' clk (+ 1000)
+        ry <- put [Create (Tmp 1) "x" (Lit (VInt 2))]
+        _ <- Ev.seal ev2
+        let [x] = M.elems (Ev.rcTemps rx); [y] = M.elems (Ev.rcTemps ry)
+        done <- Ev.withEventsLock ev2 (Ev.eraseNow ev2 (Erase.fromIds [x, y]))
+        checkEq "a record, not a drop" (1, 0) (length (Ev.edRecorded done), length (Ev.edDropped done))
+        mf0 <- readManifest dir2
+        fz2 <- Ev.freezeUnit ev2 (KCreate, (2026, 11))
+        checkEq "the hot chunk is merged, and no cold chunk takes its place" (1, 0) (length (Ev.fzMerged fz2), length (Ev.fzInto fz2))
+        mf1 <- readManifest dir2
+        checkEq "the world has no chunk; the name counter did not move for a chunk that was not made" (0, mfNextChunk mf0) (length (mfChunks mf1), mfNextChunk mf1)
+        checkEq "nothing in chunks/ or erase/" ([], []) =<< ((,) <$> listDirectory (dir2 </> "chunks") <*> listDirectory (dir2 </> "erase"))
+        checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+        Ev.closeEvents ev2)
+
+  , ("freeze: where it can stop; a scratch directory nobody lists, or the swap done with the hot chunk not yet removed: open sweeps them, and the world is the one the manifest names", withTmp $ \dir -> do
+      (ev, ids) <- markedWorld dir 3
+      mf0 <- readManifest dir
+      let [hot] = mfChunks mf0
+      copyFlat (dir </> "chunks" </> ceName hot) (dir </> "aside-chunk")
+      Ev.closeEvents ev
+      -- 1. died while the cold chunk was being written: a scratch directory, and a named one, that nobody lists
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> ".freeze-create-2026-11")
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> "c000099-create-2026-11")
+      ev1 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "open swept both: the hot chunk is all that is in chunks/" [ceName hot] =<< listDirectory (dir </> "chunks")
+      checkEq "the world is the old one" [1, 1, 1] =<< mapM (fmap length . Ev.history ev1) ids
+      -- 2. the swap done, the hot chunk not yet removed
+      _ <- Ev.freezeUnit ev1 (KCreate, (2026, 11))
+      mf1 <- readManifest dir
+      Ev.closeEvents ev1
+      copyFlat (dir </> "aside-chunk") (dir </> "chunks" </> ceName hot)
+      ev2 <- Ev.openEvents Ev.defaultEventsConfig dir
+      checkEq "open swept the hot chunk: the cold one is all that is in chunks/" (map ceName (mfChunks mf1)) =<< listDirectory (dir </> "chunks")
+      checkEq "the world is the cold one" ([1, 1, 1], ["cold"]) =<< ((,) <$> mapM (fmap length . Ev.history ev2) ids <*> pure (map ceTier (mfChunks mf1)))
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+      Ev.closeEvents ev2)
+
+  , ("freeze: an erase and a rewrite of a cold chunk leave it cold: no MPHF comes back, and the marker is gone", withTmp $ \dir -> do
+      (ev, [a, b, c]) <- markedWorld dir 3
+      let m i = BC.pack (marker i)
+      _ <- Ev.freezeUnit ev (KCreate, (2026, 11))
+      _ <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [c]))
+      mfE <- readManifest dir
+      check "the cold chunk has a record now" (all (\x -> ceErase x /= Nothing) (mfChunks mfE))
+      done <- Ev.rewriteErased ev 10
+      checkEq "rewritten" 1 (length (Ev.rwRewritten done))
+      mf <- readManifest dir
+      let [new] = mfChunks mf
+      checkEq "the new chunk is cold, with chunk.hosi and filter.bin only" ("cold", [chunkDataFile, chunkFilterFile]) (ceTier new, sort (map feName (ceFiles new)))
+      checkEq "and no mphf.idx on the disk" False =<< doesFileExist (dir </> "chunks" </> ceName new </> chunkMphfFile)
+      checkEq "the marker of c is in no file; the other two are" [1, 1, 0] =<< mapM (\i -> markerCount (m i) dir) [1, 2, 3]
+      checkEq "a and b are found, c is not" [1, 1, 0] =<< mapM (fmap length . Ev.history ev) [a, b, c]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev)
+
+  , ("rewrite: a history that runs while the chunk is being replaced always finds its events", withTmp $ \dir -> do
+      (ev, xs) <- markedWorld dir 40
+      let x = head xs
+          rounds = drop 1 xs
+      running <- newIORef True
+      problems <- newIORef ([] :: [String])
+      looked <- newIORef (0 :: Int)
+      finished <- newEmptyMVar
+      _ <- forkIO $ do
+        let loop = do
+              go <- readIORef running
+              when go $ do
+                r <- try (length <$> Ev.history ev x)
+                case r of
+                  Right 1 -> pure ()
+                  Right n -> modifyIORef' problems (("found " ++ show n ++ " events") :)
+                  Left (e :: SomeException) -> modifyIORef' problems (show e :)
+                modifyIORef' looked (+ 1)
+                loop
+        loop
+        putMVar finished ()
+      forM_ rounds $ \y -> do
+        _ <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [y]))
+        void (Ev.rewriteErased ev 10)
+      writeIORef running False
+      takeMVar finished
+      checkEq "no history failed or came back wrong" [] =<< readIORef problems
+      check "it did look, many times" . (> 20) =<< readIORef looked
+      checkEq "what is left is x" [1] =<< mapM (fmap length . Ev.history ev) [x]
+      checkEq "verify clean" (True, []) =<< Ev.withEventsLock ev (Ev.verifyEvents ev)
+      Ev.closeEvents ev
+      -- the same, but made to happen: the chunk is replaced after history has taken its view and before it opens anything.
+      -- (The loop above only sometimes lands there; this lands there every time.)  Warm the caches first, so the
+      -- reader and the filter of the old chunk are the ones the view points at.
+      withTmp $ \dir2 -> do
+        (ev2, [a, _, c]) <- markedWorld dir2 3
+        _ <- Ev.history ev2 a
+        _ <- Ev.withEventsLock ev2 (Ev.eraseNow ev2 (Erase.fromIds [c]))
+        (es, _) <- Ev.historyTraceAfter (void (Ev.rewriteErased ev2 10)) ev2 a
+        checkEq "a is found, in the chunk that took the old one's place" 1 (length es)
+        checkEq "the old chunk is gone from the disk" 1 . length =<< listDirectory (dir2 </> "chunks")
+        Ev.closeEvents ev2)
 
   , ("probe (星かな？): a stranger is turned away by the fingerprint without reading anything", do
       reads_ <- newIORef (0 :: Int)
@@ -319,6 +1151,33 @@ pureTests =
             pure (and same && back == concat (M.elems want))
           pure (and rs)
         assert ok)
+  , ("cold chunk: the same events as a hot one, answered by the deep path; no mphf.idx, so the files are fewer and smaller; the manifest lists what is there (QuickCheck)", prop 60 $
+      forAll genEvents $ \evs -> monadicIO $ do
+        ok <- run $ withTmp $ \dir -> do
+          let hot = dir </> "hot"; cold = dir </> "cold"
+              sizeOf d = fmap sum . mapM (getFileSize . (d </>)) =<< listDirectory d
+          _ <- writeChunk hot 7 KCreate (2026, 11) evs
+          info <- writeColdChunk cold 64 KCreate (2026, 11) evs
+          hotInfo <- crInfo <$> openChunkReader hot
+          files <- listDirectory cold
+          listed <- map (\(n, _, _) -> n) <$> hashChunkFiles cold
+          hr <- openChunkReader hot
+          cr <- openChunkReader cold
+          hotEvs <- readChunkEvents hr
+          coldEvs <- readChunkEvents cr
+          let want = M.fromListWith (flip (++)) [ (evId e, [e]) | e <- sortOn (\e -> (evId e, evAttr e, evSeq e)) evs ]
+          found <- forM [90 .. 130] $ \i -> do
+            o <- lookupInChunk cr i
+            pure (case (M.lookup i want, o) of
+                    (Just es, Star x) -> x == es
+                    (Nothing, x)      -> not (isStar x)
+                    _                 -> False)
+          filt <- readChunkFilter cold (ciIds info)
+          hs <- sizeOf hot
+          cs <- sizeOf cold
+          pure ( info == hotInfo, coldEvs == hotEvs, and found, sort files == sort [chunkDataFile, chunkFilterFile]
+               , sort listed == sort files, not (null filt) && all (filterMayHave filt) (M.keys want), cs < hs )
+        assert (ok == (True, True, True, True, True, True, True)))
   , ("deep path: opening reads four ranges; a lookup reads one block, or nothing when the footer already says no", withTmp $ \dir -> do
       let ids = [ makeId 5 (2 * s) | s <- [0 .. 1999] ]                           -- even seq numbers only
           inside   = [ makeId 5 (2 * s + 1) | s <- [0 .. 1998] ]                  -- odd ones: inside the ranges, not in the chunk
@@ -1012,6 +1871,282 @@ hosiTests be =
       checkEq "datoms" 20000 . stKhanaDatoms =<< stats h2
       checkEq "verify clean" [] =<< verify h2
       closeHosi h2)
+
+  , ("erase: a post is gone from the events and from now; a pointer to it from another entity stays as a number; a write to it is refused; verify agrees before and after reopening", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 75
+      r <- write h [ Create (Tmp 1) "person/name" (Lit (VStr "Boole")), Create (Tmp 1) "person/friend" (RefTo (Id b)) ]
+      let c = wrTemps r M.! 1
+      rep <- erase h [EraseIds [b]]
+      checkEq "one record, nothing dropped, generation 1" (1, 0, 1) (length (erRecorded rep), length (erDropped rep), erGeneration rep)
+      checkEq "b's two facts (name and age) were taken out of now" 2 (erRetracted rep)
+      checkEq "b is not in now" M.empty =<< getEntity h b
+      checkEq "b has no history" [] =<< history h b
+      checkEq "a is untouched" (Just [VInt 70]) =<< ageOf h a
+      checkEq "c still points at the number b was" (Just [VInt (fromIntegral b)]) . M.lookup "person/friend" =<< getEntity h c
+      checkEq "verify clean" [] =<< verify h
+      _ <- write h [name "Peirce"]                         -- the unique name is free again, as if nobody had had it
+      refused <- try (write h [Create (Id b) "person/age" (Lit (VInt 1))]) :: IO (Either HosiError WriteReport)
+      check "a write to b is refused" (case refused of Left (BadArgument _) -> True; _ -> False)
+      h2 <- reopen (cfgWith clock) dir h
+      checkEq "after reopen: b is still not in now" M.empty =<< getEntity h2 b
+      checkEq "and still has no history" [] =<< history h2 b
+      checkEq "verify clean" [] =<< verify h2
+      again <- erase h2 [EraseIds [b]]
+      checkEq "erasing it again changes nothing" (1, [], [], 0) (erGeneration again, erDropped again, erRecorded again, erRetracted again)
+      closeHosi h2)
+
+  , ("erase: a span of time takes a month whole: its chunks go with no record; the other months stay; ids up to 1 cannot be named", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- seal h
+      writeIORef clk dec05
+      b <- person h "Peirce" 75
+      _ <- seal h
+      bad <- try (erase h [EraseIds [1]]) :: IO (Either HosiError EraseReport)
+      check "the reserved entity cannot be named" (case bad of Left (BadArgument _) -> True; _ -> False)
+      rep <- erase h [EraseBetween (UTCTime (fromGregorian 2026 11 1) 0) (UTCTime (fromGregorian 2026 12 1) 0)]
+      checkEq "November's chunk dropped whole, nothing recorded" (1, 0, 1) (length (erDropped rep), length (erRecorded rep), erGeneration rep)
+      checkEq "its two facts left now" 2 (erRetracted rep)
+      checkEq "one chunk left" 1 . stChunks =<< stats h
+      checkEq "a is gone from now" M.empty =<< getEntity h a
+      checkEq "and from history" [] =<< history h a
+      checkEq "b (December) is there" (Just [VInt 75]) =<< ageOf h b
+      checkEq "b has both its events" 2 . length =<< history h b
+      checkEq "verify clean" [] =<< verify h
+      h2 <- reopen (cfgWith clock) dir h
+      checkEq "after reopen: a is gone, b is there" (M.empty, Just [VInt 75]) =<< ((,) <$> getEntity h2 a <*> ageOf h2 b)
+      checkEq "verify clean" [] =<< verify h2
+      -- everything, from id 0: the bookkeeping entity (id 1) is not an entity to erase, and is still there
+      before <- stats h2
+      _ <- erase h2 [EraseRange 0 maxBound]
+      checkEq "b is gone too" M.empty =<< getEntity h2 b
+      checkEq "the khana still knows how far it has folded" (stFoldedSeq before) . stFoldedSeq =<< stats h2
+      checkEq "verify clean" [] =<< verify h2
+      h3 <- reopen (cfgWith clock) dir h2
+      checkEq "and so does the reopened one" (stFoldedSeq before) . stFoldedSeq =<< stats h3
+      closeHosi h3)
+
+  , ("erase: a crash after the manifest swap, before the khana followed: open makes the khana again from the events, which leave the erased ids out", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 75
+      closeHosi h
+      -- the events erase b (as erase does first); the khana is not told
+      ev <- Ev.openEvents Ev.defaultEventsConfig { Ev.ecClock = clock } (dir </> "events")
+      done <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [b]))
+      checkEq "the events are at generation 1" 1 (Ev.edGeneration done)
+      Ev.closeEvents ev
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      checkEq "b is not in now (the khana was made again)" M.empty =<< getEntity h2 b
+      checkEq "a is" (Just [VInt 70]) =<< ageOf h2 a
+      checkEq "verify clean" [] =<< verify h2
+      -- and it is a khana that knows its generation: the next open does not make it again
+      -- (a file put in its directory now would be swept away with the directory if it were made again)
+      let marker = dir </> kd </> "this-khana-was-not-made-again"
+      writeFile marker ""
+      h3 <- reopen (cfgWith clock) dir h2
+      check "the khana was kept, not made again" =<< doesFileExist marker
+      checkEq "b is still not in now" M.empty =<< getEntity h3 b
+      checkEq "verify clean" [] =<< verify h3
+      closeHosi h3)
+
+  , ("clean: after an erase and a clean, the erased values are in no file under the database directory (chunks, tail, khana); the others are; verify is clean", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      let count i = markerCount (BC.pack (marker i)) dir
+      [a, b, c] <- forM [1, 2, 3] $ \i -> person h (T.pack (marker i)) (fromIntegral i)
+      _ <- seal h
+      check "before the erase every marker is on the disk" . all (> 0) =<< mapM count [1, 2, 3]
+      _ <- erase h [EraseIds [b]]
+      checkEq "b is gone from now and from history" (M.empty, []) =<< ((,) <$> getEntity h b <*> history h b)
+      check "but its bytes are still in the files (the chunk keeps them until it is written again)" . (> 0) =<< markerCount (BC.pack (marker 2)) (dir </> "events")
+      rep <- clean h defaultCleanOptions
+      checkEq "one chunk written again, none left with a record, the khana made again" (1, 0, True) (length (crRewritten rep), crRecordsLeft rep, crKhanaCleaned rep)
+      checkEq "...by the compacted copy, not by folding the events again" False (crKhanaRebuilt rep)
+      checkEq "b's marker is in no file" 0 =<< count 2
+      check "a's and c's are" . all (> 0) =<< mapM count [1, 3]
+      checkEq "a and c are as they were, b is not there" [Just [VInt 1], Just [VInt 3], Nothing] =<< mapM (ageOf h) [a, c, b]
+      checkEq "verify clean" [] =<< verify h
+      rep2 <- clean h defaultCleanOptions
+      checkEq "again: nothing to write, the khana is already clean" ([] :: [String], 0, False) (map fst (crRewritten rep2), crRecordsLeft rep2, crKhanaCleaned rep2)
+      h2 <- reopen (cfgWith clock) dir h
+      checkEq "after reopen: still in no file; still clean" (0, []) =<< ((,) <$> count 2 <*> verify h2)
+      rep3 <- clean h2 defaultCleanOptions
+      checkEq "and a clean after the reopen knows the khana is clean" False (crKhanaCleaned rep3)
+      closeHosi h2)
+
+  , ("clean: a month erased whole needs no rewrite, but the khana is made new all the same", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      let count i = markerCount (BC.pack (marker i)) dir
+      _ <- person h (T.pack (marker 1)) 1
+      _ <- seal h
+      writeIORef clk dec05
+      b <- person h (T.pack (marker 2)) 2
+      _ <- seal h
+      rep <- erase h [EraseBetween (UTCTime (fromGregorian 2026 11 1) 0) (UTCTime (fromGregorian 2026 12 1) 0)]
+      checkEq "November's chunk dropped whole: no record" (1, 0) (length (erDropped rep), length (erRecorded rep))
+      cr <- clean h defaultCleanOptions
+      checkEq "nothing to write again, but the khana is made new" ([] :: [String], 0, True) (map fst (crRewritten cr), crRecordsLeft cr, crKhanaCleaned cr)
+      checkEq "...by the compacted copy" False (crKhanaRebuilt cr)
+      checkEq "November's marker is in no file" 0 =<< count 1
+      check "December's is" . (> 0) =<< count 2
+      checkEq "December's person is there" (Just [VInt 2]) =<< ageOf h b
+      checkEq "verify clean" [] =<< verify h
+      closeHosi h)
+
+  , ("clean: a few chunks at a time; the khana waits for the last one", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      let count i = markerCount (BC.pack (marker i)) dir
+      _  <- person h (T.pack (marker 1)) 1
+      p2 <- person h (T.pack (marker 2)) 2
+      _ <- seal h
+      writeIORef clk dec05
+      _  <- person h (T.pack (marker 3)) 3
+      q2 <- person h (T.pack (marker 4)) 4
+      _ <- seal h
+      _ <- erase h [EraseIds [p2, q2]]
+      c1 <- clean h defaultCleanOptions { coMaxChunks = 1 }
+      checkEq "first call: one chunk, one still waiting, the khana not yet" (1, 1, False) (length (crRewritten c1), crRecordsLeft c1, crKhanaCleaned c1)
+      c2 <- clean h defaultCleanOptions { coMaxChunks = 1 }
+      checkEq "second call: the other chunk, none waiting, the khana now" (1, 0, True) (length (crRewritten c2), crRecordsLeft c2, crKhanaCleaned c2)
+      checkEq "...by the compacted copy" False (crKhanaRebuilt c2)
+      checkEq "the erased markers are in no file, the others are" ([0, 0], True) =<< ((,) <$> mapM count [2, 4] <*> (all (> 0) <$> mapM count [1, 3]))
+      checkEq "verify clean" [] =<< verify h
+      closeHosi h)
+
+  , ("erase by owner: what an account owns goes, in any month and what it had deleted too; the account, b's things and a reply to a thing stay (the reply as a number); after a clean it is on no disk", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      let count i = markerCount (BC.pack (marker i)) dir
+          owns = ["person/friend"]
+      a <- person h "Account A" 0
+      b <- person h "Account B" 0
+      p1 <- ownedThing h a 1
+      p2 <- ownedThing h b 2
+      p3 <- ownedThing h a 3
+      _ <- write h [Delete (Id p3) "person/friend" (RefTo (Id a))]          -- a gave up the pointer; only the Create still says p3 was a's
+      rp <- write h [ Create (Tmp 1) "person/name" (Lit (VStr "Reply")), Create (Tmp 1) "person/friend" (RefTo (Id p1)) ]
+      let reply = wrTemps rp M.! 1
+      _ <- seal h
+      writeIORef clk dec05
+      p4 <- ownedThing h a 4                                                  -- December, and still in the tail
+      rep <- erase h [EraseOwnedBy owns [a] Nothing]
+      checkEq "p1, p3 (deleted pointer) and p4 (from the tail); not b's, not the reply, not a" (sort [p1, p3, p4]) (erOwned rep)
+      checkEq "generation 1; p1 and p4 had three facts, p3 two" (1, 8) (erGeneration rep, erRetracted rep)
+      forM_ [p1, p3, p4] $ \i -> do
+        checkEq "gone from now" M.empty =<< getEntity h i
+        checkEq "and from history" [] =<< history h i
+      checkEq "b's thing stays" (Just [VInt 2]) =<< ageOf h p2
+      checkEq "the account stays: the caller adds EraseIds when the account goes too" (Just [VStr "Account A"]) . M.lookup "person/name" =<< getEntity h a
+      checkEq "the reply stays, and points at the number p1 was" (Just [VInt (fromIntegral p1)]) . M.lookup "person/friend" =<< getEntity h reply
+      checkEq "verify clean" [] =<< verify h
+      h2 <- reopen (cfgWith clock) dir h
+      checkEq "after reopen: still gone, still there" ([M.empty, M.empty, M.empty], Just [VInt 2]) =<< ((,) <$> mapM (getEntity h2) [p1, p3, p4] <*> ageOf h2 p2)
+      again <- erase h2 [EraseOwnedBy owns [a] Nothing]
+      -- p4 was alone in its chunk, which went whole; p1 and p3 are in a chunk with a record, so their Creates are still there to be found
+      checkEq "before a clean: asked again, the Creates that are left are found, and nothing new is erased" ([p1, p3], 1, 0) (erOwned again, erGeneration again, erRetracted again)
+      _ <- clean h2 defaultCleanOptions
+      checkEq "the erased markers are in no file, b's is" ([0, 0, 0], True) =<< ((,) <$> mapM count [1, 3, 4] <*> ((> 0) <$> count 2))
+      none <- erase h2 [EraseOwnedBy owns [a] Nothing]
+      checkEq "after a clean there is nothing of them to find" ([], 1, 0) (erOwned none, erGeneration none, erRetracted none)
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("erase by owner: a window is on the creation time; a second call can take what the first found owns, with the account; nothing to match writes nothing; a window that ends before it starts is refused", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      let owns  = ["person/friend"]
+          novem = (UTCTime (fromGregorian 2026 11 1) 0, UTCTime (fromGregorian 2026 12 1) 0)
+          long  = (UTCTime (fromGregorian 2000 1 1) 0, UTCTime (fromGregorian 2001 1 1) 0)
+      a  <- person h "Account A" 0
+      n1 <- ownedThing h a 1
+      _ <- seal h
+      writeIORef clk dec05
+      d1 <- ownedThing h a 2
+      _ <- seal h
+      forM_ [ ("no attributes", EraseOwnedBy [] [a] Nothing), ("no owners", EraseOwnedBy owns [] Nothing)
+            , ("an owner nobody names", EraseOwnedBy owns [999999] Nothing), ("a window before the first id", EraseOwnedBy owns [a] (Just long)) ] $ \(what, e) -> do
+        rep <- erase h [e]
+        checkEq (what ++ ": nothing found, nothing erased") ([], 0, 0) (erOwned rep, erGeneration rep, erRetracted rep)
+      refused <- try (erase h [EraseOwnedBy owns [a] (Just (snd novem, fst novem))]) :: IO (Either HosiError EraseReport)
+      check "a window that ends before it starts is refused" (case refused of Left (BadArgument _) -> True; _ -> False)
+      checkEq "none of that erased anything" (Just [VInt 1], Just [VInt 2]) =<< ((,) <$> ageOf h n1 <*> ageOf h d1)
+      -- November only: n1 goes, d1 stays
+      r1 <- erase h [EraseOwnedBy owns [a] (Just novem)]
+      checkEq "the window of November: n1 only" ([n1], 1) (erOwned r1, erGeneration r1)
+      checkEq "n1 is gone, d1 is there" (M.empty, Just [VInt 2]) =<< ((,) <$> getEntity h n1 <*> ageOf h d1)
+      -- a thing owned by d1 (a media of a post), in the tail; then the account with its things, and in a second call what those own
+      m1 <- ownedThing h d1 3
+      r2 <- erase h [EraseOwnedBy owns [a] Nothing]
+      checkEq "the first call: a's things, n1 found again (its Create is still in a chunk with a record), d1 new" ([n1, d1], 2) (erOwned r2, erGeneration r2)
+      r3 <- erase h [EraseOwnedBy owns (erOwned r2) Nothing, EraseIds [a]]
+      checkEq "the second call: what d1 (and n1) own, and the account" ([m1], 3) (erOwned r3, erGeneration r3)
+      checkEq "all four are gone from now" [M.empty, M.empty, M.empty, M.empty] =<< mapM (getEntity h) [a, n1, d1, m1]
+      checkEq "verify clean" [] =<< verify h
+      h2 <- reopen (cfgWith clock) dir h
+      checkEq "after reopen: still gone" [M.empty, M.empty, M.empty, M.empty] =<< mapM (getEntity h2) [a, n1, d1, m1]
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("freeze: a month nobody has touched goes cold; history, now and verify stay as they were; a month that is read stays hot; a late write makes a hot chunk that freezes into a second cold one; without hcColdAfterMs nothing happens", withTmp $ \dir -> do
+      (clk, clock) <- newClock nov11
+      let days n = n * 86400000
+          cfg = (cfgWith clock) { hcColdAfterMs = Just (days 10), hcColdBlockEvents = 4 }
+          tiers = (\mf -> sort (map ceTier (mfChunks mf))) <$> readManifest (dir </> "events")
+          nov = (KCreate, (2026, 11))
+          dec = (KCreate, (2026, 12))
+      h <- openHosiWith cfg dir schema
+      a <- person h "Frege" 1
+      _ <- seal h
+      ha0 <- history h a
+      writeIORef clk dec05
+      b <- person h "Peirce" 2
+      _ <- seal h
+      hb0 <- history h b
+      writeIORef clk (dec05 + days 3)
+      r1 <- freeze h defaultFreezeOptions
+      checkEq "November (quiet for 27 days) went cold, December (3 days) did not" ([nov], []) (map fst (frFrozen r1), frSkipped r1)
+      checkEq "one hot chunk and one cold" ["cold", "hot"] =<< tiers
+      checkEq "history is what it was" ([ha0, hb0], [Just [VInt 1], Just [VInt 2]]) =<< ((,) <$> mapM (history h) [a, b] <*> mapM (ageOf h) [a, b])
+      checkEq "verify clean" [] =<< verify h
+      r2 <- freeze h defaultFreezeOptions
+      checkEq "again: nothing (November is cold already, December not old enough)" ([] :: [(Kind, Month)], [] :: [(Kind, Month)]) (map fst (frFrozen r2), frSkipped r2)
+      -- a late write to the November entity: a hot chunk in November again
+      writeIORef clk (dec05 + days 5)
+      _ <- write h [Create (Id a) "person/tag" (Lit (VStr "late"))]
+      _ <- seal h
+      checkEq "a hot chunk in November again: two hot, one cold" ["cold", "hot", "hot"] =<< tiers
+      writeIORef clk (dec05 + days 30)
+      r3 <- freeze h defaultFreezeOptions { foMaxUnits = 1 }
+      checkEq "one unit at a time, the oldest first: November" [nov] (map fst (frFrozen r3))
+      r4 <- freeze h defaultFreezeOptions
+      checkEq "then December" [dec] (map fst (frFrozen r4))
+      checkEq "three cold chunks (November's two, December's one) and no hot" ["cold", "cold", "cold"] =<< tiers
+      checkEq "a's history has the late event too" (length ha0 + 1) . length =<< history h a
+      checkEq "...and now says so" (Just [VStr "late"]) . M.lookup "person/tag" =<< getEntity h a
+      checkEq "verify clean" [] =<< verify h
+      h2 <- reopen cfg dir h
+      checkEq "after reopen: the same answers" ([length ha0 + 1, length hb0], [Just [VInt 1], Just [VInt 2]]) =<< ((,) <$> (map length <$> mapM (history h2) [a, b]) <*> mapM (ageOf h2) [a, b])
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2
+      -- the default (hcColdAfterMs = Nothing): nothing is cold, nothing is written about use
+      withTmp $ \dir2 -> do
+        (clk3, clock3) <- newClock nov11
+        h3 <- openHosiWith (cfgWith clock3) dir2 schema
+        _ <- person h3 "Frege" 1
+        _ <- seal h3
+        writeIORef clk3 (nov11 + days 400)
+        r5 <- freeze h3 defaultFreezeOptions
+        checkEq "no unit is cold, however long it has been" ([] :: [(Kind, Month)], [] :: [(Kind, Month)]) (map fst (frFrozen r5), frSkipped r5)
+        checkEq "no access.json" False =<< doesFileExist (dir2 </> "events" </> "access.json")
+        closeHosi h3)
   ]
   where
     cfgWith c = (backendCfg be) { hcClock = c }
@@ -1148,6 +2283,35 @@ nativeTests exe =
       checkEq "open and catch up on five batches: start, read the seq, one transaction" 3 (m1 - m0)
       checkEq "verify" [] =<< verify h2
       closeHosi h2)
+
+  , ("clean: when the compacted copy cannot be made, or is not the khana, the khana is folded again from the events, and the report says so", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let empty = dir </> "empty-db"
+          -- a dtlv that, asked to copy, either says "Copy error" and exits with 0 (as the real one does), or copies an empty database
+          wrapper how = dir </> ("dtlv-" ++ how ++ ".sh")
+          script how = "#!/bin/sh\nif [ \"$4\" = copy ]; then\n" ++ (case how of
+            "refuses" -> "  echo 'Copy error: no room on this disk (a test)'; exit 0\n"
+            _         -> "  exec " ++ show exe ++ " -d " ++ show empty ++ " -c copy \"$5\"\n") ++ "fi\nexec " ++ show exe ++ " \"$@\"\n"
+          one how = do
+            let db = dir </> how
+                count i = markerCount (BC.pack (marker i)) db
+            writeFile (wrapper how) (script how)
+            callProcess "chmod" ["+x", wrapper how]
+            h <- openHosiWith ((backendCfg (KhanaDtlv (wrapper how))) { hcClock = clock }) db schema
+            [a, b] <- forM [1, 2] $ \i -> person h (T.pack (marker i)) (fromIntegral i)
+            _ <- seal h
+            _ <- erase h [EraseIds [b]]
+            rep <- clean h defaultCleanOptions
+            checkEq (how ++ ": cleaned, and by folding again") (True, True) (crKhanaCleaned rep, crKhanaRebuilt rep)
+            checkEq (how ++ ": the erased marker is in no file, the other is") (0, True) =<< ((,) <$> count 2 <*> ((> 0) <$> count 1))
+            checkEq (how ++ ": nothing is left lying about") False =<< doesDirectoryExist (db </> "khana-dtlv.new")
+            checkEq (how ++ ": a is there, b is not") [Just [VInt 1], Nothing] =<< mapM (ageOf h) [a, b]
+            checkEq (how ++ ": verify clean") [] =<< verify h
+            again <- clean h defaultCleanOptions
+            checkEq (how ++ ": it is clean now: the next clean has nothing to do") (False, False) (crKhanaCleaned again, crKhanaRebuilt again)
+            closeHosi h
+      one "refuses"
+      one "copies-nothing")
 
   , ("canary: (max ?x) / (min ?x) in :find do not work through `dtlv exec` 1.2.10 (if this fails, it was fixed upstream: update docs/guide.md)", withTmp $ \dir -> do
       (_, clock) <- newClock nov11

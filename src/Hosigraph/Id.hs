@@ -11,7 +11,7 @@
 module Hosigraph.Id
   ( Month, showMonth, parseMonth
   , Clock, systemClock
-  , epochMs, idMs, idSeqNo, idMonth, describeId, makeId
+  , epochMs, idMs, idSeqNo, idMonth, describeId, makeId, idRangeBetween
   , IdGen, newIdGen, nextId
   ) where
 
@@ -19,7 +19,7 @@ import           Data.Bits
 import           Data.IORef
 import           Data.Time.Calendar (toGregorian)
 import           Data.Time.Clock (UTCTime(..))
-import           Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
+import           Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import           Data.Time.Format (defaultTimeLocale, formatTime)
 
 import           Hosigraph.Event (HosiId)
@@ -51,6 +51,21 @@ seqBits = 21
 
 makeId :: Integer -> Integer -> HosiId
 makeId ms sq = fromIntegral ((ms `shiftL` seqBits) .|. sq)
+
+-- | The ids that entities created in @[from, to)@ have (UTC): from the first id of @from@'s millisecond
+-- up to the last one before @to@'s.  An id is a creation time, so a span of time is one range of ids.
+-- 'Nothing' when no id falls in it (an empty span, or one that ends before the first id the generator gives).
+idRangeBetween :: UTCTime -> UTCTime -> Maybe (HosiId, HosiId)
+idRangeBetween from to
+  | loMs >= limit || toMs <= loMs = Nothing
+  | otherwise                     = Just (makeId loMs 0, hi)
+  where
+    limit = 2 ^ (42 :: Int)                              -- 42 bits of milliseconds; more would not fit an Int64
+    msOf t = floor (utcTimeToPOSIXSeconds t * 1000) - epochMs
+    loMs = max 1 (msOf from)                             -- ms >= 1: the generator never gives 0 (see 'nextId')
+    toMs = msOf to
+    hi | toMs >= limit = maxBound
+       | otherwise     = makeId toMs 0 - 1
 
 -- | Milliseconds since 'epochMs' embedded in the id.
 idMs :: HosiId -> Integer
