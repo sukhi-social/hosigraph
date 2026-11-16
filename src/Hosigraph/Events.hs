@@ -40,7 +40,7 @@ module Hosigraph.Events
     -- * Finding them again
   , history, historyTrace, historyTraceAfter, LookupTrace(..), Probe(..)
     -- * For whoever folds the events into "now"
-  , lastSeq, eventsAfter, eventsAfterEach, tailBatches, resetTailTo
+  , lastSeq, eventsAfter, eventsAfterEach, BackStage(..), eventsBackEach, tailBatches, resetTailTo
     -- * Checking
   , verifyEvents, EventsStats(..), eventsStats
   ) where
@@ -56,6 +56,7 @@ import           Data.IORef
 import           Data.List (nub, partition, sortOn)
 import qualified Data.Map.Strict as M
 import           Data.Maybe (catMaybes, isJust)
+import           Data.Ord (Down(..))
 import qualified Data.Set as S
 import           Data.Word
 import           System.Directory
@@ -891,20 +892,61 @@ eventsAfterEach :: Events -> Word64 -> ([Event] -> IO ()) -> IO ()
 eventsAfterEach k after each = do
   mf <- readIORef (xManifest k)
   erased <- readIORef (xErased k)
-  let live = sortOn ceMinSeq [ c | c <- mfChunks mf, ceMaxSeq c > after ]
-      groups = map reverse (reverse (foldl step [] live))
-      step [] c = [[c]]
-      step (g : gs) c
-        | ceMinSeq c <= maximum (map ceMaxSeq g) = (c : g) : gs
-        | otherwise                              = [c] : g : gs
-  forM_ groups $ \g -> do
-    evs <- forM g $ \c -> do
-      cr <- readerFor k c
-      let goneHere = case M.lookup (ceName c) (erByChunk erased) of
-            Nothing -> const False
-            Just s  -> (`Erase.member` s)
-      filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr
-    each (sortOn evSeq (concat evs))
+  forM_ (seqGroups after (mfChunks mf)) $ \g -> readGroup k erased after g >>= each
+
+-- | The chunks that hold an event above @after@, in groups (see 'eventsAfterEach'), the oldest group first.
+seqGroups :: Word64 -> [ChunkEntry] -> [[ChunkEntry]]
+seqGroups after cs = map reverse (reverse (foldl step [] live))
+  where
+    live = sortOn ceMinSeq [ c | c <- cs, ceMaxSeq c > after ]
+    step [] c = [[c]]
+    step (g : gs) c
+      | ceMinSeq c <= maximum (map ceMaxSeq g) = (c : g) : gs
+      | otherwise                              = [c] : g : gs
+
+-- | The events of one group above @after@, sorted by seq, without the erased ones.
+readGroup :: Events -> Erased -> Word64 -> [ChunkEntry] -> IO [Event]
+readGroup k erased after g = do
+  evs <- forM g $ \c -> do
+    cr <- readerFor k c
+    let goneHere = case M.lookup (ceName c) (erByChunk erased) of
+          Nothing -> const False
+          Just s  -> (`Erase.member` s)
+    filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr
+  pure (sortOn evSeq (concat evs))
+
+-- | One step of 'eventsBackEach'.
+data BackStage = BackStage
+  { bsIndex  :: Int              -- ^ which step this is, from 0 (the tail)
+  , bsCount  :: Int              -- ^ how many steps there are in all
+  , bsEvents :: [Event]          -- ^ newest first (descending seq); older than every event of the steps before
+  , bsLeft   :: M.Map Month Int  -- ^ for each month the reading looks at: how many of its chunks are still unread
+                                 --   (0: all of it has been read, and so every entity created in that month is whole)
+  }
+
+-- | Read the events newest first, up to a month, one step at a time: the unsealed tail first (one step), then the
+-- sealed groups of 'eventsAfterEach' from the newest to the oldest.  Only the events of entities created in
+-- @since@ or after are read: a chunk is made for one creation month, so the chunks of earlier months are never
+-- opened.  The erased ids are left out, as in 'eventsAfterEach'.  The same rules for the lock: hold it for the
+-- whole reading (a chunk that goes away halfway would be a 'Corrupt').
+eventsBackEach :: Events -> Month -> (BackStage -> IO ()) -> IO ()
+eventsBackEach k since each = do
+  mf <- readIORef (xManifest k)
+  erased <- readIORef (xErased k)
+  batches <- tailBatches k
+  let inScope = [ c | c <- mfChunks mf, ceMonth c >= since ]
+      tailEvs = sortOn (Down . evSeq) [ e | b <- batches, e <- b, idMonth (evId e) >= since ]
+      left0   = M.unionWith (+) (M.fromListWith (+) [ (ceMonth c, 1) | c <- inScope ])
+                                (M.fromListWith (+) [ (idMonth (evId e), 0) | e <- tailEvs ])
+      groups  = reverse (seqGroups 0 inScope)
+      total   = 1 + length groups
+  each (BackStage 0 total tailEvs left0)
+  foldM_ (\left (n, g) -> do
+            evs <- readGroup k erased 0 g
+            let left' = foldl (\m c -> M.adjust (subtract 1) (ceMonth c) m) left g
+            each (BackStage n total (reverse evs) left')
+            pure left')
+         left0 (zip [1 ..] groups)
 
 -- | The unsealed batches, oldest first.  One batch = one 'record' = all or nothing.
 tailBatches :: Events -> IO [[Event]]

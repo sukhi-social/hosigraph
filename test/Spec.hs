@@ -31,6 +31,7 @@ import           Test.QuickCheck
 import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
 import           Hosigraph
+import           Hosigraph.Backfill
 import           Hosigraph.Bin
 import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
@@ -38,7 +39,7 @@ import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
-import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema)
+import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana)
 import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
@@ -127,7 +128,8 @@ withTmp act = do
 day :: Integer -> Integer
 day n = epochMs + n * 86400000
 
-nov11, dec05 :: Integer
+oct18, nov11, dec05 :: Integer
+oct18 = day 290
 nov11 = day 314
 dec05 = day 338
 
@@ -290,6 +292,43 @@ pad6 :: Int -> String
 pad6 n = let s = show n in replicate (6 - length s) '0' ++ s
 
 -- | Tests that need no khana at all.
+-- | Folding forward, as the khana does: a Create puts a value in (and, for cardinality one, takes the old one out);
+-- a Delete takes out that very value, if it is there.  In the backfill tests "t/many" is the one attribute of
+-- cardinality many; "t/one" and "t/loose" (which the schema does not know) are cardinality one.
+forwardFacts :: [Event] -> S.Set Fact
+forwardFacts = foldl' step S.empty
+  where
+    step s e = case evKind e of
+      KCreate | a == "t/many" -> S.insert f s
+              | otherwise     -> S.insert f (S.filter (\(i', a', _) -> (i', a') /= (i, a)) s)
+      KDelete                 -> S.delete f s
+      where f@(i, a, _) = (evId e, evAttr e, evVal e)
+
+backfillSchema :: Schema
+backfillSchema = M.fromList [("t/one", attr TLong), ("t/many", many (attr TLong))]
+
+-- | The events newest first, in steps; what each step gives to put in.
+backSteps :: [[Event]] -> [[Fact]]
+backSteps = go emptyBack
+  where go _ []         = []
+        go b (st : sts) = let (fs, b') = backStep backfillSchema b st in fs : go b' sts
+
+-- | Cut a list into pieces of the given sizes (the rest is one more piece).
+splitBy :: [Int] -> [a] -> [[a]]
+splitBy _ [] = []
+splitBy [] xs = [xs]
+splitBy (n : ns) xs = let (a, b) = splitAt (max 1 n) xs in a : splitBy ns b
+
+genBackEvents :: Gen [Event]
+genBackEvents = do
+  n <- choose (0, 40)
+  forM [1 .. n] $ \s -> do
+    k <- frequency [(3, pure KCreate), (2, pure KDelete)]
+    i <- elements [10, 11, 12]
+    a <- elements ["t/one", "t/many", "t/loose"]
+    v <- VInt <$> choose (0, 2)             -- three values only, so that the same fact comes round again and again
+    pure (Event (fromIntegral (s :: Int)) k i a v)
+
 pureTests :: [Test]
 pureTests =
   [ ("sha256: known vectors", do
@@ -299,6 +338,30 @@ pureTests =
         (sha256Hex "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
       checkEq "10000 patterned bytes" "c3d5cea5e36f10537bb7aeb14e6740a973a9dd5b55c22347d465693f1ded4ced" (sha256Hex (B.pack [ fromIntegral (i * 7 `mod` 251 :: Int) | i <- [0 .. 9999] ])))
   , ("crc32: standard check value", checkEq "crc32 123456789" 0xCBF43926 (crc32 "123456789"))
+
+  , ("backfill: reading newest first, in any steps, gives what folding oldest first gives, and no fact comes twice (QuickCheck)", prop 3000 $
+      forAll genBackEvents $ \evs -> forAll (listOf (choose (1, 6))) $ \sizes ->
+        let flat = concat (backSteps (splitBy sizes (reverse evs)))
+        in conjoin [ length flat === S.size (S.fromList flat)       -- a fact is put in once, and never taken out: what a step gives is final
+                   , S.fromList flat === forwardFacts evs ])
+
+  , ("backfill: an older event does not override a newer one; a Delete holds back the older Create; one that takes out nothing does nothing", do
+      let e s k a v = Event s k 10 a (VInt v)
+          one = "t/one"
+          many' = "t/many"
+      -- an update before its Create: the update is held, the Create adds nothing for that attribute
+      checkEq "update first" [[(10, one, VInt 2)], [(10, "t/loose", VInt 7)]]
+        (backSteps [[e 3 KCreate one 2], [e 2 KCreate one 1, e 1 KCreate "t/loose" 7]])
+      -- Delete first (the newest word): the Create that comes later is settled as taken out
+      checkEq "delete first" [[], []] (backSteps [[e 2 KDelete one 1], [e 1 KCreate one 1]])
+      -- a Delete of a value that is not there: the Create still counts
+      checkEq "delete of another value" [[], [(10, one, VInt 1)]] (backSteps [[e 2 KDelete one 2], [e 1 KCreate one 1]])
+      -- a value put in again after a Delete: the newest word wins
+      checkEq "create, delete, create" [[(10, one, VInt 1)], [], []]
+        (backSteps [[e 3 KCreate one 1], [e 2 KDelete one 1], [e 1 KCreate one 1]])
+      -- cardinality many: each value goes by its own newest word
+      checkEq "many" [[(10, many', VInt 2)], [(10, many', VInt 1)]]
+        (backSteps [[e 4 KCreate many' 2, e 3 KDelete many' 3], [e 2 KCreate many' 1, e 1 KCreate many' 3]]))
 
   , ("mphf: any set of distinct keys maps onto [0,n) exactly once (QuickCheck)", prop 300 $
       forAll (resize 400 (listOf arbitrary)) $ \(ks0 :: [Word64]) ->
@@ -2314,9 +2377,134 @@ hosiTests be =
         checkEq "no unit is cold, however long it has been" ([] :: [(Kind, Month)], [] :: [(Kind, Month)]) (map fst (frFrozen r5), frSkipped r5)
         checkEq "no access.json" False =<< doesFileExist (dir2 </> "events" </> "access.json")
         closeHosi h3)
+
+  , ("backfill: reading newest first, a step holds only what the full khana holds, and the last holds all of it", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids@[a, _, c, _, _, f] <- backfillWorld h clk
+        full <- entitiesOf h ids
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 10) ids
+        backfillChecks (2026, 10) full stages final cov
+        -- the first step is the unsealed log: an update of an entity whose Create nobody has read is held as it is
+        let (st0, snap0) = head stages
+        checkEq "step 0 is the log, and every month still has chunks to read"
+          (Coverage (2026, 10) [] [(2026, 10), (2026, 11), (2026, 12)]) (bfCoverage st0)
+        checkEq "a is held with the update alone (its Create is not read, so no name)" (M.fromList [("person/age", [VInt 11])]) (snap0 M.! a)
+        checkEq "f was created in the log: whole" (full M.! f) (snap0 M.! f)
+        checkEq "c is not seen yet" M.empty (snap0 M.! c))
+
+  , ("backfill since a later month reads only the chunks of entities created then", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids <- backfillWorld h clk
+        full <- entitiesOf h ids
+        forM_ [((2026, 11), 13, 9), ((2026, 12), 5, 4)] $ \(since, nEv, nFacts) -> do
+          (stages, final, cov) <- backfillSteps h (dir </> ("bf-" ++ showMonth since)) since ids
+          backfillChecks since full stages final cov
+          checkEq (showMonth since ++ ": events read") nEv (bfEventsRead (fst (last stages)))
+          checkEq (showMonth since ++ ": facts held") nFacts (bfFactsHeld (fst (last stages)))
+          checkEq (showMonth since ++ ": complete months") [ m | m <- [(2026, 10), (2026, 11), (2026, 12)], m >= since ] (cvComplete cov))
+
+  , ("backfill leaves out what erase took, as the full khana does", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids@[_, _, _, d, _, _] <- backfillWorld h clk
+        _ <- erase h [EraseIds [d]]
+        full <- entitiesOf h ids
+        checkEq "d is gone from now" M.empty (full M.! d)
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 10) ids
+        backfillChecks (2026, 10) full stages final cov)
+
+  , ("backfill of a world that is all log: one step, and its month is complete", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        a <- person h "A" 1
+        _ <- write h [Create (Id a) "person/age" (Lit (VInt 2))]
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 11) [a]
+        checkEq "one step: the log" [(0, 1)] [ (bfIndex st, bfCount st) | (st, _) <- stages ]
+        checkEq "its month is complete at once" (Coverage (2026, 11) [(2026, 11)] []) cov
+        checkEq "and the later update is the one held" (M.fromList [(a, M.fromList [("person/age", [VInt 2]), ("person/name", [VStr "A"])])]) final)
+
+  , ("backfill refuses a directory that exists, and removes its own when a step fails", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        _ <- backfillWorld h clk
+        createDirectory (dir </> "taken")
+        r <- try (backfillSince h (dir </> "taken") (2026, 10) (\_ _ -> pure ()))
+        case r of
+          Left (BadArgument _) -> pure ()
+          Left e               -> throwIO e
+          Right (k, _)         -> closeKhana k >> throwIO (userError "an existing directory should be refused")
+        r2 <- try (backfillSince h (dir </> "bf") (2026, 10) (\st _ -> when (bfIndex st == 1) (throwIO (userError "stop"))))
+        case r2 of
+          Left (_ :: SomeException) -> pure ()
+          Right (k, _)              -> closeKhana k >> throwIO (userError "the failing step should have stopped it")
+        checkEq "the half-built khana is gone" False =<< doesPathExist (dir </> "bf")
+        checkEq "the world is as it was" [] =<< verify h)
   ]
   where
     cfgWith c = (backendCfg be) { hcClock = c }
+    -- Three months of people: October a b, November c d, December e; then December edits to a b c d (sealed);
+    -- then one more edit of a and a new f (edited once more), in the log (unsealed).
+    backfillWorld h clk = do
+      writeIORef clk oct18
+      a <- person h "A" 1
+      b <- person h "B" 2
+      _ <- write h [Create (Id a) "person/tag" (Lit (VStr "x"))]
+      writeIORef clk nov11
+      c <- person h "C" 3
+      d <- person h "D" 4
+      _ <- seal h
+      writeIORef clk dec05
+      e <- person h "E" 5
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 10))]
+      _ <- write h [Delete (Id b) "person/age" (Lit (VInt 2))]
+      _ <- write h [Create (Id c) "person/tag" (Lit (VStr "t"))]
+      _ <- write h [Create (Id c) "person/age" (Lit (VInt 30))]
+      _ <- write h [Create (Id c) "person/age" (Lit (VInt 31))]    -- twice in one chunk: only the later one is c's age
+      _ <- write h [Create (Id d) "person/name" (Lit (VStr "D2"))]
+      _ <- write h [Delete (Id a) "person/tag" (Lit (VStr "x"))]
+      _ <- seal h
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 11))]
+      f <- person h "F" 6
+      _ <- write h [Create (Id f) "person/age" (Lit (VInt 7))]       -- twice in the log: only the later one is f's age
+      pure [a, b, c, d, e, f]
+    -- What "now" holds about each of these.
+    entitiesOf h ids = M.fromList <$> mapM (\i -> (,) i <$> getEntity h i) ids
+    -- Backfill into @path@, keeping what the khana held about @ids@ after every step.
+    backfillSteps h path since ids = do
+      seen <- newIORef []
+      (k, cov) <- backfillSince h path since $ \st kh -> do
+        snap <- M.fromList <$> mapM (\i -> (,) i <$> khanaEntity kh i) ids
+        modifyIORef seen ((st, snap) :)
+      stages <- reverse <$> readIORef seen
+      final <- M.fromList <$> mapM (\i -> (,) i <$> khanaEntity k i) ids
+      closeKhana k
+      pure (stages, final, cov)
+    -- What a backfill since @since@ promises, given what the full khana holds (@full@): entities created before @since@
+    -- are not there; at every step nothing is held that the full khana does not hold, and an entity of a complete month
+    -- is whole; the steps only add; the last one holds it all and has nothing pending.
+    backfillChecks since full stages final cov = do
+      let expected = M.mapWithKey (\i m -> if idMonth i >= since then m else M.empty) full
+          n = length stages
+          covs = map (bfCoverage . fst) stages
+          grows xs = and (zipWith (<=) xs (drop 1 xs))
+          held snap = and [ v `elem` M.findWithDefault [] at (expected M.! i) | (i, es) <- M.toList snap, (at, vs) <- M.toList es, v <- vs ]
+      checkEq "the steps are numbered 0 .. n-1" [0 .. n - 1] (map (bfIndex . fst) stages)
+      checkEq "every step knows how many there are" [n] (nub (map (bfCount . fst) stages))
+      forM_ stages $ \(st, snap) -> do
+        let at = "step " ++ show (bfIndex st) ++ ": "
+        check (at ++ "nothing is held that the full khana does not hold") (held snap)
+        forM_ [ i | i <- M.keys snap, idMonth i `elem` cvComplete (bfCoverage st) ] $ \i ->
+          checkEq (at ++ "an entity of a complete month is whole") (expected M.! i) (snap M.! i)
+      check "events read only grow" (grows (map (bfEventsRead . fst) stages))
+      check "facts held only grow" (grows (map (bfFactsHeld . fst) stages))
+      check "complete months only grow" (and (zipWith (\x y -> S.fromList (cvComplete x) `S.isSubsetOf` S.fromList (cvComplete y)) covs (drop 1 covs)))
+      checkEq "the last step holds all of it" expected final
+      checkEq "the facts held at the end are the facts of those entities" (sum (length <$> concatMap M.elems (M.elems expected))) (bfFactsHeld (fst (last stages)))
+      checkEq "nothing is pending at the end" [] (cvPending cov)
+      check "so it can be queried" (cvQueryable cov)
+      checkEq "the report that comes back is the last step's" (last covs) cov
     kd = khanaDirName be
     -- A file in the khana's directory: it is still there only if that directory was not replaced.
     markKhana dir = writeFile (dir </> kd </> "the-old-khana") "x"

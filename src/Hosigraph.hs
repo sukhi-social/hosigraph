@@ -45,6 +45,8 @@ module Hosigraph
   , history, historyTrace, LookupTrace(..), Probe(..), probeSays
     -- * Keeping it honest
   , rebuildKhana, verify, Stats(..), stats
+    -- * Reading the past into a khana, newest first
+  , Coverage(..), cvQueryable, BackfillStage(..), backfillSince
     -- * Ids
   , HosiId, describeId, idMonth, showMonth, Month, Clock, systemClock
     -- * Re-exported (the words of the khana)
@@ -64,6 +66,7 @@ import           Data.Word
 import           System.Directory
 import           System.FilePath ((</>))
 
+import           Hosigraph.Backfill
 import qualified Hosigraph.Erase as Erase
 import           Hosigraph.Event
 import           Hosigraph.Events (Events, EventsConfig(..), EventsStats(..), LookupTrace(..), Recorded(..), SealReport(..))
@@ -678,6 +681,63 @@ placeFreshKhana h fresh = do
   removePathForcibly (khanaDir h)
   renameDirectory fresh (khanaDir h)
   syncDir (hDir h)
+
+-- ---------------------------------------------------------------------------
+-- Backfill: read the events newest first, up to a month
+
+-- | What a backfill can say at one step.  A chunk is made for one /creation/ month, and the updates and deletes of an
+-- entity go to the chunks of the month it was created in.  So when every chunk of a month has been read, every entity
+-- created in that month is whole, and a question about those entities is answered as the finished khana would.
+data Coverage = Coverage
+  { cvSince    :: Month
+  , cvComplete :: [Month]   -- ^ months with every chunk read (and the log): their entities are whole
+  , cvPending  :: [Month]   -- ^ months with chunks still unread: an entity there may be missing, or be held with only its newer facts
+  } deriving (Eq, Show)
+
+-- | Nothing is pending: every entity created since 'cvSince' is whole, and the khana answers about them as a full one would
+-- (a reference to an entity created before 'cvSince' points at nothing).
+cvQueryable :: Coverage -> Bool
+cvQueryable = null . cvPending
+
+-- | One step of 'backfillSince', as the callback sees it.
+data BackfillStage = BackfillStage
+  { bfIndex      :: Int        -- ^ from 0: the unsealed log comes first, then the sealed events from the newest to the oldest
+  , bfCount      :: Int        -- ^ how many steps there are
+  , bfEventsRead :: Int        -- ^ events read so far
+  , bfFactsHeld  :: Int        -- ^ facts in the khana (an update whose Create is not read yet is one of them)
+  , bfCoverage   :: Coverage
+  } deriving Show
+
+-- | Read the events newest first, only those of entities created in @since@ or after, into a new khana in @dir@
+-- (which must not exist), and tell after every step what can be asked.  The callback gets the khana as it is then
+-- (read it with 'khanaEntity' or 'khanaQuery' from "Hosigraph.Khana"): an update whose Create has not been read is
+-- held as it is, so the entity shows with the facts known so far.  When the last step is done, the khana holds what
+-- a full one holds for those entities (a test checks this, for any step sizes).  The open khana and the last
+-- 'Coverage' are returned; the caller closes it.
+--
+-- This khana is on its own: it is not the one 'getEntity' reads, and it carries neither the folded seq nor the schema
+-- mark, so an open never takes it for a whole one.  The events lock is held for the whole reading, so the callback must
+-- not write to this 'Hosi', and writes wait.  If anything fails, the khana is closed and @dir@ is removed.
+backfillSince :: Hosi -> FilePath -> Month -> (BackfillStage -> Khana -> IO ()) -> IO (Khana, Coverage)
+backfillSince h dir since each = do
+  exists <- doesPathExist dir
+  when (exists || dir `elem` [khanaDir h, freshDir h]) $
+    throwIO (BadArgument "backfillSince: give it a directory that does not exist yet (a backfilled khana is not the live one)")
+  E.withEventsLock (hEvents h) $ do
+    conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) dir (hSchema h)
+    (do st <- newIORef (emptyBack, 0 :: Int, 0 :: Int, Coverage since [] [])
+        E.eventsBackEach (hEvents h) since $ \bs -> do
+          (b, nEv, nFacts, _) <- readIORef st
+          let (facts, b') = backStep (hSchema h) b (E.bsEvents bs)
+              cov = Coverage since [ m | (m, 0) <- M.toAscList (E.bsLeft bs) ] [ m | (m, n) <- M.toAscList (E.bsLeft bs), n > 0 ]
+              nEv' = nEv + length (E.bsEvents bs)
+              nFacts' = nFacts + length facts
+          applyFacts 2000 conn facts
+          writeIORef st (b', nEv', nFacts', cov)
+          each (BackfillStage (E.bsIndex bs) (E.bsCount bs) nEv' nFacts' cov) conn
+        (_, _, _, cov) <- readIORef st
+        pure (conn, cov))
+      `onException` (closeKhana conn >> removePathForcibly dir)
 
 -- | Check everything checkable: the manifest's signature, every chunk file's hash and
 -- footer, every MPHF (each id finds exactly its own events), and that the live khana

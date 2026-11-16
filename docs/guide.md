@@ -511,6 +511,54 @@ The cold read is slower for each id because it reads a block of 4,096 events and
 * **Not decided:** which attributes mean "owned by" in sukhi (they are an argument of each call, so hosigraph needs no setting); a separate S3 object for each owner and a dictionary for the cold data
   (proposed in the plan, not built); how many chunks a world may have (below 10,000 chunks nothing was slower than 0.35 s in a probe; at 100,000 a seal took 1.2 to 1.7 s and the first `history` 14 s).
 
+## Reading the past into a khana, newest first
+
+`backfillSince` reads the events from the newest to the oldest into **a new khana beside the world**, only for the entities created in a given month or after,
+and says after every step what can be asked. Use it to know "can I query yet?" before the whole khana is built, or to build only the recent part.
+
+```haskell
+import Hosigraph
+import Hosigraph.Khana (khanaEntity, closeKhana)
+
+(k, cov) <- backfillSince h "/path/to/a/new/directory" (2026, 10) $ \step khana -> do
+  let c = bfCoverage step
+  putStrLn (show (bfIndex step) ++ "/" ++ show (bfCount step) ++ " complete: " ++ show (cvComplete c) ++ " pending: " ++ show (cvPending c))
+  khanaEntity khana someId >>= print          -- whatever is known about it so far
+closeKhana k                                  -- here cvQueryable cov == True
+```
+
+Step 0 is the unsealed log. The next steps are the sealed groups (chunks whose seq ranges overlap), the newest group first.
+After each step the callback sees the khana as it is, and a `Coverage`.
+
+**What a step puts in.** The rule is one line: *an older event never overrides a newer one*. So:
+
+| What was read | What the khana holds |
+|---|---|
+| an update of an entity whose Create is not read yet | the update, as it is: the entity shows with the facts known so far |
+| a Delete of a value whose Create is not read yet | nothing now; when the Create comes, it is kept out |
+| a Create of a one-valued attribute that a newer event has settled | nothing: the newer one stays |
+| a many-valued attribute | each value is settled by its own newest event, a Create or a Delete |
+
+A fact that is put in is never taken out later, so at any step the khana holds a part of what the finished khana holds, and never something else.
+The tests check that reading newest first, in any step sizes, gives what folding oldest first gives (a property test), and cut each rule in turn to see a test fail.
+
+**What `Coverage` says.** A chunk is made for the *creation* month of its entities, and an update or a delete goes to the chunks of that month (note 2 of [`design-notes.md`](design-notes.md)).
+So when every chunk of a month has been read, every entity created in that month is whole, and a question about those entities is answered as the finished khana would.
+`cvComplete` lists those months, `cvPending` the months with chunks still unread, and `cvQueryable` is "nothing is pending".
+It is cautious: an entity of a pending month may already be whole, and the report does not say so. A question that follows a reference to an entity of another month may still meet a pointer to nothing.
+Entities created before the month you gave are not read at all: their chunks are never opened, and they are not in this khana.
+
+**What it is not.**
+
+* It is not the khana that `getEntity` and `query` read. It carries neither the folded seq nor the schema mark, so an open never takes it for a whole khana. `dir` must not exist yet (`BadArgument` if it does).
+  If a step fails (or the callback throws), the khana is closed and `dir` is removed.
+* It holds the events lock for the whole reading, so writes wait, and the callback must not write to this `Hosi`. Serving it as the world's own khana while it is still being built is not built (note 10 of the design notes says what it needs).
+* The erased ids are left out, as a rebuild leaves them out.
+
+**Measured** on the sukhi cold copy (527,971 events in 53 chunks, one month: they were all written when the world was loaded; `dtlv` khana): 54 steps, **106.6 to 109 s** (in the same run the world's own khana took 111 s to build from the events;
+an earlier run of that build took 71 s), the Haskell process peaked at **about 131 MB** (the `dtlv` processes are not counted), and the khana it made held the same 527,971 facts as the world's own (the sets are equal).
+Almost all of the time is `dtlv` (one process for each transaction of 2,000 facts): the program's own CPU time was 2.8 s, and 3.5 s of garbage collection. This world has no updates or deletes, so the run says what the reading costs, not how a half-built entity looks; the tests do that.
+
 ## From other languages (`setu/`, `hosigraph-abi/`)
 
 hosigraph is a Haskell library. To use it from Go, Python, Elixir or C, the repository has two more packages next to `takka/`.

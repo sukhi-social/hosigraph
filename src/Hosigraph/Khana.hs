@@ -36,7 +36,7 @@ module Hosigraph.Khana
   ( KhanaBackend(..), khanaDirName, Khana
   , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
   , metaEntity, foldedSeqAttr, eraseGenAttr, schemaMarkAttr, schemaMark, khanaSchema
-  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, foldRefused, khanaDatoms, khanaDatomCount
+  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, applyFacts, foldRefused, khanaDatoms, khanaDatomCount
   , khanaFoldedAndCount
     -- * Erasing
   , peekKhana, setEraseGen, setSchemaMark, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
@@ -51,6 +51,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import           Data.Word
 
+import           Hosigraph.Backfill (Fact)
 import           Hosigraph.Event
 import           Hosigraph.Khana.Dtlv
 import           Hosigraph.Khana.Sidecar (Sidecar, newSidecar, stopSidecar)
@@ -253,6 +254,18 @@ applyBatched n k evs = do
     Left (e :: SomeException) -> throwIO (Corrupt (foldRefused ++ show e))
   where chunksOf _ [] = []
         chunksOf m xs = let (a, b) = splitAt m xs in a : chunksOf m b
+
+-- | Put facts in (adds only), in transactions of at most @n@ facts.  For a backfill ("Hosigraph.Backfill"): the folded seq
+-- and the schema mark are not written, so a khana built this way is never taken for a whole one at open.
+applyFacts :: Int -> Khana -> [Fact] -> IO ()
+applyFacts n k fs = do
+  r <- try (forM_ (chunksOf fs) $ \c -> case k of
+              DtlvKhana d -> dtlvTransact d [ DAdd e a v | (e, a, v) <- c ])
+  case r of
+    Right () -> pure ()
+    Left (e :: SomeException) -> throwIO (Corrupt ("could not put backfilled facts into the khana: " ++ show e))
+  where chunksOf [] = []
+        chunksOf xs = let (a, b) = splitAt n xs in a : chunksOf b
 
 -- | Every fact in the khana except the bookkeeping one.
 khanaDatoms :: Khana -> IO [Datom]

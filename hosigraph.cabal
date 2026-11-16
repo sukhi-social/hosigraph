@@ -26,6 +26,7 @@ library
   hs-source-dirs:   src
   exposed-modules:
     Hosigraph
+    Hosigraph.Backfill
     Hosigraph.Bin
     Hosigraph.BinaryFuse
     Hosigraph.Chunk

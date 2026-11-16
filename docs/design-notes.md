@@ -5,7 +5,7 @@
 > In these notes, "core material" means the khana (see "What the names mean" in docs/guide.md).
 
 These notes list the open points of the Phase 1 prototype of the [design document v0.2.0-draft](hosiDB-design-v0.2.0-draft.md).
-Each note says what the prototype does and asks what the design document wants. Item 9 was added for Phase 3 (the local part: Erase, cleaning, freezing).
+Each note says what the prototype does and asks what the design document wants. Item 9 was added for Phase 3 (the local part: Erase, cleaning, freezing). Item 10 was added for the backfill (reading the past into a khana, newest first).
 
 ## 1. A chunk also needs a seq
 
@@ -152,3 +152,26 @@ or where the document says nothing. Each one asks the design document to take th
     in plain words wherever it promises that Erase makes data gone.
 11. **A pointer to an erased entity stays as a number.** Someone else's reply to an erased post, or a mention of an erased account, keeps the ID it points at, which now points at nothing.
     Blanking such pointers rewrites other people's entities, a different and bigger operation, and it is not planned.
+
+## 10. Backfill: reading the past into a khana, newest first
+
+`backfillSince` builds a khana for the entities created from a month onward, reading the events from the newest to the oldest, and says after each step what can be asked
+(what it does is in [the guide](guide.md#reading-the-past-into-a-khana-newest-first)). The design document does not have this; these are the choices.
+
+1. **The order is the order of writing, not of creation.** The newest writes come first, and the creation month is only the stop line. This was the choice for this version: show today's content first and go back into the past.
+   The other order also works: read the newest *month* first, all its chunks together, newest event first. An entity's events all live in the chunks of its creation month (item 2), so each month would be whole as soon
+   as it is read, and `Coverage` would be simpler. The price of the order taken is that a month is whole only when its oldest chunk has been read (an old month that is edited today stays pending until the end).
+   Which order the design wants is open; the fold needs only that the events of *one entity* come newest first, which both orders give, so changing the order changes `eventsBackEach` only
+   (and the sentence in `backStep`'s comment that every step is older than the steps before, which would then hold for each entity, not for the whole).
+2. **An update may arrive before its Create.** The khana holds the update as it is, so the entity shows with the facts known so far. The rule that makes this safe is one line: *an older event never overrides a newer one*.
+   For one attribute with cardinality one, the first Create read settles it, unless a newer Delete took out exactly that value (then it is settled as absent). For cardinality many, each value is settled by its newest event.
+   So a fact that is put in is never taken out later, and at any step the khana holds a part of what the finished khana holds. The tests check this against folding oldest first (a property test, with any step sizes) and by cutting the
+   rules one at a time (five breaks, each caught).
+3. **"Queryable" is about whole entities, not about the whole khana.** A chunk is made for a creation month, and an update or a delete of an entity goes to the chunks of the month it was *created* in (item 2). So when every chunk
+   of a month has been read, every entity created in that month is whole. `Coverage` says which months are so (`cvComplete`) and which are not yet (`cvPending`); `cvQueryable` is "nothing pending". It is cautious on purpose:
+   an entity of a pending month may already be whole (its Create came first), and the report does not say so. A question that joins through a reference to an entity of another month may still see a pointer to nothing.
+4. **The state grows with what was read.** To know that an attribute is settled, the fold remembers its (entity, attribute) until the end, and for cardinality many each value it has seen. With the chunks in memory one group at a time
+   this is the only thing that grows; it is about one entry for each fact read.
+5. **Not built (the second phase):** serving this khana as the world's own while it is still being built. That needs the writes that arrive meanwhile to be told apart from what is read from the past (a write that
+   deletes a fact the backfill has not read yet must hold it back, the same way a Delete read from a chunk does), and a way to swap the finished khana in. The first phase gives a khana beside the world, which
+   nobody opens by mistake (no folded seq, no schema mark), and holds the events lock for the reading, so writes wait.
