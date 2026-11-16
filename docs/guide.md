@@ -135,7 +135,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `clean` | Let what `erase` took out go from the disk: write the chunks again without it, and make the khana a new file. |
 | `freeze` | Put a month that nobody has read or written for a while into one cold chunk. Does nothing unless `hcColdAfterMs` is set. |
 
-You can also use `Hosigraph.Events` alone, without a khana. The tests cover this.
+You can also use `Hosigraph.Events` alone, without a khana. The tests cover this. Which of its names are promised: see "What 0.1 promises".
 
 ## Where "now" lives
 
@@ -245,22 +245,46 @@ and it reads `foldedSeq` once. A catch-up of 5 batches starts 3 `dtlv` processes
 
 ### Measurements
 
-macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmark is not part of the project.
+Taken on **2026-11-16**: an Apple M4 with 16 GB, macOS (arm64), the world on the internal SSD, GHC 9.10.3 (`-O1`), Datalevin 1.2.10 (JVM: Temurin 21), `fsync` on.
+One program does it all, **`scripts/bench.hs`** (build it with `scripts/build-ghc.sh bench`; it is not part of the cabal package). Run it alone on the machine: the numbers are times.
+The numbers are one run on one machine; they say how big a thing is, not how fast it will be on yours.
+
+**What a call costs** (an item is a `write` of 2 facts, a name and an age; 200 of each):
 
 | | `KhanaDatalevinJvm` | `KhanaDtlv` |
 |---|---|---|
-| `write`, one item at a time | 0.9 ms | about 25 ms |
-| the same items in one batch (for each item) | 0.05 ms | 1.2 ms |
-| `getEntity`, one at a time | 0.6 ms | about 23 ms |
-| `getEntities`, 200 together | about 3 ms | about 23 ms |
-| 6 queries (one by one → `queryMany`) | 2.6 → 1.9 ms | 156 → 28 ms |
-| `stats` | 1 ms | about 24 ms |
+| `write`, one item at a time | 1.05 ms | 24 ms |
+| the same items through `writeMany` (for each item) | 0.06 ms | 0.14 ms |
+| `getEntity`, one at a time | 0.66 ms | 24 ms |
+| `getEntities`, 200 together | 2.7 ms | 26 ms |
+| 6 queries (one by one → `queryMany`; each asked once before, so it is not the first) | 2.0 → 1.0 ms | 160 → 30 ms |
+| `stats` | 1.0 ms | 24 ms |
 
-* **Grouping helps `KhanaDtlv` most**, because starting a process is almost all of its time.
-  A JVM call is cheap already (200 entities: about 40 times faster; 6 queries: about 1.4 times).
-* "The same items in one batch" is the **upper limit** for grouped writes. `writeMany` (separate batches) comes close to it.
-* The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms). hosigraph calls only `fsync(2)`,
+* **Grouping helps `KhanaDtlv` most**, because starting a process is almost all of its time (200 entities: about 180 times faster; 6 queries: about 5 times).
+  A JVM call is cheap already (about 50 times; about 2 times).
+* The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms; measured earlier, not again). hosigraph calls only `fsync(2)`,
   and on macOS that does not wait for the disk write cache. On systems that really wait, the time is higher. It is not measured.
+
+**What a world costs.** A made-up world: 25,000 entities of 4 facts each (name, age, score, tag), so **100,000 events**, written in groups of 500 by `writeMany`:
+
+| | `KhanaDatalevinJvm` | `KhanaDtlv` |
+|---|---|---|
+| the writes | 3.1 s | 2.6 s |
+| open, the khana is in step | 1.5 s | 0.1 s |
+| open, the khana is 100 batches behind | 1.5 s | 0.1 s |
+| **open, the khana is made again from all the events** | 2.8 s | 2.3 s |
+| memory of the khana's program | 260 MB after an open, 400 MB at most | 90 MB at most (one process for each call) |
+| memory of hosigraph itself (GHC) | about 50 MB | about 50 MB |
+| on disk | events 1.4 MB, khana 11 to 22 MB | events 1.4 MB, khana 8 MB |
+
+* Opening with the JVM takes about 1.4 s even when nothing is to be done: that is the JVM starting.
+* **Real data is much slower to make again than this.** A copy of a real server's data (527,971 events, 54,402 entities, 288 attributes, 53 chunks, 96 MB, 2026-11-07) took
+  **about 70 s** with `KhanaDtlv` (71 to 111 s over runs; about 0.13 ms for each event, against 0.02 ms above), and the same again when the schema changes.
+  With the JVM it was not measured for this data (the first guess, from the old table, was about 26 s). Plan the worst open as **events × 0.15 ms**, and use that, not the made-up number.
+* The memory of `KhanaDtlv` is the largest of its processes, from `time -l` over the whole run; sampling every 25 ms misses a process that lives for 25 ms (the sampling saw 40 MB, and `time -l` saw 89 MB).
+  An earlier measure (2026-11-13, a made-up world of 100,000 *people*) saw about 260 MB for one `dtlv` and about 300 MB resident for the JVM that a smaller heap did not remove. The memory depends on the data.
+  The JVM is started with no heap setting.
+* A world of 25,000 entities is **small**. Nothing here was measured above 530,000 events.
 
 ## Limits
 
@@ -272,14 +296,15 @@ macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmar
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
 * The order of rows is not guaranteed (a Datalevin answer is a set). Sort the rows before you compare them.
-* Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). The memory use of the resident JVM is not measured.
+* Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). Its numbers (calls, opens, memory) are in "Measurements", for one machine.
 * **One opener at a time.** A world (a directory) is open in one place at a time: the first `openHosi` takes a lock (`events/lock`, `flock(2)`) and keeps it until `closeHosi`;
   a second one, in this process or in another, stops with `WorldBusy` before it touches anything.
   The lock is let go when the process dies, however it dies; a `lock` file left behind means nothing.
   Without it two writers overwrite each other's records in the tail log, and each is told that its write went in
   (tried on 2026-11-16: two processes, 300 writes each, 300 records left; with seals going on, a second one died on `manifest.tmp`).
   Not promised: a directory on a network file system (`flock` may say yes to two machines), and Windows (there is no `System.Posix` there).
-  This is for writers and readers alike: a second process cannot even read a world that the first one has open.
+  This is for writers and readers alike: **in 0.1 a world has one opener, and a second process cannot even read a world that the first one has open.**
+  A lock that readers share (for a backup, or an inspector) is not in 0.1; it is in `TODO.md`. To read a world that is open elsewhere, copy `events/` while its owner is closed, or ask its owner.
 
 ## Errors
 
@@ -296,6 +321,52 @@ A `HosiError` says which kind it is, so that you can answer it without reading t
 
 A khana that fails while it runs (the `dtlv` process or the JVM) is not a `HosiError` yet. It is a `DtlvError`, a bare string, and the C door tells it as `HOSI_ERR_INTERNAL`.
 So a backend that has failed cannot be told from a query that the caller wrote wrongly and that reached the khana (a Haskell caller's `query`; the C door reads the query first and refuses it as `parse-error`). That is left for after 0.1.0 (see `TODO.md`).
+
+## What 0.1 promises
+
+hosigraph 0.1 is **an embedded database for one process on one machine, on a local disk.** It brings Datalevin along
+(the `dtlv` program, or JDK 21 and the standalone jar), and the README says so on its first screen.
+**What 0.1.0 wrote, every 0.1.x reads.** The names listed as stable stay. The rest may change.
+The reason for this size: "local, one process" can be promised now. S3 brings failures of the network, which is a different promise (0.2).
+
+### The files
+
+| File | What is promised |
+|---|---|
+| `events/manifest` | `hosi-manifest/1` and `/2` are read by every 0.1.x. A format this code does not know is refused (`Corrupt`), and nothing is touched. |
+| `events/chunks/*/chunk.hosi` | `HOSICHK1`, **versions 1 and 2**, are both read (a world that began before 0.1 has version 1). New chunks are version 2. A later layout will have a new version number, not a changed meaning. |
+| `filter.bin`, `mphf.idx` | Version 1 of each. A chunk may have neither (a chunk from before Phase 2, or a cold chunk). |
+| `events/erase/*.bin` | `HOSIERS1`. |
+| `events/tail.log` | Records of `length:4  crc32:4  payload`, with **no header**. The first four bytes `HOSI` are reserved: no record of this format starts that way (read as a length, it would be 1.1 GiB), so a later format may begin with a mark that starts with them. 0.1.x **refuses** such a file (`Corrupt`) and does not cut it. Without the refusal, a log that cannot be read at its first record looks like a torn end, and the open cuts the file there (this is from reading the code; the cut was not run). A **torn end** (a crash in the middle of an append: the last record is short, or does not match its CRC) is cut at the open. A bad record with a **whole record after it** is not a torn end but damage: the open is refused (`Corrupt`, with the byte where the bad record begins), and the file is not cut. To open anyway, keep a copy and cut `tail.log` at that byte (what follows is lost). A damaged *last* record cannot be told from a torn one, and is cut. |
+| `khana-dtlv/` | **Nothing.** It is derived. A khana that is missing, behind, or made under another schema is made again from the events. |
+| `events/access.json`, `events/lock` | Nothing. A hint, and a lock; both may be missing. |
+
+A test holds this. `test/fixtures/world-0.1.0/` is a small world that 0.1.0 wrote (made by `spec --make-fixture DIR`), with chunks of both versions, a cold chunk, an erase record, and a tail that is not sealed.
+Every build opens it, and must show the events listed in `expected.txt`, and (with each khana) answer for each person as `expected.txt` says.
+**If a change makes that test fail, it is a change of the format.** It needs a new version number and a reader for the old one. Do not make the fixture again to make the test pass.
+
+Not tried: a world written by a build *older* than 0.1.0 (0.0.1.0). Its chunks are version 1, which the fixture has; its tail has the same shape. It was not opened with a real one.
+
+### The names
+
+`Hosigraph` lists them in the export list, in groups. Those **before the heading "Experimental"** are stable: within 0.1.x they are not removed, and what they mean does not change.
+New names, new fields in `HosiConfig` and in the reports, and new constructors of `HosiError` may come. So: build a config with `defaultConfig { … }`, and keep a catch-all case when you match an error.
+
+| | Names |
+|---|---|
+| **Stable** | Opening (`Hosi`, `HosiConfig`, `defaultConfig`, `openHosi`, `openHosiWith`, `closeHosi`, `withHosi`, `KhanaBackend`); writing (`Op`, `Ref`, `Val`, `write`, `writeMany`, `writeIf`, `Cond`, `seal`, and their reports); `erase`, `clean`; reading now (`getEntity`, `query`, `queryCells`, and the `…Many` forms); `history`; `rebuildKhana`, `verify`; ids; `HosiError`, `Event`, `Kind`; the words of the khana that `Hosigraph` re-exports. |
+| **Experimental** (may change, or go, in a 0.1.x; the changelog says so) | `freeze` (when a month is cold is not settled; the cold chunk's file is promised, the call that makes it is not); `historyTrace`, `LookupTrace`, `Probe`; `Stats`, `stats`; `Coverage`, `backfillSince`. |
+| **Not promised** | Every module other than `Hosigraph`. They are exposed so that the tests and tools can reach them. |
+
+One exception: `Hosigraph.Events` **used alone** (no khana) is promised for `EventsConfig`, `defaultEventsConfig`, `openEvents`, `closeEvents`, `withEventsLock`, `record`, `recordMany`, `commit`, `rollback`, `seal`, `history`, `eventsAfter`, `lastSeq` and `verifyEvents`.
+The rest of that module (erase, freeze, rewrite, access stamps, the pieces the khana folds from) is the inside of `Hosigraph`.
+Whoever uses the events alone owns "now": there is no khana to keep in step with them.
+
+The C door (`hosigraph-abi`, `libhosi`) is not covered here. It was seen working on macOS only, and it has its own documents.
+
+### Not in 0.1
+
+S3, live serving of a backfill, distribution and sync, metrics, JSON-LD import, thaw and compression of cold chunks. Windows, and a directory on a network file system.
 
 ## How the files are laid out
 

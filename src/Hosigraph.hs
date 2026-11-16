@@ -2,7 +2,7 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- |
 -- Module      : Hosigraph
--- Description : hosigraph, Phase 1 prototype: events (tail, chunks, manifest) + khana (now: Datalevin, or an in-process engine).
+-- Description : hosigraph: an embedded database that keeps the past as events (tail, chunks, manifest) and "now" as a khana (Datalevin).
 --
 -- > import Hosigraph
 -- >
@@ -23,6 +23,26 @@
 -- > write ──► events/tail.log ──seal──► events/chunks/<name>/{chunk.hosi, mphf.idx, filter.bin}
 -- >                 │                              │          (events/manifest lists the chunks)
 -- >                 └──────────── fold ────────────┴───────► khana/  ("now", Datalog)
+--
+-- == What 0.1 promises
+--
+-- hosigraph is for /one process on one machine, on a local disk/ (a world has one opener: a second one is refused,
+-- 'WorldBusy', even if it only wants to read; a shared lock for readers is not in 0.1), and it brings Datalevin along
+-- (the @dtlv@ program, or a JVM and the standalone jar).
+--
+-- * /What it wrote, it reads./  A world that 0.1.0 wrote is read by every 0.1.x (the files, not the khana: that is derived,
+--   and is simply made again).  A test opens such a world, kept in the repository.  A format that this code does not know
+--   is refused ('Corrupt') and not touched.
+-- * /Stable/ are the names under the headings of the export list /before/ "Experimental".  Within 0.1.x they are not
+--   removed, and what they mean does not change.  New names, new fields of 'HosiConfig' and the reports, and new constructors
+--   of 'HosiError' may come (build a config with @defaultConfig { .. }@; keep a catch-all case when you match an error).
+-- * /Experimental/ (the last headings) may change, or go, in a 0.1.x; the changelog says so when it happens.
+--   They are the ones whose meaning is not settled yet: cold storage ('freeze'), how a question was answered ('historyTrace'),
+--   the numbers ('stats'), and reading the past into a khana ('backfillSince').
+-- * /Not promised/: any module other than this one, except the part of "Hosigraph.Events" that the guide lists
+--   (use the events alone, without a khana).  The others are exposed so that the tests and tools can reach them.
+-- * /Not in 0.1/: S3, live serving of a backfill, sync, metrics, JSON-LD import, thaw and compression of cold chunks,
+--   Windows, a network file system.
 module Hosigraph
   ( -- * Opening
     Hosi, HosiConfig(..), defaultConfig, openHosi, openHosiWith, closeHosi, withHosi
@@ -36,22 +56,28 @@ module Hosigraph
   , Erasure(..), EraseReport(..), erase
     -- * Letting erased things go from the disk
   , CleanOptions(..), defaultCleanOptions, CleanReport(..), clean
-  , FreezeOptions(..), defaultFreezeOptions, FreezeReport(..), freeze
     -- * Reading "now" (the khana)
   , getEntity, query, queryCells
     -- * Reading many at once (one snapshot; one round trip with Datalevin)
   , getEntities, queryMany, queryCellsMany
     -- * Reading the past (events: chunks + tail, point lookup by id)
-  , history, historyTrace, LookupTrace(..), Probe(..), probeSays
+  , history
     -- * Keeping it honest
-  , rebuildKhana, verify, Stats(..), stats
-    -- * Reading the past into a khana, newest first
-  , Coverage(..), cvQueryable, BackfillStage(..), backfillSince
+  , rebuildKhana, verify
     -- * Ids
   , HosiId, describeId, idMonth, showMonth, Month, Clock, systemClock
     -- * Re-exported (the words of the khana)
   , Value(..), Keyword(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, ValueType(..)
   , Event(..), Kind(..), HosiError(..)
+    -- * Experimental (may change, or go, in a 0.1.x)
+    -- ** Cold storage: a quiet month goes cold
+  , FreezeOptions(..), defaultFreezeOptions, FreezeReport(..), freeze
+    -- ** How a question about the past was answered
+  , historyTrace, LookupTrace(..), Probe(..), probeSays
+    -- ** The numbers
+  , Stats(..), stats
+    -- ** Reading the past into a khana, newest first
+  , Coverage(..), cvQueryable, BackfillStage(..), backfillSince
   ) where
 
 import           Control.Exception

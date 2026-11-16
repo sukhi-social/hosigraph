@@ -5,7 +5,10 @@
 A small embedded database that **keeps the past as events**, and keeps **"now" as a copy you can put down**.
 
 > [!NOTE]
-> A prototype, written in Haskell. **S3 is not here yet.** Come and sit with it for a while; if anything puzzles you, an issue is welcome.
+> **0.1 is for one process on one machine, on a local disk.** It is written in Haskell, and it brings [Datalevin](https://github.com/datalevin/datalevin) along:
+> the `dtlv` program, or JDK 21 and the standalone jar.
+> What 0.1.0 wrote, every 0.1.x reads ([what is promised, and what is not](docs/guide.md#what-01-promises)). **S3 is not here yet.**
+> Come and sit with it for a while; if anything puzzles you, an issue is welcome.
 
 ## The idea
 

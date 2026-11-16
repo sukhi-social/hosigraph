@@ -1,21 +1,30 @@
 cabal-version:      3.0
 name:               hosigraph
-version:            0.0.1.0
-synopsis:           hosigraph Phase 1 prototype (events, khana, MPHF)
+version:            0.1.0.0
+synopsis:           An embedded database: the past as events, "now" as a Datalevin database
 description:
-  A prototype of the hosigraph design (formerly hosiDB, v0.2.0-draft): an embedded database that keeps the
-  past as frozen chunks of Create/Delete events and "now" (the khana) as a rebuildable instant.
-  The khana ("now") is a Datalevin database (through dtlv or a resident JVM). The words it speaks
-  (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
-  There is no C in the package.
+  An embedded database for one process on one machine, on a local disk (the hosigraph design, formerly hosiDB):
+  it keeps the past as frozen chunks of Create/Delete events and "now" (the khana) as a rebuildable instant.
+  The khana ("now") is a Datalevin database (through the dtlv program or a resident JVM, which you bring along).
+  The words it speaks (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
+  What 0.1.0 wrote, every 0.1.x reads. There is no C in the package. S3 is not in 0.1.
 category:           Database
 license:            BlueOak-1.0.0
 license-file:       LICENSE
 copyright:          2026 Hosigraph Contributors
 build-type:         Simple
+extra-doc-files:
+  CHANGELOG.md
 extra-source-files:
   README.md
   docs/*.md
+  test/fixtures/world-0.1.0/expected.txt
+  test/fixtures/world-0.1.0/events/manifest
+  test/fixtures/world-0.1.0/events/tail.log
+  test/fixtures/world-0.1.0/events/chunks/**/*.hosi
+  test/fixtures/world-0.1.0/events/chunks/**/*.bin
+  test/fixtures/world-0.1.0/events/chunks/**/*.idx
+  test/fixtures/world-0.1.0/events/erase/*.bin
 
 common shared
   default-language: GHC2021

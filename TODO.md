@@ -19,14 +19,28 @@ It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar)
      and `closeEvents` lets it go last; a second opener, in this process or another, gets `WorldBusy` and nothing is touched (a test checks that a chunk directory the manifest does not list is not swept).
      `openHosiWith` now opens the events *before* it starts the khana runtime, so a second opener never starts a JVM, and `closeHosi` closes the khana and the runtime *before* the events, so nobody opens on top of an open khana.
    * *Tests* (each was seen to fail with the lock turned off): the same process; another process holds it, and is killed with SIGTERM, so it is free again; an open that fails after the lock does not keep it.
-   * *Not decided:* a second process that only wants to **read** is refused too. A backup or an inspector would want to read (see "A backup call" below). A shared lock for readers is possible with the same `flock`; but a reader would see a world whose owner may seal.
+   * *Decided (nyanrus, 2026-11-16):* **0.1 has one opener, and no shared lock for readers.** A second process that only wants to read is refused too (`WorldBusy`), and the guide says so. The shared lock is in "Would help" below.
    * *Also run:* the Hosi path (the new order of open and close) with each khana: a test opens a world twice through `openHosiWith`, and the second is `WorldBusy` with nothing under the world touched, khana files included.
      "A second opener never starts a JVM" is by the order of the code (the lock comes before `newKhanaRuntime`); no test proves it.
    * *Not done:* the Elixir binding's own tests (`hosigraph-ex`, `mix test`) were not run. Network file systems and Windows are out of scope; the guide says so.
-2. **The shape on disk is a promise, and a test holds it.**
-   * Formats that exist: `hosi-manifest/1` and `/2`, `HOSICHK1` (chunk version 1 and 2), `HOSIERS1`, the tail log. The khana is derived and promised nothing (a different one is simply made again).
-   * Put a small world written by 0.1.0 into `test/` (chunks of both versions, a cold chunk, an erase record, a tail that is not sealed) and open it with every later build, with each khana backend.
-   * Whether the tail log carries a format mark was **not checked**. If it does not, add one before 0.1.0: it is cheapest now.
+2. **The shape on disk is a promise, and a test holds it.** *Done on 2026-11-16, except that the tail has no mark (and why).*
+   * Formats that exist: `hosi-manifest/1` and `/2`, `HOSICHK1` (chunk version 1 and 2), the filter and the MPHF (version 1), `HOSIERS1`, the tail log. The khana is derived and promised nothing (a different one is simply made again).
+   * *Looked at first:* what each reader does with a version it does not know. The manifest, the chunk, the MPHF, the filter and the erase record all refuse it (`Corrupt`). **The tail log did not.** `readTail` reads a first record it cannot understand as a torn end,
+     and `openHeld` cuts the file to the good part (`resetTail`): so a world written by a *newer* build would have lost its unsealed writes at the first open by an older one. (Read from the code. The cut itself was not run; with the check turned off, the test below fails on the refusal, before it looks at the file.)
+   * *The mark: not added.* A header would change the file, and a 0.1.0 build could no longer be put under a world that a later 0.1.x had written. What is needed is that a later format can *tell*, and that 0.1.x refuses it. The first four bytes of a tail are the length of the first record, big-endian;
+     `HOSI` as a length is 1.1 GiB, and a record is one batch. So **`HOSI` is reserved** (`Hosigraph.Tail`): `readTail` refuses a file that begins with it (`Corrupt`, nothing touched), and a later format may begin with any mark that starts with it. Nothing on disk changes.
+     If you want a mark anyway (say, to tell a tail from a file that is not one), it can still be added in a later 0.1.x in this way; say so.
+   * *The fixture:* `test/fixtures/world-0.1.0/`, made by `spec --make-fixture DIR` at the events layer (no khana program needed): October's Create chunk written again as **version 1** (what 0.0.1.0 wrote) beside version 2 chunks, a Delete chunk, a **cold** chunk (November), an **erase record** (so the manifest is `/2`), and a tail that is not sealed. 15 events, 6 people, one erased.
+     `expected.txt` has the events as read back, and, written by hand in the maker, what "now" must say for each person.
+   * *Tests* (3 without a khana, 1 for each khana): the world reads back as `expected.txt` says and `verify`s; the fixture holds what it claims (both chunk versions, a cold chunk without `mphf.idx`, an erase record and its file, a tail); a tail that begins with `HOSI` and a manifest of format 9 are refused (`Corrupt`) and every file is as it was;
+     with each khana, `Hosi` opens the fixture, makes the khana, answers for each person as written, takes a new write and a seal on top, and says the same after a reopen.
+     *Seen to fail:* with `HOSI` not reserved, the refusal test fails; with the erase magic changed to `HOSIERS2`, the read-back test fails with `not an erase record (wrong magic)`.
+   * *Not tried:* a world written by a real 0.0.1.0. Its chunks are version 1 (the fixture has them) and its tail has the same shape; it was not opened with one.
+   * *Found, and changed on 2026-11-16 (nyanrus: "fix it"):* a record that is damaged in the **middle** of the tail (a flipped bit, not a torn end) was handled as a torn end: everything after it was cut, and the batches after it had been told to their writers as kept.
+     Now `readTail` looks, after the first record it cannot read, for **any whole record later in the file** (length, CRC and payload all fit, at any offset). If there is one, it was not a crash: `Corrupt`, with the byte where the bad record begins and the byte where the whole one is; nothing is cut, and the lock is let go.
+     The way out is the operator's: keep a copy of `tail.log` and cut it at the byte the message names (what follows is lost). Nothing is added to the API for that.
+     *What is not told apart:* a damaged **last** record (nothing follows it) still looks like a torn end, and is cut; and if a crash ever left a bad record with a later one whole (a write that reached the disk out of order), that is refused too, where it used to be cut. A test holds each (damage in the payload, the CRC and the length of the second of three, and in the first; the last, damaged and torn; and through `openEvents`, twice, so the lock is let go).
+     *Seen to fail:* with the look-ahead turned off, that test fails. The cost is a scan of the bytes after the bad record (only when there is one), at most as long as the log.
 3. **Errors that say which kind they are.** *Mostly done on 2026-11-16: three kinds added; the fourth is left, and why.*
    * Listed where each `BadArgument` was thrown (`grep`, 2026-11-16) and grouped by what a caller does: the program is missing (3 places in `checkBackend`) → `BackendMissing`; the schema is refused (2 places in `recoverKhana`) → `SchemaRefused`;
      the world is open already (new) → `WorldBusy`. What is left in `BadArgument` is a wrong call: an empty batch, a reserved id, an erased id, a range that ends before it starts, a pull sent to `query`, a directory that exists for `backfillSince`, an unknown chunk version.
@@ -35,17 +49,26 @@ It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar)
      and is now `backend-missing` (the ABI test that said so was changed). The Elixir binding takes the kind as an atom, so it needs no change, but its tests were not run here.
    * **Left:** "the khana backend died". It is a `DtlvError` (a bare string, not a `HosiError`), thrown in about a dozen places, and some of them are the caller's fault: an unreadable query, a value that has no EDN form. The C door tells it `HOSI_ERR_INTERNAL`.
      To make it a kind (say `KhanaFailed`) the caller's own mistakes there must be told apart first. It is a bigger change, and the guide says that it waits.
-4. **Draw the line around the public names.**
-   * `Hosigraph` exports a wide surface (the probe words, `LookupTrace`, `Stats`, …), and `hosigraph.cabal` exposes more modules than the README talks about. Decide what is *stable* and what is *experimental*; say it in the haddock and the guide.
-     `backfillSince` and `Coverage` would be experimental. "You can also use `Hosigraph.Events` alone" (guide) is a promise too: keep it, or take it back.
-   * Change `synopsis`, `description` and the README's "A prototype" to say what 0.1.0 means.
-5. **Numbers on one page** (a table in the guide's "Limits", with the machine they were taken on).
-   * The worst open: a khana that must be made again (an old one, or a changed schema). Measured on 2026-11-16, 528,000 events with `dtlv`: **71 to 111 s**.
-   * A write one by one, `writeMany`, `getEntity`, `query`; the open of a world that is only behind.
-   * Memory. The guide says the resident JVM's memory "is not measured", but a run on 2026-11-13 (made-up data, 100,000 people) saw about 300 MB resident that a smaller heap did not remove. Take it again, and put it in.
+4. **Draw the line around the public names.** *Done on 2026-11-16, as a proposal for nyanrus to change.*
+   * `Hosigraph`'s export list is in two parts: the groups before the heading **Experimental** are stable (not removed, same meaning, in 0.1.x); under the heading are `freeze` (and its options and report), `historyTrace`, `LookupTrace`, `Probe`, `probeSays`, `Stats`, `stats`, `Coverage`, `cvQueryable`, `BackfillStage`, `backfillSince`.
+     Nothing was added or removed: the names were only moved. The module header says what 0.1 promises; the guide has the same as a section ("What 0.1 promises") with the table of files, and the README's first screen points to it.
+   * *Why `freeze` is experimental:* when a month is cold is not settled (the rule, `hcColdAfterMs`, and thaw is not in 0.1). The **cold chunk's file** is promised (the fixture has one); the **call that makes it** is not. It is also in the C door, which is not covered.
+   * *`Hosigraph.Events` alone:* kept, and narrowed to what the tests use without a khana: `EventsConfig`, `defaultEventsConfig`, `openEvents`, `closeEvents`, `withEventsLock`, `record`, `recordMany`, `commit`, `rollback`, `seal`, `history`, `eventsAfter`, `lastSeq`, `verifyEvents`. The rest of that module, and every other module, is not promised.
+   * `synopsis` and `description` no longer say "Phase 1 prototype"; the README's "A prototype" note is the 0.1 note. `version` is `0.1.0.0`. No tag, no push of a tag, no upload.
+   * *Open:* the C door (`hosigraph-abi`, `libhosi`) has its own version (`0.0.1.0`) and was seen working on macOS only; this section does not cover it. Does 0.1.0 of the library come with a promise about the door, or not yet?
+5. **Numbers on one page** *Done on 2026-11-16: the guide's "Measurements", taken again, with the machine and the date.*
+   * One program takes them all: `scripts/bench.hs` (`scripts/build-ghc.sh bench`; not in the cabal package). Apple M4, 16 GB, internal SSD, Datalevin 1.2.10, Temurin 21.
+   * *Calls* (replaces the old table, whose machine was not written down): `write` 1.05 ms (JVM) / 24 ms (dtlv); `writeMany` 0.06 / 0.14 ms for each item; `getEntity` 0.66 / 24 ms; `getEntities` of 200: 2.7 / 26 ms; 6 queries 2.0 → 1.0 / 160 → 30 ms.
+     The old table's "the same items in one batch" row is gone: the new row is `writeMany` of separate batches (what a caller does).
+   * *A world* (made up: 100,000 events): written in 3.1 / 2.6 s; open 1.5 / 0.1 s (1.4 s of the JVM's is the JVM starting); made again 2.8 / 2.3 s; the JVM's memory 260 MB after an open, 400 MB at most; dtlv 89 MB at most; hosigraph about 50 MB; events 1.4 MB, khana 8 to 22 MB.
+   * *The worst open* is the real data's: 527,971 events (a copy of a real server): about **70 s** with dtlv (0.13 ms for each event; 0.02 ms for the made-up one). Plan it as events × 0.15 ms. With the JVM, on real data: **not measured**.
+   * *Found while measuring:* the first run of the six queries was 41 ms in the JVM (the second 2 ms): a first use pays for parsing and warming up. The table says each query was asked once before. And the 25 ms sampling of memory sees nothing of a `dtlv` that lives for 25 ms (0 MB, then 41 MB, where `time -l` saw 89 MB); the guide says which was used.
+   * *Not measured:* anything above 530,000 events; two threads; a disk that waits for `fsync` (on macOS it does not); Linux.
 
 ### Would help, and 0.1.x is soon enough
 
+* **A shared lock for readers.** 0.1 has one opener: a second process that only wants to read (a backup, an inspector, a second reader of the same world) gets `WorldBusy`. A `LOCK_SH` on the same `events/lock` is possible with the same `flock`: readers share it, the writer takes it exclusively.
+  Open: a reader would see a world whose owner may seal or erase underneath it (a chunk directory swapped, a file gone), so it needs a read that survives that, or a promise that its answers are for one manifest. Not decided; waits for a user who needs it.
 * **A backup call.** The khana is derived, so `events/` alone is a backup. Open: may it be copied while writes go on (seal first, under the lock?), or only when the `Hosi` is closed?
 * **Many threads.** The guide lists as not tested: `clean` from two threads at once, many readers while `seal` or `erase` runs, and "the world changed between the read and the lock" in a rewrite.
 * **Linux, for real.** CI runs on ubuntu with the JVM khana only; the native `dtlv` is not run there, and the `abi` job has been seen to pass on macOS only. Windows has no `System.Posix`; say it.
@@ -65,6 +88,8 @@ The khana needs a program outside the process, and the in-process one was taken 
 If the first users are sukhi and tacchaka-matrix, (a) probably promises enough; that is a guess, not something asked.
 
 **Done when:** items 1 to 5 each have a test or a line in the guide, and the first paragraph of the README says what it needs.
+
+**State (2026-11-16):** items 1 to 5 are done as written above (item 3 with `DtlvError` left, item 2 without a tail mark). `version` is `0.1.0.0`; `CHANGELOG.md` says "not released". Left for nyanrus: the tag and the release (nothing was tagged, uploaded or pushed as a tag), the open questions below and in items 2 and 4, and `mix test` of `hosigraph-ex`, which was not run.
 
 ## Phase 2, the S3 part — against RustFS
 
