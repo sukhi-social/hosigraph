@@ -43,6 +43,7 @@ library
     Hosigraph.Sha256
     Hosigraph.Sync
     Hosigraph.Tail
+    Hosigraph.WorldLock
   build-depends:
       base        >=4.20 && <5
     , takka

@@ -66,10 +66,15 @@ data Cond
   | Unset !HosiId Keyword         -- ^ ...has no value at all for this attribute
   deriving (Eq, Show)
 
+-- | What went wrong, in the kinds a caller would answer differently.  The 'String' is for a person;
+-- match on the constructor, not on the text.
 data HosiError
   = WriteRejected String      -- ^ the batch was refused; nothing was kept
   | Corrupt String            -- ^ a file does not match what its hash / format promises
-  | BadArgument String
+  | BadArgument String        -- ^ the call itself is wrong (an empty batch, an id that is not an entity, a range that ends before it starts): change the call
+  | WorldBusy String          -- ^ the world is open already, in this process or in another: close the other one, or try again later.  Nothing was touched
+  | BackendMissing String     -- ^ the program the khana needs (@dtlv@, or @java@ and the Datalevin jar) is not where the config says: install it, or fix the path
+  | SchemaRefused String      -- ^ the khana cannot be made under this schema, and nothing was changed: open again with the schema the world was made with
   deriving Show
 
 instance Exception HosiError

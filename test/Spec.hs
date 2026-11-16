@@ -22,11 +22,11 @@ import           Data.Time.Clock (UTCTime(..))
 import           Data.Time.Clock.POSIX (getPOSIXTime)
 import           Data.Word
 import           System.Directory
-import           System.Environment (lookupEnv)
+import           System.Environment (getArgs, getExecutablePath, lookupEnv)
 import           System.Exit
 import           System.FilePath ((</>))
 import           System.IO
-import           System.Process (callProcess, readProcess)
+import           System.Process (CreateProcess(..), StdStream(..), callProcess, createProcess, proc, readProcess, terminateProcess, waitForProcess)
 import           Test.QuickCheck
 import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
@@ -69,6 +69,22 @@ prop n p = do
 
 main :: IO ()
 main = do
+  args <- getArgs
+  case args of
+    ["--hold-world", dir] -> holdWorld dir        -- a helper for the world-lock tests: not a test run
+    _                     -> runTests
+
+-- | Run again by the world-lock test as a second process: open this world, say so, and hold it until stdin is closed.
+-- (If the test kills it instead, it dies holding the world: that is the point.)
+holdWorld :: FilePath -> IO ()
+holdWorld dir = do
+  ev <- Ev.openEvents Ev.defaultEventsConfig dir
+  putStrLn "held" >> hFlush stdout
+  _ <- try (hGetLine stdin) :: IO (Either IOException String)
+  Ev.closeEvents ev
+
+runTests :: IO ()
+runTests = do
   hSetEncoding stdout utf8
   hSetBuffering stdout LineBuffering
   -- The Datalevin khana is tried too: through the native `dtlv` when HOSIGRAPH_DTLV names it, and
@@ -91,7 +107,7 @@ main = do
       dtlvRun = nativeRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
-  results <- forM (pureTests ++ dtlvRun) $ \(name, act) -> do
+  results <- forM (pureTests ++ worldLockTests ++ dtlvRun) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -102,6 +118,82 @@ main = do
 
 nonEmpty :: String -> Maybe String
 nonEmpty x = if null x then Nothing else Just x
+
+-- ---------------------------------------------------------------------------
+-- One opener at a time
+
+-- | Every path under a directory, with the size of each file: what "nothing was touched" compares.
+listAll :: FilePath -> IO [(FilePath, Integer)]
+listAll root = go ""
+  where
+    go rel = do
+      names <- sort <$> listDirectory (root </> rel)
+      fmap concat . forM names $ \n -> do
+        let r = rel </> n
+        isDir <- doesDirectoryExist (root </> r)
+        if isDir then ((r, -1) :) <$> go r else (\sz -> [(r, sz)]) <$> getFileSize (root </> r)
+
+isWorldBusy :: Either HosiError a -> Bool
+isWorldBusy r = case r of Left (WorldBusy _) -> True; _ -> False
+
+worldLockTests :: [Test]
+worldLockTests =
+  [ ("world lock: a second open of an open world is refused (WorldBusy), in the same process, and touches nothing", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+          put ev n = Ev.withEventsLock ev (Ev.record ev [Create (Tmp 1) "a" (Lit (VInt n))] >>= \rc -> Ev.commit ev rc)
+      ev <- Ev.openEvents cfg dir
+      put ev 1
+      -- a chunk directory the manifest does not list: the owner may be in the middle of a seal.  A second opener that
+      -- recovered would sweep it.
+      let making = dir </> "chunks" </> "c-in-the-making"
+      createDirectoryIfMissing True making
+      B.writeFile (making </> "chunk.hosi") "half"
+      before <- listAll dir
+      r <- try (Ev.openEvents cfg dir)
+      check "refused: WorldBusy" (isWorldBusy r)
+      case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+      checkEq "nothing was touched (not the tail, not the unlisted chunk directory)" before =<< listAll dir
+      put ev 2                                                  -- the owner goes on
+      Ev.closeEvents ev
+      -- let go: the next one opens, and finds both writes of the owner
+      ev2 <- Ev.openEvents cfg dir
+      checkEq "both writes are there" 2 . length =<< Ev.tailBatches ev2
+      Ev.closeEvents ev2)
+
+  , ("world lock: another process holds the world, so it is refused; the process dies without closing, so it is free", withTmp $ \dir -> do
+      exe <- getExecutablePath
+      (Just hin, Just hout, _, ph) <- createProcess (proc exe ["--hold-world", dir]) { std_in = CreatePipe, std_out = CreatePipe }
+      (do said <- hGetLine hout
+          checkEq "the other process has it" "held" said
+          r <- try (Ev.openEvents Ev.defaultEventsConfig dir)
+          check "refused: WorldBusy" (isWorldBusy r)
+          case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+          terminateProcess ph                                   -- SIGTERM: it has no time to close anything
+          _ <- waitForProcess ph
+          ev <- Ev.openEvents Ev.defaultEventsConfig dir        -- the lock file is still there, and means nothing
+          Ev.closeEvents ev) `finally` (hClose hin >> terminateProcess ph >> void (waitForProcess ph)))
+
+  , ("world lock: closing lets go, and a world that failed to open does not keep the lock", withTmp $ \dir -> do
+      let cfg = Ev.defaultEventsConfig
+      ev <- Ev.openEvents cfg dir
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents cfg dir
+      Ev.closeEvents ev2
+      -- a manifest that cannot be read: the open fails after the lock was taken
+      B.writeFile (dir </> manifestFile) "this is not a manifest"
+      r <- try (Ev.openEvents cfg dir) :: IO (Either SomeException Ev.Events)
+      check "the damaged world does not open" (either (const True) (const False) r)
+      check "...but it is not WorldBusy either" (case r of Left e | Just (WorldBusy _) <- fromException e -> False; _ -> True)
+      removeFile (dir </> manifestFile)
+      ev3 <- Ev.openEvents cfg dir
+      Ev.closeEvents ev3)
+
+  , ("open: a khana program that is not there is BackendMissing, found before the world is touched", withTmp $ \dir -> do
+      r <- try (openHosiWith defaultConfig { hcKhanaBackend = KhanaDtlv "/no/such/dtlv" } (dir </> "w") schema) :: IO (Either HosiError Hosi)
+      check "BackendMissing" (case r of Left (BackendMissing _) -> True; _ -> False)
+      checkEq "...and no directory was made" False =<< doesDirectoryExist (dir </> "w"))
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -1454,6 +1546,23 @@ hosiTests be =
       checkEq "last seq" 2 =<< Ev.lastSeq ev2
       Ev.closeEvents ev2)
 
+  , ("one opener at a time: a second open of an open world is WorldBusy and touches nothing, khana included; the first goes on; it opens again after close", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+      h <- openHosiWith cfg dir schema
+      _ <- person h "Frege" 70
+      before <- listAll dir
+      r <- try (openHosiWith cfg dir schema) :: IO (Either HosiError Hosi)
+      check "the second open is WorldBusy" (isWorldBusy r)
+      case r of Right h2 -> closeHosi h2; Left _ -> pure ()
+      checkEq "nothing under the world was touched (events, khana)" before =<< listAll dir
+      _ <- person h "Peirce" 80                                    -- the first goes on
+      closeHosi h
+      h3 <- openHosiWith cfg dir schema                            -- closed: free again, and nothing was lost
+      rows <- query h3 "[:find ?n :where [?e :person/name ?n]]" []
+      checkEq "both people are there" 2 (length rows)
+      closeHosi h3)
+
   , ("events alone: the chunk reader cache keeps within its limit and still answers", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       -- three seals = three chunks, each with one entity
@@ -2509,11 +2618,11 @@ hosiTests be =
     -- A file in the khana's directory: it is still there only if that directory was not replaced.
     markKhana dir = writeFile (dir </> kd </> "the-old-khana") "x"
     isOldKhana dir = doesFileExist (dir </> kd </> "the-old-khana")
-    -- Open and be refused: the message of the 'BadArgument'.
+    -- Open and be refused: the message of the 'SchemaRefused'.
     openRefused cfg dir sch = do
       r <- try (openHosiWith cfg dir sch)
       case r of
-        Left (BadArgument m) -> pure m
+        Left (SchemaRefused m) -> pure m
         Left e               -> throwIO e
         Right h              -> closeHosi h >> throwIO (userError "the open should have been refused")
     -- A khana that only knows Frege, while the log holds more: Peirce and Boole as two unsealed
@@ -2646,13 +2755,13 @@ nativeTests exe =
         before <- catalog
         check (what "the dump has the names in it") (any (":person/name" `isInfixOf`) before)
         r <- try (openHosiWith cfg dir schemaLong) :: IO (Either HosiError Hosi)
-        check (what "the open was refused") (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+        check (what "the open was refused") (either (\e -> case e of SchemaRefused _ -> True; _ -> False) (const False) r)
         checkEq (what "the khana is as it was") before =<< catalog)
 
   , ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       r <- try (openHosiWith ((backendCfg (KhanaDtlv "/no/such/dtlv")) { hcClock = clock }) dir schema) :: IO (Either HosiError Hosi)
-      check "a missing dtlv is a BadArgument" (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+      check "a missing dtlv is BackendMissing" (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
       checkEq "...and no database directory was made" False =<< doesDirectoryExist (dir </> "events"))
 
   , ("a batch costs one dtlv process, however many items are in it", withTmp $ \dir -> do
@@ -2751,7 +2860,7 @@ jvmTests java jar =
   , ("a missing java, or a missing jar, is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let bad be d = do r <- try (openHosiWith ((backendCfg be) { hcClock = clock }) d schema) :: IO (Either HosiError Hosi)
-                        pure (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+                        pure (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
       checkEq "no java" True =<< bad (KhanaDatalevinJvm "/no/such/java" jar) (dir </> "a")
       checkEq "no jar" True =<< bad (KhanaDatalevinJvm java "/no/such/datalevin.jar") (dir </> "b")
       checkEq "...and nothing was made" [False, False] =<< mapM (doesDirectoryExist . (dir </>)) ["a", "b"])

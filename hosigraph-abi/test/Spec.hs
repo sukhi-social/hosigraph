@@ -464,11 +464,12 @@ opTests =
 failureTests :: [Test]
 failureTests =
   [ ("failure: what hosigraph refuses on purpose is HOSI_ERR_APP with its kind", do
-      forM_ [ (WriteRejected "m1", "write-rejected"), (Corrupt "m2", "corrupt"), (BadArgument "m3", "bad-argument") ] $ \(e, kind) -> do
+      forM_ [ (WriteRejected "m1", "write-rejected"), (Corrupt "m2", "corrupt"), (BadArgument "m3", "bad-argument")
+            , (WorldBusy "m4", "world-busy"), (BackendMissing "m5", "backend-missing"), (SchemaRefused "m6", "schema-refused") ] $ \(e, kind) -> do
         ref <- newIORef []
         let d = dispatchOver (fake ref) { bStats = throwIO e }
         m <- askErr d "{:op :stats}" StApp kind
-        check "the message is kept" (T.pack (drop 0 (case e of WriteRejected s -> s; Corrupt s -> s; BadArgument s -> s)) == m))
+        check "the message is kept" (T.pack (drop 0 (case e of WriteRejected s -> s; Corrupt s -> s; BadArgument s -> s; WorldBusy s -> s; BackendMissing s -> s; SchemaRefused s -> s)) == m))
 
   , ("failure: what takka refuses on purpose is HOSI_ERR_APP too", do
       forM_ [ (TxError "t", "tx-error"), (QueryError "q", "query-error"), (SchemaError "s", "schema-error"), (ParseError "p", "parse-error") ] $ \(e, kind) -> do
@@ -565,7 +566,7 @@ openTests =
   , ("open: a backend that is not there is HOSI_ERR_APP; no database at all is a connection that answers ping", do
       r1 <- libConnect library "{:dir \"/tmp/hosi-abi-never\" :config {:khana [:dtlv \"/nonexistent/dtlv\"]}}"
       case r1 of
-        Left (Failure st kind _) -> checkEq "status, kind" (StApp, "bad-argument") (st, kind)
+        Left (Failure st kind _) -> checkEq "status, kind" (StApp, "backend-missing") (st, kind)
         Right _ -> throwIO (userError "opened with a backend that is not there")
       r2 <- libConnect library "{}"
       case r2 of

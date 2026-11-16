@@ -72,6 +72,7 @@ import           Hosigraph.Sha256 (sha256Hex)
 import           Takka.Types (Keyword, Value(..))
 import           Hosigraph.Sync
 import           Hosigraph.Tail
+import           Hosigraph.WorldLock
 
 -- ---------------------------------------------------------------------------
 -- Configuration and state
@@ -155,6 +156,7 @@ data Events = Events
   , xErased   :: IORef Erased                  -- ^ the erase records of the world in 'xManifest', loaded (whoever swaps one swaps the other, under the lock)
   , xRewrite  :: MVar ()                       -- ^ one 'rewriteErased' (or 'freezeUnit') at a time (it works outside 'xLock', and two would write the same scratch directory)
   , xStamps   :: IORef (M.Map (Kind, Month) Stamp)   -- ^ when each unit was last read and written; empty, and never touched, unless 'ecColdAfterMs' is set
+  , xWorldLock :: WorldLock                    -- ^ held from the open to 'closeEvents': nobody else may open this directory meanwhile
   }
 
 chunksDir :: Events -> FilePath
@@ -209,6 +211,19 @@ lastReservedId = 1
 openEvents :: EventsConfig -> FilePath -> IO Events
 openEvents cfg dir = do
   createDirectoryIfMissing True (dir </> "chunks")
+  held <- tryWorldLock (dir </> lockFile) >>= maybe (throwIO (WorldBusy (busyMessage dir))) pure
+  openHeld held cfg dir `onException` releaseWorldLock held
+
+-- | The lock file of a world: one opener at a time ("Hosigraph.WorldLock").
+lockFile :: FilePath
+lockFile = "lock"
+
+busyMessage :: FilePath -> String
+busyMessage dir = "the world at " ++ show dir ++ " is open already, in this process or in another; close that one first.  Nothing was touched"
+
+-- | 'openEvents' once the world is ours.
+openHeld :: WorldLock -> EventsConfig -> FilePath -> IO Events
+openHeld held cfg dir = do
   mf <- readManifest dir
   sweepOrphans dir mf
   erased <- loadErased dir mf                                  -- before anything is opened: a refusal leaves nothing behind
@@ -226,10 +241,12 @@ openEvents cfg dir = do
   stamps <- loadStamps cfg dir mf
   Events dir cfg <$> newMVar () <*> newIORef mf <*> pure tl <*> newIORef (fromBatches now batches)
                 <*> newIORef (lastS + 1) <*> pure gen <*> newIORef emptyReaderCache <*> newIORef M.empty
-                <*> newIORef erased <*> newMVar () <*> newIORef stamps
+                <*> newIORef erased <*> newMVar () <*> newIORef stamps <*> pure held
 
+-- | Close, and let go of the world: it is the last thing a closer does (a khana that is still open, and that
+-- the caller closes, must be closed before this, or another opener could start on top of it).
 closeEvents :: Events -> IO ()
-closeEvents k = flushAccess k >> closeTail (xTail k)
+closeEvents k = (flushAccess k >> closeTail (xTail k)) `finally` releaseWorldLock (xWorldLock k)
 
 withEventsLock :: Events -> IO a -> IO a
 withEventsLock k act = withMVar (xLock k) (const act)

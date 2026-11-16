@@ -128,12 +128,12 @@ verifyDir h = hDir h </> ("verify-" ++ khanaDirName (hcKhanaBackend (hCfg h)))
 checkBackend :: KhanaBackend -> IO ()
 checkBackend (KhanaDtlv exe) = do
   found <- runnable exe
-  unless found $ throwIO (BadArgument ("KhanaDtlv: no executable dtlv at " ++ show exe))
+  unless found $ throwIO (BackendMissing ("KhanaDtlv: no executable dtlv at " ++ show exe))
 checkBackend (KhanaDatalevinJvm java jar) = do
   okJava <- runnable java
-  unless okJava $ throwIO (BadArgument ("KhanaDatalevinJvm: no java at " ++ show java))
+  unless okJava $ throwIO (BackendMissing ("KhanaDatalevinJvm: no java at " ++ show java))
   okJar <- doesFileExist jar
-  unless okJar $ throwIO (BadArgument ("KhanaDatalevinJvm: no Datalevin jar at " ++ show jar))
+  unless okJar $ throwIO (BackendMissing ("KhanaDatalevinJvm: no Datalevin jar at " ++ show jar))
 
 -- | A path to an executable file, or a command name found on the PATH.
 runnable :: FilePath -> IO Bool
@@ -157,21 +157,21 @@ openHosiWith :: HosiConfig -> FilePath -> Schema -> IO Hosi
 openHosiWith cfg dir schema = do
   checkBackend (hcKhanaBackend cfg)
   createDirectoryIfMissing True dir
-  rt <- newKhanaRuntime (hcKhanaBackend cfg)
-  ev <- E.openEvents (eventsConfig cfg) (dir </> "events") `onException` closeKhanaRuntime rt
+  -- the world first: an opener that comes second is refused here ('WorldBusy'), before it starts a JVM or touches a khana
+  ev <- E.openEvents (eventsConfig cfg) (dir </> "events")
+  rt <- newKhanaRuntime (hcKhanaBackend cfg) `onException` E.closeEvents ev
   (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
       ref0 <- newIORef (error "khana not opened yet")
       let h = Hosi dir cfg schema ev ref0 rt
       lastS <- E.lastSeq ev
       conn <- recoverKhana h lastS
       writeIORef ref0 conn
-      pure h) `onException` (E.closeEvents ev >> closeKhanaRuntime rt)
+      pure h) `onException` (closeKhanaRuntime rt `finally` E.closeEvents ev)
 
 closeHosi :: Hosi -> IO ()
-closeHosi h = do
-  E.closeEvents (hEvents h)
-  readIORef (hKhana h) >>= closeKhana
-  closeKhanaRuntime (hRuntime h)
+closeHosi h =
+  -- the khana and its runtime first, the events last: closing them lets go of the world, and nobody may open it on top of a khana that is still open
+  (readIORef (hKhana h) >>= closeKhana) `finally` closeKhanaRuntime (hRuntime h) `finally` E.closeEvents (hEvents h)
 
 withHosi :: FilePath -> Schema -> (Hosi -> IO a) -> IO a
 withHosi dir schema = bracket (openHosi dir schema) closeHosi
@@ -213,7 +213,7 @@ recoverKhana h lastS = do
       (conn, refused) <- buildKhana h fresh `catch` \(ex :: SomeException) -> do
         removePathForcibly fresh
         case fromException ex of
-          Just (Corrupt m) | not same, foldRefused `isPrefixOf` m -> throwIO (BadArgument (schemaRefused m))
+          Just (Corrupt m) | not same, foldRefused `isPrefixOf` m -> throwIO (SchemaRefused (schemaRefused m))
           _                                                       -> throwIO ex
       closeKhana conn
       unless (null refused) $
@@ -221,7 +221,7 @@ recoverKhana h lastS = do
           then do batches <- E.tailBatches ev
                   E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
           else do removePathForcibly fresh
-                  throwIO (BadArgument (schemaRefused (show (length refused) ++ " logged batch(es) that the khana refuses (none was cut)")))
+                  throwIO (SchemaRefused (schemaRefused (show (length refused) ++ " logged batch(es) that the khana refuses (none was cut)")))
       placeFreshKhana h fresh
       openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
     schemaRefused why = "the schema cannot be applied to this world: " ++ why

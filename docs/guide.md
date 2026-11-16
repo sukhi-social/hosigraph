@@ -154,10 +154,11 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDtlv "/usr/local/bin/dtlv" }
 cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datalevin-1.2.10-standalone.jar" }
 ```
 
-* If `dtlv`, `java`, or the jar is missing, `openHosi` stops with `BadArgument` **before it touches anything**.
+* If `dtlv`, `java`, or the jar is missing, `openHosi` stops with `BackendMissing` **before it touches anything**.
   The default expects `datalevin-standalone.jar` in the place where you run, so give the real path.
 * To switch from one khana to another, just fold the events into the new one. The tests do this in both directions.
-* The two Datalevin khanas read the same files. **Do not open them at the same time.** hosigraph does not check the LMDB lock.
+* The two Datalevin khanas read the same files, so they must not be open at the same time. Through hosigraph they cannot be: a world is open once at a time (see "One opener at a time" under Limits).
+  A program that opens `khana-dtlv/` on its own is not stopped by that, and hosigraph does not check the LMDB lock.
 * `KhanaDtlv` sends the code on standard input to `dtlv exec`. A write is one `transact!`, so "all or none" holds.
 * `KhanaDatalevinJvm` talks to the JVM one line at a time. `closeHosi` ends it, and so does the end of your process.
   If the JVM dies, that one call fails (a write fails with `WriteRejected`), and the next call starts a new JVM.
@@ -272,6 +273,29 @@ macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmar
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
 * The order of rows is not guaranteed (a Datalevin answer is a set). Sort the rows before you compare them.
 * Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). The memory use of the resident JVM is not measured.
+* **One opener at a time.** A world (a directory) is open in one place at a time: the first `openHosi` takes a lock (`events/lock`, `flock(2)`) and keeps it until `closeHosi`;
+  a second one, in this process or in another, stops with `WorldBusy` before it touches anything.
+  The lock is let go when the process dies, however it dies; a `lock` file left behind means nothing.
+  Without it two writers overwrite each other's records in the tail log, and each is told that its write went in
+  (tried on 2026-11-16: two processes, 300 writes each, 300 records left; with seals going on, a second one died on `manifest.tmp`).
+  Not promised: a directory on a network file system (`flock` may say yes to two machines), and Windows (there is no `System.Posix` there).
+  This is for writers and readers alike: a second process cannot even read a world that the first one has open.
+
+## Errors
+
+A `HosiError` says which kind it is, so that you can answer it without reading the text. The C door tells the same kind as `{:error :kind ...}` (and as `HOSI_ERR_APP`).
+
+| `HosiError` | C door kind | What it says | What you do |
+|---|---|---|---|
+| `WriteRejected` | `write-rejected` | the batch was refused (for example a unique value that is taken); nothing was kept | change the batch |
+| `BadArgument` | `bad-argument` | the call itself is wrong: an empty batch, an id that is not an entity, a range that ends before it starts | change the call |
+| `Corrupt` | `corrupt` | a file does not match what its hash or format promises | stop; look at the world with `verify` |
+| `WorldBusy` | `world-busy` | the world is open already, in this process or another | close the other one, or try later. Nothing was touched |
+| `BackendMissing` | `backend-missing` | `dtlv`, or `java` and the Datalevin jar, is not where the config says | install it, or fix the path |
+| `SchemaRefused` | `schema-refused` | the khana cannot be made under this schema (a type that clashes with the data, a unique value that is not unique); nothing was changed | open again with the schema the world was made with |
+
+A khana that fails while it runs (the `dtlv` process or the JVM) is not a `HosiError` yet. It is a `DtlvError`, a bare string, and the C door tells it as `HOSI_ERR_INTERNAL`.
+So a backend that has failed cannot be told from a query that the caller wrote wrongly and that reached the khana (a Haskell caller's `query`; the C door reads the query first and refuses it as `parse-error`). That is left for after 0.1.0 (see `TODO.md`).
 
 ## How the files are laid out
 
@@ -281,6 +305,7 @@ macOS, arm64. One item is a `write` of 2 facts (a name and an age). The benchmar
 | Hot chunk | `chunk.hosi`, `mphf.idx` and `filter.bin` in `events/chunks/<name>/`. One chunk for each kind and (creation) month. Nobody changes it. A chunk from before Phase 2 has no `filter.bin` and is still read. |
 | ID | `(milliseconds since 2026-01-01) << 21 \| sequence number` (63 bits). The ID alone tells you the month. |
 | MPHF | A *minimal perfect hash*: it gives each known key its own slot, with no collisions. This one is PTHash-style and written for this project (`Hosigraph.Mphf`). Each slot has a 32-bit fingerprint and the position of the body, which `Probe` checks. |
+| Lock | `events/lock`: empty. Held with `flock(2)` for as long as the world is open ("One opener at a time", under Limits). A file left behind means nothing. |
 | Manifest | `events/manifest`. Line 1 is JSON. Line 2 is `sha256:`. hosigraph writes a tmp file and replaces the manifest by a rename. A chunk that is not in the manifest is outside the world; hosigraph cleans it at open. A world that has ever erased something is `hosi-manifest/2`, and a build that knows only `/1` refuses it (it must not read it and show what was erased). A world that never erased is still written as `/1`, byte for byte as before. |
 | Cold chunk | A chunk made by `freeze`: the events of one (kind, month), in bigger blocks (`hcColdBlockEvents`, 4,096 events; a hot chunk has 256), **no `mphf.idx`**, and `"tier": "cold"` in the manifest. It is found by the footer and one block, as on the deep path. |
 | Erase record | `events/erase/<chunk>-<generation>.bin`, format `HOSIERS1`: the ids of that chunk that were erased, as sorted ranges (6 to 8 bytes for each scattered id; a whole day is one range of 28 bytes). The manifest lists it next to the chunk; it is not inside the chunk's directory and not in the chunk's hash, because it belongs to the world, not to the chunk. It goes when the chunk is written again (`clean`, `freeze`). |
@@ -633,7 +658,7 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
 
 * **Speed is measured only roughly.** Each write fsyncs the tail log and the khana commits once, so one-by-one writes are slow. The design expects grouped writes.
 * `Schema` is an argument of open. The events do not store it, but the khana keeps a mark of the schema it was folded under: open with another schema makes the khana again
-  (beside the old one; it costs a fold of every event, about 0.13 ms an event with `dtlv`), and a schema that the events or the log refuse stops the open with `BadArgument`,
+  (beside the old one; it costs a fold of every event, about 0.13 ms an event with `dtlv`), and a schema that the events or the log refuse stops the open with `SchemaRefused`,
   with the khana and the log untouched. See item 6 of [`design-notes.md`](design-notes.md).
 * Writes go one at a time (`MVar`). Reads run in parallel.
   `history` takes the lock for a moment to see the manifest and the tail log in a stable state, so a seal in progress is not visible.
