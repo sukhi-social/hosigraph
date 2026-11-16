@@ -552,7 +552,7 @@ Entities created before the month you gave are not read at all: their chunks are
 
 * It is not the khana that `getEntity` and `query` read. It carries neither the folded seq nor the schema mark, so an open never takes it for a whole khana. `dir` must not exist yet (`BadArgument` if it does).
   If a step fails (or the callback throws), the khana is closed and `dir` is removed.
-* It holds the events lock for the whole reading, so writes wait, and the callback must not write to this `Hosi`. Serving it as the world's own khana while it is still being built is not built (note 10 of the design notes says what it needs).
+* It holds the events lock for the whole reading, so writes wait, and the callback must not write to this `Hosi`. Serving it as the world's own khana while it is still being built ("live serving") is not built (note 10 of the design notes says what it needs, and [`TODO.md`](../TODO.md) lists the open points).
 * The erased ids are left out, as a rebuild leaves them out.
 
 **Measured** on the sukhi cold copy (527,971 events in 53 chunks, one month: they were all written when the world was loaded; `dtlv` khana): 54 steps, **106.6 to 109 s** (in the same run the world's own khana took 111 s to build from the events;

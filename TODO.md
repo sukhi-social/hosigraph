@@ -106,3 +106,22 @@ README: how to configure the store; how to start RustFS for the tests. `docs/des
 * Erase and bucket versioning: the design document says an Erase is complete only after the old versions are deleted too (line 123 of the design document). Check what RustFS does with versioning then.
 * Freezing / cold chunks, garbage collection of remote chunks, lifecycle rules.
 * Expanding RustFS: a single-node single-drive deployment cannot be grown in place (its docs say so). Not our problem for tests; it matters for a real deployment.
+
+## Backfill: live serving (after `backfillSince`)
+
+`backfillSince` (see [the guide](docs/guide.md#reading-the-past-into-a-khana-newest-first)) builds a khana beside the world, newest write first, and says which creation months are whole.
+What is not built is using it *while it is still being built*, as the world's own khana. This is not the S3 part above. Nothing here is decided; these are the open points.
+
+* **Writes that arrive meanwhile.** A write is newer than every event the backfill has not read. One way: apply it to the backfill khana as the forward fold does (a Create replaces, a Delete takes out),
+  and also mark the (entity, attribute) or the value as settled in the backfill's state (`Hosigraph.Backfill.Back`), so that an older event read later cannot override it. This needs a test of its own,
+  with a write between every two steps, against folding everything oldest first.
+* **A khana that is only part of the world.** With a month later than the oldest, the khana lacks the older entities. Can it be the world's own at all? `getEntity` of an old id would answer "nothing", which is
+  a wrong answer, not a missing one. Either the world's khana is only ever the whole one (and the partial one is a separate thing you ask by name), or an answer must say which months it covers.
+* **Swapping it in.** When it is whole, it needs the folded seq (the last seq) and the schema mark, written the way `buildKhana` writes them, and then the place of the old khana (`installFreshKhana`).
+* **The lock.** The events lock is held for the whole reading (about 107 s for 528,000 events), so writes wait. Letting them in means a snapshot of the manifest, the erase records and the log taken under the lock,
+  and chunks that stay readable while `clean` or `freeze` retire one (they do not, today: a chunk that goes away halfway makes the reading fail).
+* **The order.** The reading is by write order (newest first). Reading by month (the newest month first, all its chunks) also works and makes each month whole as soon as it is read; see note 10, item 1, of
+  `docs/design-notes.md`. Only `eventsBackEach` would change.
+* **Speed.** On the real world nearly all of the time is `dtlv`, one process for each transaction of 2,000 facts (the program's own CPU time was 2.8 s of 107 s). A larger transaction is the lever; `applyBatched`
+  (the rebuild) uses 2,000 too. Not tried.
+

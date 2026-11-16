@@ -172,6 +172,7 @@ or where the document says nothing. Each one asks the design document to take th
    an entity of a pending month may already be whole (its Create came first), and the report does not say so. A question that joins through a reference to an entity of another month may still see a pointer to nothing.
 4. **The state grows with what was read.** To know that an attribute is settled, the fold remembers its (entity, attribute) until the end, and for cardinality many each value it has seen. With the chunks in memory one group at a time
    this is the only thing that grows; it is about one entry for each fact read.
-5. **Not built (the second phase):** serving this khana as the world's own while it is still being built. That needs the writes that arrive meanwhile to be told apart from what is read from the past (a write that
-   deletes a fact the backfill has not read yet must hold it back, the same way a Delete read from a chunk does), and a way to swap the finished khana in. The first phase gives a khana beside the world, which
-   nobody opens by mistake (no folded seq, no schema mark), and holds the events lock for the reading, so writes wait.
+5. **Not built (live serving):** serving this khana as the world's own while it is still being built. That needs the writes that arrive meanwhile to be told apart from what is read from the past (a write that
+   deletes a fact the backfill has not read yet must hold it back, the same way a Delete read from a chunk does), and a way to swap the finished khana in. What is built gives a khana beside the world, which
+   nobody opens by mistake (no folded seq, no schema mark), and holds the events lock for the reading, so writes wait. The open points are in [`TODO.md`](../TODO.md), under "Backfill: live serving".
+   (This is not the Phase 2 of the design document, which is S3 and the deep path.)
