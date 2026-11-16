@@ -27,7 +27,7 @@
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
   ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..)
-  , openDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomCount, dtlvQueryCells
+  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomCount, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
     -- * Taking out whole entities
@@ -95,6 +95,14 @@ openDtlv runner dir schema = do
   let d = Dtlv runner absDir schema
   _ <- run d "nil"
   pure d
+
+-- | Like 'openDtlv', without the first, empty operation: for a database that is only looked at (the look is its
+-- first operation, so nothing is spent on a start that only checks), and let go of straight after.
+attachDtlv :: Runner -> FilePath -> Schema -> IO Dtlv
+attachDtlv runner dir schema = do
+  createDirectoryIfMissing True dir
+  absDir <- makeAbsolute dir
+  pure (Dtlv runner absDir schema)
 
 -- | Let go of the database.  With a resident JVM the connection is closed (so the directory can be
 -- moved or removed); the JVM itself stays up for the other databases.  With the native @dtlv@

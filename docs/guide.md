@@ -584,7 +584,9 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
 ## Notes on the current state
 
 * **Speed is measured only roughly.** Each write fsyncs the tail log and the khana commits once, so one-by-one writes are slow. The design expects grouped writes.
-* `Schema` is an argument of open. hosigraph does not store it. See item 6 of [`design-notes.md`](design-notes.md).
+* `Schema` is an argument of open. The events do not store it, but the khana keeps a mark of the schema it was folded under: open with another schema makes the khana again
+  (beside the old one; it costs a fold of every event, about 0.13 ms an event with `dtlv`), and a schema that the events or the log refuse stops the open with `BadArgument`,
+  with the khana and the log untouched. See item 6 of [`design-notes.md`](design-notes.md).
 * Writes go one at a time (`MVar`). Reads run in parallel.
   `history` takes the lock for a moment to see the manifest and the tail log in a stable state, so a seal in progress is not visible.
 * The MPHF is a minimal PTHash style (load factor about 89 %, about 4 keys for each bucket, 16-bit pilots).
@@ -605,6 +607,6 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
 3. **A khana plus a tail log cannot be read together** (a Datalevin `Db` is one LMDB read transaction). Instead, hosigraph folds into the khana at each write (write-through).
 4. **Who decides whether a write is allowed?** A type error or a unique-key conflict shows only when hosigraph folds into the khana.
 5. **There are two fast paths.** "Now" comes from the khana. "The events of one ID" comes from the MPHF.
-6. **Nobody stores the schema.** The cardinality sets the meaning of Create, so it changes the fold.
+6. **The schema is an argument of open; the khana keeps a mark of it.** The cardinality sets the meaning of Create, so it changes the fold; a different schema at open makes the khana again.
 7. **The 63 bits of the ID have no room for a node ID.** Where does the room for distribution go?
 8. **The parts have names that the design document does not have** (Events and Khana). Should the design document take these words?

@@ -26,7 +26,7 @@ import           System.Environment (lookupEnv)
 import           System.Exit
 import           System.FilePath ((</>))
 import           System.IO
-import           System.Process (callProcess)
+import           System.Process (callProcess, readProcess)
 import           Test.QuickCheck
 import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
@@ -38,7 +38,8 @@ import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
-import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
+import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema)
+import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
 import           Hosigraph.Probe (confirmSlot)
@@ -1683,6 +1684,93 @@ hosiTests be =
       checkEq "verify clean" [] =<< verify h2
       closeHosi h2)
 
+  , ("a changed schema is noticed at open: the khana is made again under it, and the old answers do not linger", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaMany = M.insert "person/age" (many (attr TLong)) schema
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 71))]       -- cardinality one: 71 replaces 70
+      checkEq "as cardinality one" (Just [VInt 71]) =<< ageOf h a
+      closeHosi h
+      markKhana dir
+      h1 <- openHosiWith (cfgWith clock) dir schema
+      check "the same schema: the khana is kept" =<< isOldKhana dir
+      closeHosi h1
+      h2 <- openHosiWith (cfgWith clock) dir schemaMany
+      check "a different schema: the khana was made again" . not =<< isOldKhana dir
+      checkEq "as cardinality many" (Just [VInt 70, VInt 71]) . fmap sort =<< ageOf h2 a
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2
+      markKhana dir
+      h2b <- openHosiWith (cfgWith clock) dir schemaMany               -- the khana that was made says which schema it was made under
+      check "the same schema again: the khana that was made is kept" =<< isOldKhana dir
+      closeHosi h2b
+      h3 <- openHosiWith (cfgWith clock) dir schema                    -- and back again
+      checkEq "as cardinality one again" (Just [VInt 71]) =<< ageOf h3 a
+      checkEq "verify clean" [] =<< verify h3
+      closeHosi h3)
+
+  , ("a schema the sealed events cannot be folded under is refused at open; the khana and the log are as they were", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- seal h
+      s1 <- stats h
+      closeHosi h
+      markKhana dir
+      msg <- openRefused (cfgWith clock) dir schemaLong
+      check "the message says what to do" ("open it again with the schema" `isInfixOf` msg)
+      check "the old khana was not replaced" =<< isOldKhana dir
+      check "no half-made khana is left" . not =<< doesDirectoryExist (dir </> (kd ++ ".new"))
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      check "still not replaced after the old schema is back" =<< isOldKhana dir
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      s2 <- stats h2
+      checkEq "the log is as it was" (stSealedSeq s1, stTailBytes s1) (stSealedSeq s2, stTailBytes s2)
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a schema the unsealed log cannot be folded under is refused at open: nothing acknowledged is cut from the log", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong   = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+          schemaUnique = M.insert "person/age" (uniqueValue (attr TLong)) schema     -- and two people are 70
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 70
+      s1 <- stats h
+      closeHosi h
+      checkEq "both batches are in the log, none sealed" (4, 0) (stTailEvents s1, stSealedSeq s1)
+      forM_ [("a string for a number", schemaLong), ("a unique age taken twice", schemaUnique)] $ \(what, sch) -> do
+        _ <- openRefused (cfgWith clock) dir sch
+        checkEq ("the log is as it was: " ++ what) (stTailBytes s1) =<< getFileSize (dir </> "events" </> tailFile)
+      -- the khana is lost as well: nobody can tell which schema it was made with, and still nothing is cut
+      removePathForcibly (dir </> kd)
+      _ <- openRefused (cfgWith clock) dir schemaUnique
+      checkEq "the log is as it was, with the khana lost" (stTailBytes s1) =<< getFileSize (dir </> "events" </> tailFile)
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      checkEq "Peirce" (Just [VInt 70]) =<< ageOf h2 b
+      checkEq "both batches are still in the log" (stTailEvents s1) . stTailEvents =<< stats h2
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a khana that cannot be opened is made again beside the old one; if that fails the old one is not deleted", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- seal h
+      closeHosi h
+      B.writeFile (dir </> kd </> "data.mdb") (BC.pack "this is not a database")
+      _ <- openRefused (cfgWith clock) dir schemaLong
+      check "the khana's directory is still there" =<< doesDirectoryExist (dir </> kd)
+      check "and so is the file in it" =<< doesFileExist (dir </> kd </> "data.mdb")
+      h2 <- openHosiWith (cfgWith clock) dir schema                    -- the right schema: made again, whole
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
   , ("several unfolded tail batches go in together at open", tailCatchUp False)
 
   , ("...and when the khana refuses one of them, only that one is dropped", tailCatchUp True)
@@ -2230,6 +2318,16 @@ hosiTests be =
   where
     cfgWith c = (backendCfg be) { hcClock = c }
     kd = khanaDirName be
+    -- A file in the khana's directory: it is still there only if that directory was not replaced.
+    markKhana dir = writeFile (dir </> kd </> "the-old-khana") "x"
+    isOldKhana dir = doesFileExist (dir </> kd </> "the-old-khana")
+    -- Open and be refused: the message of the 'BadArgument'.
+    openRefused cfg dir sch = do
+      r <- try (openHosiWith cfg dir sch)
+      case r of
+        Left (BadArgument m) -> pure m
+        Left e               -> throwIO e
+        Right h              -> closeHosi h >> throwIO (userError "the open should have been refused")
     -- A khana that only knows Frege, while the log holds more: Peirce and Boole as two unsealed
     -- batches, and (if @bad@) a batch the khana would refuse between them and a good batch after it.
     tailCatchUp bad = withTmp $ \dir -> do
@@ -2319,7 +2417,51 @@ dtlvTests be =
 -- | Only the native `dtlv`.
 nativeTests :: FilePath -> [Test]
 nativeTests exe =
-  [ ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
+  [ ("a khana from before the schema mark was kept is trusted by nobody: it is made again once at open, and then kept", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
+          kdir = dir </> khanaDirName (KhanaDtlv exe)
+      h <- openHosiWith cfg dir schema
+      a <- person h "Frege" 70
+      closeHosi h
+      -- as if a build that kept no mark had made this khana: take the mark out, and leave a file to see whether the khana is replaced
+      d <- openDtlv (Native exe) kdir (khanaSchema schema)
+      dtlvTransact d [DRetract metaEntity schemaMarkAttr (VStr (schemaMark schema))]
+      closeDtlv d
+      writeFile (kdir </> "the-old-khana") "x"
+      h2 <- openHosiWith cfg dir schema
+      check "no mark: the khana was made again" . not =<< doesFileExist (kdir </> "the-old-khana")
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      closeHosi h2
+      writeFile (kdir </> "the-old-khana") "x"
+      h3 <- openHosiWith cfg dir schema
+      check "and with the mark it made, it is kept" =<< doesFileExist (kdir </> "the-old-khana")
+      checkEq "verify clean" [] =<< verify h3
+      closeHosi h3)
+
+  , ("a schema that is refused at open is not written into the old khana: it holds what it held, types and datoms", withTmp $ \dir0 -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
+          schemaLong = M.insert "person/name" (attr TLong) schema      -- the names are strings: a number it cannot be
+      -- once with the events sealed (the sealed fold refuses), once with them in the log (the log's fold refuses)
+      forM_ [True, False] $ \sealed -> do
+        let dir  = dir0 </> show sealed
+            kdir = dir </> khanaDirName (KhanaDtlv exe)
+            -- everything the khana holds (its catalog of types, and its datoms), as `dtlv dump` writes it
+            catalog = do out <- readProcess exe ["-d", kdir, "dump", "-g"] ""
+                         pure (sort (lines out))
+            what s = (if sealed then "sealed: " else "in the log: ") ++ s
+        h <- openHosiWith cfg dir schema
+        _ <- person h "Frege" 70
+        when sealed (void (seal h))
+        closeHosi h
+        before <- catalog
+        check (what "the dump has the names in it") (any (":person/name" `isInfixOf`) before)
+        r <- try (openHosiWith cfg dir schemaLong) :: IO (Either HosiError Hosi)
+        check (what "the open was refused") (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+        checkEq (what "the khana is as it was") before =<< catalog)
+
+  , ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       r <- try (openHosiWith ((backendCfg (KhanaDtlv "/no/such/dtlv")) { hcClock = clock }) dir schema) :: IO (Either HosiError Hosi)
       check "a missing dtlv is a BadArgument" (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
@@ -2359,7 +2501,7 @@ nativeTests exe =
       m0 <- calls
       h2 <- openHosiWith cfg (dir </> "db") schema
       m1 <- calls
-      checkEq "open and catch up on five batches: start, read the seq, one transaction" 3 (m1 - m0)
+      checkEq "open and catch up on five batches: look at the bookkeeping, start, one transaction" 3 (m1 - m0)
       checkEq "verify" [] =<< verify h2
       closeHosi h2)
 

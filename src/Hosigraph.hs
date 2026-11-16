@@ -54,6 +54,7 @@ module Hosigraph
 
 import           Control.Exception
 import           Control.Monad
+import           Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import           Data.IORef
@@ -173,23 +174,55 @@ withHosi :: FilePath -> Schema -> (Hosi -> IO a) -> IO a
 withHosi dir schema = bracket (openHosi dir schema) closeHosi
 
 -- | Get a khana that agrees with the events.
+--
+-- A khana that is healthy, was folded under this very schema (it keeps a mark of it, see 'schemaMark') and is
+-- only behind, catches up in place.  Every other khana is made again from the events, /beside/ the old one, and takes
+-- its place only when it is whole (so a schema that cannot be applied leaves the old khana and the log as they were).
 recoverKhana :: Hosi -> Word64 -> IO Khana
 recoverKhana h lastS = do
-  r <- try (openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h))
+  -- Look at the old khana first, with only its own bookkeeping declared (see 'peekKhana'): the schema may still be refused.
+  r <- try (peekKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h))
   case r of
-    Left (_ :: SomeException) -> rebuildFresh
-    Right conn -> do
-      (fs, gen) <- foldedState conn
+    Left (_ :: SomeException) -> rebuildBeside False      -- it cannot be opened: which schema it was made under is not known
+    Right (fs, gen, mark) -> do
       mgen <- E.eraseGeneration ev
-      if fs > lastS || gen /= mgen
-        then closeKhana conn >> rebuildFresh              -- the khana saw a write the events never kept, or has not followed an erase (or is ahead of one)
-        else catchUp conn fs >> pure conn
+      let same = mark == Just (schemaMark (hSchema h))
+          mustRebuild =
+               fs > lastS || gen /= mgen    -- the khana saw a write the events never kept, or has not followed an erase (or is ahead of one)
+            || fs == 0 && lastS > 0         -- it holds nothing, and there are events (it was lost)
+            || fs > 0 && not same           -- it was made under another schema, or from before the mark was kept
+      if mustRebuild
+        then rebuildBeside same
+        else do
+          conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+          unless same (setSchemaMark conn (hSchema h))   -- only an empty khana with no events behind it gets here unmarked
+          catchUp conn fs
+          pure conn
   where
     ev = hEvents h
-    rebuildFresh = do
-      removePathForcibly (khanaDir h)
-      (conn, _) <- buildKhana h (khanaDir h)
-      pure conn
+    -- Fold a new khana from the events beside the old one, and put it in the old one's place when it is whole.
+    -- @same@: the old khana says it was made under this very schema.  Then a logged batch the new khana refuses is one
+    -- nobody was told was written (a crash between the log and the fold), and it is cut.  Otherwise the /schema/ may be what
+    -- refuses it, and a batch that was acknowledged is not ours to cut: the open stops, and nothing is touched.
+    rebuildBeside same = do
+      let fresh = freshDir h
+      removePathForcibly fresh
+      (conn, refused) <- buildKhana h fresh `catch` \(ex :: SomeException) -> do
+        removePathForcibly fresh
+        case fromException ex of
+          Just (Corrupt m) | not same, foldRefused `isPrefixOf` m -> throwIO (BadArgument (schemaRefused m))
+          _                                                       -> throwIO ex
+      closeKhana conn
+      unless (null refused) $
+        if same
+          then do batches <- E.tailBatches ev
+                  E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
+          else do removePathForcibly fresh
+                  throwIO (BadArgument (schemaRefused (show (length refused) ++ " logged batch(es) that the khana refuses (none was cut)")))
+      placeFreshKhana h fresh
+      openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+    schemaRefused why = "the schema cannot be applied to this world: " ++ why
+      ++ ".  The khana and the log were left as they were; open it again with the schema the khana was made with"
     catchUp conn fs = do
       top <- newIORef fs
       E.eventsAfterEach ev fs (foldGroup top conn)
@@ -232,14 +265,15 @@ buildKhana :: Hosi -> FilePath -> IO (Khana, [[Event]])
 buildKhana h target = do
   let ev = hEvents h
   conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) target (hSchema h)
-  top <- newIORef 0
-  E.eventsAfterEach ev 0 (foldGroup top conn)
-  mgen <- E.eraseGeneration ev                         -- the events left the erased ids out, so this khana is up to date with them
-  when (mgen > 0) (setEraseGen conn mgen)
-  batches <- E.tailBatches ev
-  top' <- readIORef top
-  refused <- foldTail conn top' batches
-  pure (conn, refused)
+  (do top <- newIORef 0
+      E.eventsAfterEach ev 0 (foldGroup top conn)
+      mgen <- E.eraseGeneration ev                     -- the events left the erased ids out, so this khana is up to date with them
+      when (mgen > 0) (setEraseGen conn mgen)
+      batches <- E.tailBatches ev
+      top' <- readIORef top
+      refused <- foldTail conn top' batches
+      setSchemaMark conn (hSchema h)                   -- whole: say which schema it was folded under
+      pure (conn, refused)) `onException` closeKhana conn
 
 -- ---------------------------------------------------------------------------
 -- Writing
@@ -600,12 +634,14 @@ rebuildKhanaLocked h = do
   removePathForcibly fresh
   (newConn, refused) <- buildKhana h fresh
   closeKhana newConn
-  installFreshKhana h fresh
-  unless (null refused) $ do
-    -- same rule as at open: a logged batch the khana refuses is not part of the world
-    batches <- E.tailBatches ev
-    E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
-  where ev = hEvents h
+  if null refused
+    then installFreshKhana h fresh
+    else do
+      -- The schema is the one this khana has been folded under since open, so a batch it takes now is one it took
+      -- when it was written.  If it refuses one anyway, something is wrong, and an acknowledged write is not ours to cut.
+      removePathForcibly fresh
+      throwIO (Corrupt ("the khana refuses " ++ show (length refused) ++ " logged batch(es) that were acknowledged; "
+                        ++ "the log was not cut and the khana is as it was"))
 
 -- | Make the khana a compacted copy of itself, stamped as clean at erase number @gen@.  For a caller that holds the events
 -- lock (so nothing is written to the khana meanwhile).  The copy is made in the 'freshDir', opened to be stamped and to be
@@ -631,11 +667,17 @@ installFreshKhana :: Hosi -> FilePath -> IO ()
 installFreshKhana h fresh = do
   old <- readIORef (hKhana h)
   closeKhana old
+  placeFreshKhana h fresh
+  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+  writeIORef (hKhana h) conn
+
+-- | Move the khana built in @fresh@ to the live place, over whatever is there.  Nothing may have the old one open.  (A crash
+-- between the removal and the move leaves no khana, and the next open makes one from the events.)
+placeFreshKhana :: Hosi -> FilePath -> IO ()
+placeFreshKhana h fresh = do
   removePathForcibly (khanaDir h)
   renameDirectory fresh (khanaDir h)
   syncDir (hDir h)
-  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
-  writeIORef (hKhana h) conn
 
 -- | Check everything checkable: the manifest's signature, every chunk file's hash and
 -- footer, every MPHF (each id finds exactly its own events), and that the live khana

@@ -65,13 +65,22 @@ In the prototype, **the core material answers "now", and the MPHF answers "the l
 In Phase 3, the invalidation record (Erase) joins the `history` path (and asks earlier than the design says: see item 9).
 How Erase works on the "now" path (does the data stay in the core material until the cleanup?) is answered in item 9 too: yes, it stays until `clean`.
 
-## 6. Nobody stores the schema
+## 6. The schema is an argument of open, and the khana keeps a mark of it
 
 Whether an attribute has cardinality one or many changes the meaning of Create (replace or add).
 So **the result of the fold depends on the schema**.
-You give the schema when you open. Nobody stores it.
-If you reopen with a different schema and build the core material again, "now" can be different.
-The simplest fix is to store the schema (or its hash) in the manifest and compare it at open.
+You give the schema when you open. The events do not store it.
+The khana does keep a mark of it (a hash of every attribute's name, type, cardinality and uniqueness), written when the khana is whole.
+At open the mark is compared with the schema you gave:
+
+* the same: the khana catches up in place, as before;
+* different (or from a khana made before the mark was kept, or a khana that holds nothing while events exist): the khana is made again from the events, **beside the old one**, and takes its place only when it is whole;
+* the events (sealed) or the log (unsealed) refuse the new schema: **open stops** with `BadArgument`, and the old khana and the log are left as they were. Open again with the schema they were made with.
+
+To read the mark, the old khana is opened with only its own bookkeeping declared, and the schema you gave goes to it only when it is kept. Datalevin writes the schema it is opened with into the file (even one that holds data of another type), so a schema that may still be refused must not be given to a khana that is to be left as it was. (A refused open used to change the type of an attribute in the old khana's catalog; a test now compares the whole of what `dtlv dump` shows, before and after.)
+
+A batch in the log that the khana refuses is cut (as a crash leftover: nobody was told it was written) only when the khana says it was made under this very schema. Under a different or an unknown schema it may be the schema that refuses it, so nothing is cut.
+Any change of the schema, even a new attribute, makes the khana again: a new attribute may already have events (Datalevin takes attributes nobody declared), and the events cannot be asked cheaply.
 
 ## 7. The 63 bits of the ID
 
