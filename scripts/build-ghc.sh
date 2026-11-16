@@ -6,6 +6,7 @@
 #
 #   scripts/build-ghc.sh app    -> build/hosigraph-demo
 #   scripts/build-ghc.sh test   -> build/hosigraph-test
+#   scripts/build-ghc.sh bench  -> build/hosigraph-bench   (the numbers of the guide; see the head of scripts/bench.hs)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 target="${1:-app}"
@@ -14,5 +15,6 @@ common=(-isrc -itakka/src -Wall -Wno-name-shadowing -O1 -threaded -rtsopts -outp
 case "$target" in
   app)  ghc "${common[@]}" -iapp  app/Main.hs   -o build/hosigraph-demo ;;
   test) ghc "${common[@]}" -itest test/Spec.hs  -o build/hosigraph-test ;;
-  *) echo "usage: $0 [app|test]"; exit 1 ;;
+  bench) ghc "${common[@]}" scripts/bench.hs    -o build/hosigraph-bench ;;
+  *) echo "usage: $0 [app|test|bench]"; exit 1 ;;
 esac
