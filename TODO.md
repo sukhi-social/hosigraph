@@ -1,5 +1,71 @@
 # TODO
 
+## 0.1.0: the first version you can keep data in (draft)
+
+**Status:** a draft of 2026-11-16 (Shiro, after a question from nyanrus). Nothing here is decided except where it says so.
+The package is `0.0.1.0` and calls itself "Phase 1 prototype". In the PVP the next major is `0.1.0.0`; the number is cheap, what it promises is not.
+
+**What 0.1.0 would say:** hosigraph is an embedded database for **one process on one machine, on a local disk**. What you write is kept.
+What 0.1.0 wrote, any 0.1.x reads. The names it lists as public stay; the others may change.
+It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar), and says so on the first screen of the README.
+
+### Needed
+
+1. **Refuse a second open of the same world.** *Done on 2026-11-16. With both khanas (`dtlv` and the JVM, Datalevin 1.2.10, Temurin 21): 180 passed, 0 failed; the C door's conformance script passes.*
+   * *Tried first* (events only, two processes, one directory, both writing), and it does break. 300 writes each, no seal: both were told that all went well, and **300 of the 600 records were left**
+     (each process appends at the offset it remembers, so they overwrite each other); `verify` passed. With a seal every 20 writes: one process died on `rename manifest.tmp` (both use the same temp name),
+     the other went on, and 200 events were left. (The probe is not in the repository.)
+   * *Done:* `Hosigraph.WorldLock`: `flock(2)` (`LOCK_EX | LOCK_NB`) on `events/lock`, close-on-exec (so the `java` or `dtlv` that hosigraph starts does not keep it alive). `openEvents` takes it first
+     and `closeEvents` lets it go last; a second opener, in this process or another, gets `WorldBusy` and nothing is touched (a test checks that a chunk directory the manifest does not list is not swept).
+     `openHosiWith` now opens the events *before* it starts the khana runtime, so a second opener never starts a JVM, and `closeHosi` closes the khana and the runtime *before* the events, so nobody opens on top of an open khana.
+   * *Tests* (each was seen to fail with the lock turned off): the same process; another process holds it, and is killed with SIGTERM, so it is free again; an open that fails after the lock does not keep it.
+   * *Not decided:* a second process that only wants to **read** is refused too. A backup or an inspector would want to read (see "A backup call" below). A shared lock for readers is possible with the same `flock`; but a reader would see a world whose owner may seal.
+   * *Also run:* the Hosi path (the new order of open and close) with each khana: a test opens a world twice through `openHosiWith`, and the second is `WorldBusy` with nothing under the world touched, khana files included.
+     "A second opener never starts a JVM" is by the order of the code (the lock comes before `newKhanaRuntime`); no test proves it.
+   * *Not done:* the Elixir binding's own tests (`hosigraph-ex`, `mix test`) were not run. Network file systems and Windows are out of scope; the guide says so.
+2. **The shape on disk is a promise, and a test holds it.**
+   * Formats that exist: `hosi-manifest/1` and `/2`, `HOSICHK1` (chunk version 1 and 2), `HOSIERS1`, the tail log. The khana is derived and promised nothing (a different one is simply made again).
+   * Put a small world written by 0.1.0 into `test/` (chunks of both versions, a cold chunk, an erase record, a tail that is not sealed) and open it with every later build, with each khana backend.
+   * Whether the tail log carries a format mark was **not checked**. If it does not, add one before 0.1.0: it is cheapest now.
+3. **Errors that say which kind they are.** *Mostly done on 2026-11-16: three kinds added; the fourth is left, and why.*
+   * Listed where each `BadArgument` was thrown (`grep`, 2026-11-16) and grouped by what a caller does: the program is missing (3 places in `checkBackend`) → `BackendMissing`; the schema is refused (2 places in `recoverKhana`) → `SchemaRefused`;
+     the world is open already (new) → `WorldBusy`. What is left in `BadArgument` is a wrong call: an empty batch, a reserved id, an erased id, a range that ends before it starts, a pull sent to `query`, a directory that exists for `backfillSince`, an unknown chunk version.
+     Two places (`Khana.hs`, "needs a KhanaRuntime made for it") are the caller's mistake in assembling the config; they stay `BadArgument`.
+   * The C door tells the new kinds (`world-busy`, `backend-missing`, `schema-refused`); `errorKind` is exhaustive over `HosiError`, so a fourth would not build until it is told. **This is visible to hosts:** a backend that is missing was `bad-argument`
+     and is now `backend-missing` (the ABI test that said so was changed). The Elixir binding takes the kind as an atom, so it needs no change, but its tests were not run here.
+   * **Left:** "the khana backend died". It is a `DtlvError` (a bare string, not a `HosiError`), thrown in about a dozen places, and some of them are the caller's fault: an unreadable query, a value that has no EDN form. The C door tells it `HOSI_ERR_INTERNAL`.
+     To make it a kind (say `KhanaFailed`) the caller's own mistakes there must be told apart first. It is a bigger change, and the guide says that it waits.
+4. **Draw the line around the public names.**
+   * `Hosigraph` exports a wide surface (the probe words, `LookupTrace`, `Stats`, …), and `hosigraph.cabal` exposes more modules than the README talks about. Decide what is *stable* and what is *experimental*; say it in the haddock and the guide.
+     `backfillSince` and `Coverage` would be experimental. "You can also use `Hosigraph.Events` alone" (guide) is a promise too: keep it, or take it back.
+   * Change `synopsis`, `description` and the README's "A prototype" to say what 0.1.0 means.
+5. **Numbers on one page** (a table in the guide's "Limits", with the machine they were taken on).
+   * The worst open: a khana that must be made again (an old one, or a changed schema). Measured on 2026-11-16, 528,000 events with `dtlv`: **71 to 111 s**.
+   * A write one by one, `writeMany`, `getEntity`, `query`; the open of a world that is only behind.
+   * Memory. The guide says the resident JVM's memory "is not measured", but a run on 2026-11-13 (made-up data, 100,000 people) saw about 300 MB resident that a smaller heap did not remove. Take it again, and put it in.
+
+### Would help, and 0.1.x is soon enough
+
+* **A backup call.** The khana is derived, so `events/` alone is a backup. Open: may it be copied while writes go on (seal first, under the lock?), or only when the `Hosi` is closed?
+* **Many threads.** The guide lists as not tested: `clean` from two threads at once, many readers while `seal` or `erase` runs, and "the world changed between the read and the lock" in a rewrite.
+* **Linux, for real.** CI runs on ubuntu with the JVM khana only; the native `dtlv` is not run there, and the `abi` job has been seen to pass on macOS only. Windows has no `System.Posix`; say it.
+
+### Not in 0.1.0
+
+S3 (the section below), live serving of a backfill (the section after it), distribution and sync, metrics, JSON-LD import, thaw and compression of cold chunks.
+The reason is one sentence: "local, one process" can be promised now; S3 brings failures of the network, which is a different promise (0.2).
+
+### Open for nyanrus: how strongly to say "embedded"
+
+The khana needs a program outside the process, and the in-process one was taken out on purpose (see "Notes on the current state" in the guide).
+
+* **(a)** 0.1.0 says it plainly: embedded, and it brings Datalevin along. This is the leaning. It keeps 0.1.0 near.
+* **(b)** Wait for a khana inside the process. 0.1.0 then moves far away, and nothing in the repository starts that work.
+
+If the first users are sukhi and tacchaka-matrix, (a) probably promises enough; that is a guess, not something asked.
+
+**Done when:** items 1 to 5 each have a test or a line in the guide, and the first paragraph of the README says what it needs.
+
 ## Phase 2, the S3 part — against RustFS
 
 **Decided (2026-11-12, nyanrus):** the object store we build and test against is **RustFS**
