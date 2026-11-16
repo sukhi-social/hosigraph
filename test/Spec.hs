@@ -13,7 +13,7 @@ import qualified Data.ByteString.Char8 as BC
 import           Data.Bits (xor)
 import           Data.IORef
 import           Data.Int (Int64)
-import           Data.List (sort, sortOn, nub, isInfixOf)
+import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
@@ -72,6 +72,7 @@ main = do
   args <- getArgs
   case args of
     ["--hold-world", dir] -> holdWorld dir        -- a helper for the world-lock tests: not a test run
+    ["--make-fixture", dir] -> makeFixture dir    -- writes test/fixtures/world-0.1.0 (see "The shape on disk is a promise"); not a test run
     _                     -> runTests
 
 -- | Run again by the world-lock test as a second process: open this world, say so, and hold it until stdin is closed.
@@ -96,10 +97,10 @@ runTests = do
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
       nativeRun = case mexe of
-        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ nativeTests exe)
+        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ formatHosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ nativeTests exe)
         Nothing  -> []
       jvmRun = case mjar of
-        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
+        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
         Nothing  -> []
       mixedRun = case (mexe, mjar) of
         (Just exe, Just jar) -> tag "[dtlv+jvm]" (mixedTests exe java jar)
@@ -107,7 +108,7 @@ runTests = do
       dtlvRun = nativeRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
-  results <- forM (pureTests ++ worldLockTests ++ dtlvRun) $ \(name, act) -> do
+  results <- forM (pureTests ++ worldLockTests ++ formatTests ++ dtlvRun) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -193,6 +194,235 @@ worldLockTests =
       r <- try (openHosiWith defaultConfig { hcKhanaBackend = KhanaDtlv "/no/such/dtlv" } (dir </> "w") schema) :: IO (Either HosiError Hosi)
       check "BackendMissing" (case r of Left (BackendMissing _) -> True; _ -> False)
       checkEq "...and no directory was made" False =<< doesDirectoryExist (dir </> "w"))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- The shape on disk is a promise
+--
+-- @test/fixtures/world-0.1.0/@ is a world that 0.1.0 wrote (made by @--make-fixture@ below, and kept).  Every later build
+-- must open it, show the events it holds, and (with each khana) answer as it was written: that is what "what 0.1.0 wrote,
+-- any 0.1.x reads" means.  If a change makes these tests fail, it is a change of the format, and the format is the promise.
+-- Do not make the fixture again to make them pass.
+
+fixtureDir :: FilePath
+fixtureDir = "test" </> "fixtures" </> "world-0.1.0"
+
+renderValue :: Value -> String
+renderValue v = case v of
+  VInt n          -> "i:" ++ show n
+  VDouble d       -> "d:" ++ show d
+  VStr t          -> "s:" ++ show (T.unpack t)
+  VBool b         -> "b:" ++ (if b then "t" else "f")
+  VKw (Keyword k) -> "k:" ++ T.unpack k
+
+renderEvent :: E.Event -> String
+renderEvent e = unwords [ show (E.evSeq e), E.kindName (E.evKind e), show (E.evId e), attrName, renderValue (E.evVal e) ]
+  where attrName = case E.evAttr e of Keyword a -> T.unpack a
+
+-- | Every event the world shows, in order: the sealed ones (the erased are not among them), then the tail.
+dumpWorld :: Ev.Events -> IO [String]
+dumpWorld ev = do
+  sealed <- Ev.withEventsLock ev (Ev.eventsAfter ev 0)
+  tl     <- Ev.tailBatches ev
+  pure (map renderEvent sealed ++ [ "tail " ++ renderEvent e | b <- tl, e <- b ])
+
+-- | An entity as "now" shows it, one line: attributes in order, the values of each in order.
+renderEntity :: HosiId -> M.Map Keyword [Value] -> String
+renderEntity i m = unwords ("entity" : show i : [ T.unpack k ++ "=" ++ intercalate "," (sort (map renderValue vs)) | (Keyword k, vs) <- M.toList m ])
+
+-- | Make the fixture world: @root/events/@ and @root/expected.txt@.  It is made at the events layer, so no khana program is needed.
+-- The world has: chunks of both versions (October was written as version 1, the way 0.0.1.0 did), a cold chunk (November),
+-- an erase record (on the version 1 chunk), and a tail that is not sealed.  The @entity@ lines of @expected.txt@ are written by hand here
+-- (what each person should be), not read back from the world.
+makeFixture :: FilePath -> IO ()
+makeFixture root = do
+  removePathForcibly root
+  let evDir = root </> "events"
+  (clk, clock) <- newClock oct18
+  let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+      put ev ops = Ev.withEventsLock ev (do rc <- Ev.record ev ops; Ev.commit ev rc; pure (Ev.rcTemps rc))
+      str = Lit . VStr
+  -- October: three people.  Then the chunks are written again as version 1.
+  ev1 <- Ev.openEvents cfg evDir
+  t1 <- put ev1 [ Create (Tmp 1) "person/name" (str "Ada"), Create (Tmp 1) "person/age" (Lit (VInt 36))
+                , Create (Tmp 2) "person/name" (str "Bo"), Create (Tmp 2) "person/score" (Lit (VDouble 1.5))
+                , Create (Tmp 2) "person/friend" (RefTo (Tmp 1)), Create (Tmp 2) "person/tag" (str "x"), Create (Tmp 2) "person/tag" (str "y")
+                , Create (Tmp 3) "person/name" (str "Cy") ]
+  _ <- Ev.seal ev1
+  Ev.closeEvents ev1
+  toVersion1 evDir (2026, 10)
+  -- November: Dan; Ada is a year older (a newer Create wins); Bo loses a tag
+  writeIORef clk nov11
+  ev2 <- Ev.openEvents cfg evDir
+  let (ada, bo, cy) = (t1 M.! 1, t1 M.! 2, t1 M.! 3)
+  t2 <- put ev2 [ Create (Tmp 1) "person/name" (str "Dan"), Create (Tmp 1) "person/friend" (RefTo (Id ada))
+                , Create (Id ada) "person/age" (Lit (VInt 37)), Delete (Id bo) "person/tag" (str "y") ]
+  _ <- Ev.seal ev2
+  -- December: Eve; November goes cold; Cy is erased; and a last batch stays in the tail
+  writeIORef clk dec05
+  t3 <- put ev2 [ Create (Tmp 1) "person/name" (str "Eve") ]
+  _ <- Ev.seal ev2
+  _ <- Ev.freezeUnit ev2 (KCreate, (2026, 11))
+  _ <- Ev.withEventsLock ev2 (Ev.eraseNow ev2 (Erase.fromIds [cy]))
+  t4 <- put ev2 [ Create (Tmp 1) "person/name" (str "Fay"), Create (Id bo) "person/tag" (str "z"), Delete (Id bo) "person/score" (Lit (VDouble 1.5)) ]
+  Ev.closeEvents ev2
+  ev3 <- Ev.openEvents cfg evDir
+  events <- dumpWorld ev3
+  Ev.closeEvents ev3
+  let (dan, eve, fay) = (t2 M.! 1, t3 M.! 1, t4 M.! 1)
+      entity i rows = unwords ("entity" : show i : rows)
+  writeFile (root </> "expected.txt") $ unlines $
+    [ "# What world-0.1.0 shows.  `event` lines: the events, in order (made by --make-fixture, read back).  `entity` lines: what \"now\" must say (written by hand there)." ]
+    ++ [ "event " ++ l | l <- events ]
+    ++ [ entity ada ["person/age=i:37", "person/name=s:\"Ada\""]
+       , entity bo  ["person/friend=i:" ++ show ada, "person/name=s:\"Bo\"", "person/tag=s:\"x\",s:\"z\""]
+       , entity cy  []
+       , entity dan ["person/friend=i:" ++ show ada, "person/name=s:\"Dan\""]
+       , entity eve ["person/name=s:\"Eve\""]
+       , entity fay ["person/name=s:\"Fay\""] ]
+
+-- | Write the Create chunks of one month again as version 1 (what 0.0.1.0 wrote), and let the manifest say so.
+toVersion1 :: FilePath -> Month -> IO ()
+toVersion1 evDir month = do
+  mf <- readManifest evDir
+  chunks <- forM (mfChunks mf) $ \c ->
+    if ceKind c /= KCreate || ceMonth c /= month then pure c else do
+      let old = evDir </> "chunks" </> ceName c
+          new = old ++ ".v1"
+      evs   <- openChunkReader old >>= readChunkEvents
+      ci    <- writeChunkVersion 1 new 4 (ceKind c) (ceMonth c) evs
+      files <- hashChunkFiles new
+      removePathForcibly old
+      renameDirectory new old
+      pure (entryFromInfo (ceName c) ci [ FileEntry n b h | (n, b, h) <- files ])
+  writeManifest evDir mf { mfChunks = chunks }
+
+-- | The fixture, copied to a place of its own (opening a world writes to it).
+withFixture :: (FilePath -> IO a) -> IO a
+withFixture act = withTmp $ \tmp -> do
+  there <- doesDirectoryExist fixtureDir
+  unless there $ throwIO (userError (fixtureDir ++ " is not here: run the tests from the package directory"))
+  copyDir fixtureDir (tmp </> "w")
+  act (tmp </> "w")
+
+expectedLines :: FilePath -> IO [String]
+expectedLines dir = filter (\l -> not (null l) && take 1 l /= "#") . lines <$> readFile (dir </> "expected.txt")
+
+formatTests :: [Test]
+formatTests =
+  [ ("format: the world 0.1.0 wrote is read as it was written: every event in order, the sealed ones then the tail, the erased person gone; and it verifies", withFixture $ \dir -> do
+      expected <- expectedLines dir
+      ev <- Ev.openEvents Ev.defaultEventsConfig (dir </> "events")
+      got <- dumpWorld ev
+      checkEq "the events" [ drop 6 l | l <- expected, take 6 l == "event " ] got
+      (readable, problems) <- Ev.withEventsLock ev (Ev.verifyEvents ev)
+      checkEq "verify: no problems" (True, []) (readable, problems)
+      Ev.closeEvents ev)
+
+  , ("format: the fixture holds what it says: chunks of both versions, a cold chunk, an erase record, a tail that is not sealed", withFixture $ \dir -> do
+      let evDir = dir </> "events"
+      raw <- B.readFile (evDir </> manifestFile)
+      check "the manifest is hosi-manifest/2 (it has an erase record)" ("\"hosi-manifest/2\"" `B.isInfixOf` raw)
+      mf <- readManifest evDir
+      versions <- forM (mfChunks mf) $ \c -> do
+        bs <- B.readFile (evDir </> "chunks" </> ceName c </> chunkDataFile)
+        pure (B.take 4 (B.drop 8 bs))                                      -- the version, after the 8 bytes of magic
+      checkEq "chunk versions in the world" [B.pack [0, 0, 0, 1], B.pack [0, 0, 0, 2]] (sort (nub versions))
+      let cold = [ c | c <- mfChunks mf, ceTier c == "cold" ]
+      check "a cold chunk" (not (null cold))
+      forM_ cold $ \c -> checkEq "...has no mphf.idx" False =<< doesFileExist (evDir </> "chunks" </> ceName c </> chunkMphfFile)
+      let records = [ fe | c <- mfChunks mf, Just fe <- [ceErase c] ]
+      check "an erase record" (not (null records))
+      forM_ records $ \fe -> checkEq "...and its file is there" True =<< doesFileExist (evDir </> "erase" </> feName fe)
+      check "a tail that is not sealed" . (> 0) =<< getFileSize (evDir </> tailFile))
+
+  , ("format: a world written under a newer format is refused, and left as it was (a tail that begins with the reserved HOSI; a manifest of another format)", do
+      forM_ [("tail", newerTail), ("manifest", newerManifest)] $ \(what, mutate) -> withFixture $ \dir -> do
+        let evDir = dir </> "events"
+        mutate evDir
+        r1 <- try (Ev.openEvents Ev.defaultEventsConfig evDir)
+        check (what ++ ": refused as Corrupt, not opened and not cut") (case r1 of Left (Corrupt _) -> True; _ -> False)
+        case r1 of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+        before <- filter ((/= "lock") . fst) <$> listAll evDir
+        tailBefore <- B.readFile (evDir </> tailFile)
+        r2 <- try (Ev.openEvents Ev.defaultEventsConfig evDir)
+        check (what ++ ": and again") (case r2 of Left (Corrupt _) -> True; _ -> False)
+        case r2 of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+        checkEq (what ++ ": every file is as it was") before . filter ((/= "lock") . fst) =<< listAll evDir
+        checkEq (what ++ ": the tail is as it was") tailBefore =<< B.readFile (evDir </> tailFile))
+
+  , ("tail: a bad record with a whole one after it is damage in the middle, and is refused (Corrupt) and not cut; a bad last record cannot be told from a torn end, and is cut", withTmp $ \dir -> do
+      let ev n = E.Event n KCreate 10 "a" (VInt (fromIntegral n))
+          (b1, b2) = ([ev 1], [ev 2])
+          path = dir </> tailFile
+      tl <- openTail dir False
+      starts <- appendBatches tl [b1, b2, [ev 3]]                    -- where each of the three begins
+      closeTail tl
+      whole <- B.readFile path
+      let at2 = fromIntegral (starts !! 1) :: Int
+          at3 = fromIntegral (starts !! 2) :: Int
+          flipAt n bs = B.concat [B.take n bs, B.singleton (B.index bs n `xor` 0xff), B.drop (n + 1) bs]
+          readIt = try (readTail dir) :: IO (Either HosiError ([[E.Event]], Integer))
+          kept r = either (const Nothing) Just r
+          damaged what n from = do
+            B.writeFile path (flipAt n whole)
+            r <- readIt
+            check (what ++ ": refused as Corrupt, and it says where the bad record begins")
+              (case r of Left (Corrupt m) -> ("the record at byte " ++ show from ++ " ") `isInfixOf` m; _ -> False)
+            checkEq (what ++ ": the file is as it was") (flipAt n whole) =<< B.readFile path
+      damaged "the payload of the second of three" (at2 + 10) at2
+      damaged "the CRC of the second of three" (at2 + 4) at2
+      damaged "the length of the second of three (it says something huge)" at2 at2
+      damaged "the first of three" 10 (0 :: Int)
+      -- the last one: nothing follows it, so a flipped byte looks like a crash that left half a record
+      B.writeFile path (flipAt (at3 + 10) whole)
+      checkEq "the last of three damaged: the first two are kept, the good part ends where it begins" (Just ([b1, b2], fromIntegral at3)) . kept =<< readIt
+      B.writeFile path (B.take (B.length whole - 3) whole)
+      checkEq "the last of three torn: the same" (Just ([b1, b2], fromIntegral at3)) . kept =<< readIt
+      -- through the open: refused, nothing cut, and the lock is let go (the second try is Corrupt too, not WorldBusy)
+      B.writeFile path (flipAt (at2 + 10) whole)
+      forM_ [1, 2 :: Int] $ \_ -> do
+        r <- try (Ev.openEvents Ev.defaultEventsConfig dir)
+        check "openEvents: refused as Corrupt" (case r of Left (Corrupt _) -> True; _ -> False)
+        case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+      checkEq "...and the tail is as it was" (flipAt (at2 + 10) whole) =<< B.readFile path)
+  ]
+  where
+    -- a log of a later format: a mark that begins with HOSI, then whatever it likes
+    newerTail evDir = do
+      t <- B.readFile (evDir </> tailFile)
+      B.writeFile (evDir </> tailFile) (B.concat ["HOSITAIL", B.pack [0, 2], t])
+    -- the same manifest, said to be of format 9, and signed again so that only the format is wrong
+    newerManifest evDir = do
+      raw <- B.readFile (evDir </> manifestFile)
+      let body  = fst (BC.break (== '\n') raw)
+          body' = BC.pack (replaceOnce "hosi-manifest/2" "hosi-manifest/9" (BC.unpack body))
+      B.writeFile (evDir </> manifestFile) (B.concat [body', "\nsha256:", BC.pack (sha256Hex body'), "\n"])
+    replaceOnce from to s = case [ (a, b) | n <- [0 .. length s], let (a, b) = splitAt n s, from `isPrefixOf` b ] of
+      ((a, b) : _) -> a ++ to ++ drop (length from) b
+      []           -> error ("replaceOnce: no " ++ from)
+
+-- | The same, with a khana: Hosi opens what 0.1.0 wrote, makes the khana from the events, and answers as written;
+-- and new writes go on top of the old world.
+formatHosiTests :: KhanaBackend -> [Test]
+formatHosiTests be =
+  [ ("format: Hosi opens the world 0.1.0 wrote, says what is written for each person, takes new writes on top, and says the same after a reopen", withFixture $ \dir -> do
+      expected <- expectedLines dir
+      let people = [ (read (words l !! 1) :: HosiId, l) | l <- expected, take 7 l == "entity " ]
+          sayAll h = forM_ people $ \(i, l) -> do m <- getEntity h i; checkEq ("entity " ++ show i) l (renderEntity i m)
+      h <- openHosiWith (backendCfg be) dir schema
+      sayAll h
+      checkEq "verify: no problems" [] =<< verify h
+      gus <- person h "Gus" 30
+      _ <- seal h
+      sayAll h
+      check "the new one is there" . M.member "person/name" =<< getEntity h gus
+      closeHosi h
+      h2 <- openHosiWith (backendCfg be) dir schema
+      sayAll h2
+      m <- getEntity h2 gus
+      check "...and Gus is still there after the reopen" (M.member "person/name" m)
+      closeHosi h2)
   ]
 
 -- ---------------------------------------------------------------------------

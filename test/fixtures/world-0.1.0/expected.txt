@@ -1,0 +1,22 @@
+# What world-0.1.0 shows.  `event` lines: the events, in order (made by --make-fixture, read back).  `entity` lines: what "now" must say (written by hand there).
+event 1 create 52546240512000000 person/name s:"Ada"
+event 2 create 52546240512000000 person/age i:36
+event 3 create 52546240512000001 person/name s:"Bo"
+event 4 create 52546240512000001 person/score d:1.5
+event 5 create 52546240512000001 person/friend i:52546240512000000
+event 6 create 52546240512000001 person/tag s:"x"
+event 7 create 52546240512000001 person/tag s:"y"
+event 9 create 56894894899200000 person/name s:"Dan"
+event 10 create 56894894899200000 person/friend i:52546240512000000
+event 11 create 52546240512000000 person/age i:37
+event 12 delete 52546240512000001 person/tag s:"y"
+event 13 create 61243549286400000 person/name s:"Eve"
+event tail 14 create 61243549286400001 person/name s:"Fay"
+event tail 15 create 52546240512000001 person/tag s:"z"
+event tail 16 delete 52546240512000001 person/score d:1.5
+entity 52546240512000000 person/age=i:37 person/name=s:"Ada"
+entity 52546240512000001 person/friend=i:52546240512000000 person/name=s:"Bo" person/tag=s:"x",s:"z"
+entity 52546240512000002
+entity 56894894899200000 person/friend=i:52546240512000000 person/name=s:"Dan"
+entity 61243549286400000 person/name=s:"Eve"
+entity 61243549286400001 person/name=s:"Fay"
