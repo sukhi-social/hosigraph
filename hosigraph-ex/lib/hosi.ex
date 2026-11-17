@@ -125,6 +125,30 @@ defmodule Hosi do
     request(conn, :highest, args)
   end
 
+  @doc """
+  Like `highest/4`, for the facts of some keys only: the newest `limit` of the notes of these authors. `attr` is a
+  tuple of exactly two attributes of one entity, `(key, order)` (`tuple ["note/by", "note/at"]` in the schema);
+  `keys` are values of the key part. Each one is `%{key: key, val: order_value, id: id}`, the largest order value
+  first and, among equal values, the largest id first, whichever key it has.
+
+      {:ok, page} = Hosi.highest_in(db, :"note/by+at", followed, 20)
+      {:ok, next} = Hosi.highest_in(db, :"note/by+at", followed, 20, after: List.last(page))
+
+  It costs about a seek per key and one per fact in the answer, whatever the facts' spread among the keys (walking
+  `highest/4` and dropping what is not wanted reads every fact newer than the last one that passes). The order
+  part has to be a long, the key part has a type (not `:any`), `keys` have the key part's type, and `after:` is a
+  long order value with an id; otherwise the answer is `{:error, {:app, :"bad-argument", message}}`.
+  """
+  def highest_in(conn, attr, keys, limit, opts \\ []) do
+    args = %{attr: attr, keys: keys, limit: limit}
+    args =
+      if place = Keyword.get(opts, :after),
+        do: Map.put(args, :after, Map.take(place, [:val, :id])),
+        else: args
+
+    request(conn, :"highest-in", args)
+  end
+
   @doc "Each query is `%{q: \"[:find ...]\", inputs: [[:scalar, v] | [:coll, vs] | [:rel, rows]]}`; `:inputs` may be left out."
   def query_many(conn, queries), do: request(conn, :"query-many", %{queries: queries})
   def query_cells_many(conn, queries), do: request(conn, :"query-cells-many", %{queries: queries})

@@ -35,6 +35,7 @@ data Backend = Backend
   , bSeal           :: IO (Maybe SealReport)
   , bGetEntities    :: [HosiId] -> IO [M.Map Keyword [Value]]
   , bHighest        :: Keyword -> Maybe (Value, HosiId) -> Int -> IO [Datom]
+  , bHighestIn      :: Keyword -> [Value] -> Maybe (Value, HosiId) -> Int -> IO [Datom]
   , bQueryMany      :: [(Text, [Input])] -> IO [[[Value]]]
   , bQueryCellsMany :: [(Text, [Input])] -> IO [[[Cell]]]
   , bHistory        :: HosiId -> IO [Event]
@@ -50,7 +51,7 @@ data Backend = Backend
 realBackend :: Hosi -> Backend
 realBackend h = Backend
   { bWrite = writeIf h, bWriteMany = writeMany h, bSeal = seal h
-  , bGetEntities = getEntities h, bHighest = highest h, bQueryMany = queryMany h, bQueryCellsMany = queryCellsMany h
+  , bGetEntities = getEntities h, bHighest = highest h, bHighestIn = highestIn h, bQueryMany = queryMany h, bQueryCellsMany = queryCellsMany h
   , bHistory = history h, bHistoryTrace = historyTrace h
   , bVerify = verify h, bStats = stats h, bRebuildKhana = rebuildKhana h
   , bErase = erase h, bClean = clean h, bFreeze = freeze h }
@@ -59,7 +60,7 @@ realBackend h = Backend
 -- (the reserved @ping@ and @abi@ are the dispatcher's, and still answer).
 unattached :: Backend
 unattached = Backend
-  { bWrite = \_ _ -> no0, bWriteMany = no1, bSeal = no0, bGetEntities = no1, bHighest = \_ _ _ -> no0, bQueryMany = no1
+  { bWrite = \_ _ -> no0, bWriteMany = no1, bSeal = no0, bGetEntities = no1, bHighest = \_ _ _ -> no0, bHighestIn = \_ _ _ _ -> no0, bQueryMany = no1
   , bQueryCellsMany = no1, bHistory = no1, bHistoryTrace = no1
   , bVerify = no0, bStats = no0, bRebuildKhana = no0
   , bErase = no1, bClean = no1, bFreeze = no1 }
@@ -77,6 +78,7 @@ handlers b =
   , ("seal",             run none        (const (bSeal b))   toEdn)
   , ("get-entities",     run decIds      (bGetEntities b)    toEdn)
   , ("highest",          run decHighest  (\(a, c, n) -> bHighest b a c n) encPlaces)
+  , ("highest-in",       run decHighestIn (\(a, ks, c, n) -> bHighestIn b a ks c n) encKeyedPlaces)
   , ("query-many",       run decQueries  (\qs -> readable qs >> bQueryMany b qs)      toEdn)
   , ("query-cells-many", run decQueries  (\qs -> readable qs >> bQueryCellsMany b qs) toEdn)
   , ("history",          run decId       (bHistory b)        toEdn)

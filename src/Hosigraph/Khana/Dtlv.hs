@@ -27,7 +27,7 @@
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
   ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..)
-  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvHighest, dtlvQueryCells
+  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvHighest, dtlvHighestIn, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
     -- * Taking out whole entities
@@ -278,6 +278,53 @@ dtlvHighest d a cur n0 = do
     , "(if (or (>= (count kept) n) (< (count rows) m))"
     , "(mapv (fn [x] [(:e x) (:a x) (:v x)]) (take n kept))"
     , "(recur (* 2 m))))))" ])
+  forM rows $ \r -> case r of
+    [EInt e, EKw k, v] -> Datom (fromInteger e) (Keyword k) <$> value v
+    _                  -> bad ("a datom row: " ++ show r)
+  where n = max 1 n0
+
+-- | The facts of a two-part tuple attribute @(key, order)@ from the high end of the order part, for the given keys only:
+-- at most @n@, the largest order value first and, among equal values, the largest entity id first, whichever key they
+-- are under.  With @Just (v, e)@ it starts after that place, as 'dtlvHighest' does.  The facts are the tuple's: their
+-- value is @VTuple [key, order]@.
+--
+-- It does not read the facts of the keys it is given; it reads the head of each key's run in the tuple's index (a seek
+-- each) and merges the runs lazily, taking the next of a key only when that key's head was taken, so the cost is about
+-- one seek per key plus one per fact answered, and does not depend on how the facts are spread among the keys.  (A walk
+-- from the top of the order that looks each fact's key up has no such bound: it reads every fact newer than the @n@th
+-- one that passes, and when the keys are quiet that is all of them.)
+--
+-- The tuple's index puts a key's facts together in order of the order part (tried with keys that are prefixes of one
+-- another, and not ASCII).  The order part has to be a long, because the walk of a key starts at the largest one.
+-- An entity that has the key and not the order part has a half-made tuple, @[key nil]@, at the low end of that key's
+-- run: it has no place in the order, and the walk of the key ends there.
+-- Facts that tie (the same key and order, which a tuple that is not unique allows) are told apart by the entity id, so
+-- the next fact of a key is found by asking for the facts at the same order value again and dropping the ones taken,
+-- never by "the order value minus one", which loses the ties.
+dtlvHighestIn :: Dtlv -> Keyword -> [Value] -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+dtlvHighestIn d a keys cur n0 = do
+  ks <- either bad (pure . T.unwords) (mapM ednVal keys)
+  (hi, skipE) <- case cur of
+    Nothing     -> pure ("9223372036854775807", "nil")
+    Just (v, e) -> do
+      vt <- either bad pure (ednVal v)
+      pure (vt, T.pack (show e))
+  rows <- asRows =<< readReply d (T.unwords
+    [ "(let [db @c a " <> ednKw a <> " n " <> T.pack (show n) <> " hi0 " <> hi <> " skip0 " <> skipE
+    , "desc (fn [x y] (compare [(nth y 0) (nth y 1)] [(nth x 0) (nth x 1)]))"
+    , "head (fn [k hi skip-e]"
+    , "(loop [m 2]"
+    , "(let [rs (vec (rseek-datoms db :ave a [k hi] nil m))"
+    , "x (first (drop-while (fn [x] (and skip-e (= k (first (:v x))) (= (second (:v x)) hi) (>= (:e x) skip-e))) rs))]"
+    , "(cond (and x (= k (first (:v x))) (some? (second (:v x)))) [(second (:v x)) (:e x) k]"
+    , "x nil"
+    , "(< (count rs) m) nil"
+    , ":else (recur (* 2 m))))))]"
+    , "(loop [pq (into (sorted-set-by desc) (keep (fn [k] (head k hi0 skip0)) (distinct [" <> ks <> "]))) out []]"
+    , "(if (or (= (count out) n) (empty? pq))"
+    , "out"
+    , "(let [top (first pq) [o e k] top nx (head k o e) pq (disj pq top)]"
+    , "(recur (if nx (conj pq nx) pq) (conj out [e a [k o]]))))))" ])
   forM rows $ \r -> case r of
     [EInt e, EKw k, v] -> Datom (fromInteger e) (Keyword k) <$> value v
     _                  -> bad ("a datom row: " ++ show r)

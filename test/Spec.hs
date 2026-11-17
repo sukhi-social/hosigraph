@@ -3166,6 +3166,92 @@ dtlvTests be =
         refused2 "a tuple" (highest h2 "f/pair" Nothing 3)
         closeHosi h2)
 
+  , ("dtlv: highestIn merges the runs of some keys: the newest first whoever wrote it, ties by id, a page after a page; the keys not asked for, a half-made tuple and what cannot be walked stay out", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          sch = M.fromList
+            [ ("note/by", attr TString), ("note/at", attr TLong), ("note/by+at", tuple ["note/by", "note/at"])
+            , ("x/any", attr TAny), ("x/txt", attr TString)
+            , ("r/by", ref), ("r/at", attr TLong), ("r/by+at", tuple ["r/by", "r/at"])
+            , ("x/three", tuple ["note/by", "note/at", "x/txt"]), ("x/txtorder", tuple ["note/by", "x/txt"])
+            , ("x/anykey", tuple ["x/any", "note/at"]) ]
+          -- authors that are prefixes of one another and one that is not ASCII; the notes of a group have the same author and time
+          authors = ["a", "a1", "a10", "a100", "b", "\233"] :: [T.Text]
+          spec = [ (authors !! (g `mod` 6), fromIntegral g * 10 + 5) | i <- [0 .. 59 :: Int], let g = i `div` 3 ] :: [(T.Text, Int64)]
+          newest ns = reverse (sortOn (\(_, t, e) -> (t, e)) ns)
+          mk (a, t, e) = Datom e "note/by+at" (VTuple [Just (VStr a), Just (VInt t)])
+          place (_, t, e) = (t, e)
+      h <- openHosiWith cfg dir sch
+      notes0 <- forM spec $ \(a, t) -> do
+        r <- write h [Create (Tmp 1) "note/by" (Lit (VStr a)), Create (Tmp 1) "note/at" (Lit (VInt t))]
+        pure (a, t, wrTemps r M.! 1)
+      -- a note with a key and no time, and one with a time and no key: a tuple that is half made
+      _ <- write h [Create (Tmp 1) "note/by" (Lit (VStr "a"))]
+      _ <- write h [Create (Tmp 1) "note/at" (Lit (VInt 99999))]
+      let wantFor ns ks = map mk [ x | x@(a, _, _) <- newest ns, a `elem` ks ]
+          ask ks cur n = highestIn h "note/by+at" (map VStr ks) cur n
+          sets = [ ["a"], ["a1"], ["a", "a1"], ["a1", "a10", "a100"], authors, ["b", "\233"], ["a", "a", "b"], ["a", "nobody"], ["nobody"], [] ] :: [[T.Text]]
+          pagesOf ks n = go Nothing
+            where go cur = do
+                    ds <- ask ks cur n
+                    case ds of
+                      [] -> pure []
+                      _  -> case dV (last ds) of
+                              VTuple [_, Just o] -> (ds :) <$> go (Just (o, dE (last ds)))
+                              v                  -> error ("a fact that is not a pair: " ++ show v)
+      forM_ sets $ \ks -> checkEq ("all of it for " ++ show ks) (wantFor notes0 ks) =<< ask ks Nothing 500
+      checkEq "the top four of all" (take 4 (wantFor notes0 authors)) =<< ask authors Nothing 4
+      forM_ [1, 2, 7, 100 :: Int] $ \n ->
+        forM_ [authors, ["a1", "a10"], ["a"]] $ \ks -> do
+          ps <- endsIn ("pages of " ++ show n) (pagesOf ks n)
+          checkEq ("pages of " ++ show n ++ " for " ++ show ks ++ " are all of it") (wantFor notes0 ks) (concat ps)
+          check "...and none is longer than the count" (all ((<= n) . length) ps)
+      -- the cursor is a place in the order: what is after it, and not itself; a place that nobody has works too
+      forM_ (map place notes0 ++ [(73, 5), (100000, 1), (-5, 1)]) $ \p@(t, e) ->
+        forM_ [authors, ["a1", "b"]] $ \ks ->
+          checkEq ("after " ++ show p ++ " for " ++ show ks)
+            (map mk [ x | x@(a, _, _) <- newest notes0, a `elem` ks, place x < p ]) =<< ask ks (Just (VInt t, e)) 500
+      -- it is "now": a fact that was taken out takes the note out of it (its tuple is half made), and so does an erase
+      let (a5, t5, e5) = notes0 !! 5
+          (_, _, e7)   = notes0 !! 7
+      _ <- write h [Delete (Id e5) "note/at" (Lit (VInt t5))]
+      _ <- erase h [EraseIds [e7]]
+      let notes1 = [ x | x@(_, _, e) <- notes0, e /= e5, e /= e7 ]
+      checkEq ("a deleted time (" ++ T.unpack a5 ++ ") and an erased note") (wantFor notes1 authors) =<< ask authors Nothing 500
+      -- the keys may be references (an author is an entity): three authors, twelve notes, some of the same author and time
+      let ents = [ e | (_, _, e) <- take 3 notes1 ]
+      rs <- forM [0 .. 11 :: Int] $ \i -> do
+        let au = ents !! (i `mod` 3); at = 1000 + fromIntegral (i `div` 4) :: Int64
+        r <- write h [Create (Tmp 1) "r/by" (RefTo (Id au)), Create (Tmp 1) "r/at" (Lit (VInt at))]
+        pure (au, at, wrTemps r M.! 1)
+      let wantR ks = [ Datom e "r/by+at" (VTuple [Just (VInt (fromIntegral au)), Just (VInt at)])
+                     | (au, at, e) <- reverse (sortOn (\(_, t, e) -> (t, e)) rs), au `elem` ks ]
+          askR ks cur n = highestIn h "r/by+at" (map (VInt . fromIntegral) ks) cur n
+      forM_ [[head ents], [head ents, ents !! 2], ents] $ \ks -> do
+        checkEq ("references as keys: " ++ show ks) (wantR ks) =<< askR ks Nothing 500
+        let go cur = do
+              ds <- askR ks cur 3
+              case ds of
+                [] -> pure []
+                _  -> case dV (last ds) of
+                        VTuple [_, Just o] -> (ds ++) <$> go (Just (o, dE (last ds)))
+                        v                  -> error ("a fact that is not a pair: " ++ show v)
+        checkEq ("...in pages of 3: " ++ show ks) (wantR ks) =<< endsIn "pages of references" (go Nothing)
+      -- what is refused is the caller's
+      let refused why act = do
+            r <- try act :: IO (Either HosiError [Datom])
+            check why (case r of Left (BadArgument _) -> True; _ -> False)
+      refused "a count of 0" (ask authors Nothing 0)
+      refused "an attribute that is not in the schema" (highestIn h "no/such" [VStr "a"] Nothing 3)
+      refused "an attribute that is not a tuple" (highestIn h "note/at" [VInt 1] Nothing 3)
+      refused "a tuple of three" (highestIn h "x/three" [VStr "a"] Nothing 3)
+      refused "an order part that is not a long" (highestIn h "x/txtorder" [VStr "a"] Nothing 3)
+      refused "a key part with no type" (highestIn h "x/anykey" [VInt 1] Nothing 3)
+      refused "a key of another type" (highestIn h "note/by+at" [VStr "a", VInt 7] Nothing 3)
+      refused "a cursor of another type" (highestIn h "note/by+at" [VStr "a"] (Just (VStr "x", 1)) 3)
+      checkEq "...and the khana is still good" [] =<< verify h
+      closeHosi h)
+
   , ("dtlv: a composite tuple is made by the khana: it is read and looked up, one pair is held once, it follows its parts, and it is not written", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let cfg = (backendCfg be) { hcClock = clock }

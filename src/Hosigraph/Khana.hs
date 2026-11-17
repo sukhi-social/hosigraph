@@ -40,7 +40,7 @@ module Hosigraph.Khana
   , khanaFoldedAndCount
     -- * Erasing
   , peekKhana, setEraseGen, setSchemaMark, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
-  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany, khanaHighest
+  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany, khanaHighest, khanaHighestIn
   ) where
 
 import           Control.Exception (SomeException, try, throwIO, finally)
@@ -335,6 +335,11 @@ khanaEntities k is = case k of
 khanaHighest :: Khana -> Keyword -> Maybe (Value, EntityId) -> Int -> IO [Datom]
 khanaHighest k a cur n = case k of
   DtlvKhana d -> dtlvHighest d a cur n
+
+-- | The facts of a two-part tuple attribute for some keys, from the high end of its order part, as 'dtlvHighestIn' gives them.
+khanaHighestIn :: Khana -> Keyword -> [Value] -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+khanaHighestIn k a keys cur n = case k of
+  DtlvKhana d -> dtlvHighestIn d a keys cur n
 
 -- | A Datalog query (EDN) against the khana.
 khanaQuery :: Khana -> Text -> [Q.Input] -> IO [[Value]]

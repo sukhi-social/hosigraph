@@ -37,6 +37,13 @@ defmodule HosiTest do
     assert {:error, {:app, :"bad-argument", _}} = Hosi.highest(db, :"note/at", 20, after: %{val: 1, id: 2})
   end
 
+  test "highest_in is read as the contract says: keys that are not a list, or a limit that is not a number, are :protocol; a call that is well formed reaches the library", %{db: db} do
+    assert {:error, {:protocol, _, _}} = Hosi.highest_in(db, :"note/by+at", "a", 20)
+    assert {:error, {:protocol, _, _}} = Hosi.highest_in(db, :"note/by+at", ["a"], "20")
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.highest_in(db, :"note/by+at", ["a"], 20)
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.highest_in(db, :"note/by+at", ["a"], 20, after: %{key: "a", val: 1, id: 2})
+  end
+
   test "write takes when: conditions; a condition that is not the shape is :protocol, one that is reaches the library", %{db: db} do
     # (no database here: a request of the right shape is refused as :app, and that is how we know it got there)
     assert {:error, {:protocol, _, _}} = Hosi.write(db, [[:create, 1, :a, 2]], when: [[:equals, 1, :a, 2]])

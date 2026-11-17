@@ -19,11 +19,11 @@
 -- by the dispatcher against the result's 'Setu.Spec.Ty'.
 module Hosigraph.Abi.Codec
   ( -- * The arguments of each operation
-    decWrite, decBatches, decIds, decId, decQueries, decHighest
+    decWrite, decBatches, decIds, decId, decQueries, decHighest, decHighestIn
   , decErasures, decCleanOptions, decFreezeOptions
     -- * The answers that are not one instance
   , encWriteResult, encTrace, errorKind, conflictMessage
-  , encEraseReport, encCleanReport, encFreezeReport, encPlaces
+  , encEraseReport, encCleanReport, encFreezeReport, encPlaces, encKeyedPlaces
   ) where
 
 import qualified Data.Map.Strict as M
@@ -169,6 +169,13 @@ decHighest e = do
     p    -> (\v i -> Just (v, i)) <$> fromEdn (field "val" p) <*> fromEdn (field "id" p)
   Right (a, after, n)
 
+-- | The tuple attribute, the keys, where to start (as for @highest@) and how many.
+decHighestIn :: Edn -> Either Text (Keyword, [Value], Maybe (Value, HosiId), Int)
+decHighestIn e = do
+  (a, after, n) <- decHighest e
+  ks <- fromEdn (field "keys" e)
+  Right (a, ks, after, n)
+
 decFreezeOptions :: Edn -> Either Text FreezeOptions
 decFreezeOptions e = do
   n <- fromEdn (field "max-units" e)
@@ -202,6 +209,11 @@ instance ToEdn Value where
 -- | The facts of one attribute, as the places they hold in its order: @[{:val 75 :id 1001} ...]@.
 encPlaces :: [Datom] -> Edn
 encPlaces ds = EVec [ EMap [(EKw "val", toEdn (dV d)), (EKw "id", toEdn (dE d))] | d <- ds ]
+
+-- | The facts of a tuple of (key, order) as places: @[{:key k :val order :id e} ...]@.
+encKeyedPlaces :: [Datom] -> Edn
+encKeyedPlaces ds =
+  EVec [ EMap [(EKw "key", toEdn k), (EKw "val", toEdn o), (EKw "id", toEdn (dE d))] | d <- ds, VTuple [Just k, Just o] <- [dV d] ]
 
 instance ToEdn Kind where
   toEdn = EKw . T.pack . kindName

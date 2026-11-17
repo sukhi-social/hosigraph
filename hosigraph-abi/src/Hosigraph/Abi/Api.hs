@@ -81,6 +81,10 @@ api = Api
           "The facts of one attribute from the high end of its order, as many as limit: the entities with the largest value, the largest first and, among equal values, the largest id first (for a timeline, the newest, when the attribute is a time). Each answer is the :val and the :id; give the last one as :after to get the next page. It reads about limit facts and not all the attribute's (a :limit in a query sorts every row first), and it cannot be given a filter: ask for more and filter, or use a query over a window. The attribute has to be in the schema with a type (not any) and not be a tuple, and :after has that type. Ask for the entities with get-entities."
           (TMap [Field "attr" TKw, Field "limit" TInt, Field "after" (TOpt tyPlace)])
           (TVec tyPlace)
+      , Op "highest-in"
+          "Like highest, for the facts of some keys only (the newest of the notes of these authors). The attribute is a tuple of exactly two attributes of one entity, (key, order); the answer is the entities whose key is one of keys: at most limit, the largest order value first and, among equal values, the largest id first, whichever key they have. Each answer is the :key, the :val (the order value) and the :id; give :val and :id of the last one as :after to get the next page. It costs about a seek per key and one per fact in the answer, whatever the facts' spread among the keys (a walk with a filter reads every fact newer than the last that passes). The order part has to be a long, the key part has a type (not any), keys have the key part's type, and :after is a long."
+          (TMap [Field "attr" TKw, Field "keys" (TVec tyValue), Field "limit" TInt, Field "after" (TOpt tyPlace)])
+          (TVec tyKeyedPlace)
       , Op "history"
           "Every event about one entity, oldest first, from the chunks and the tail."
           (TMap [Field "id" TInt])
@@ -169,6 +173,10 @@ tyEntity = TDict (TVec tyValue)
 -- | A place in the order of an attribute: the value, and the entity that has it.
 tyPlace :: Ty
 tyPlace = TMap [Field "val" tyValue, Field "id" TInt]
+
+-- | A place in the order of a tuple of (key, order): the key it was found under, the order value, and the entity.
+tyKeyedPlace :: Ty
+tyKeyedPlace = TMap [Field "key" tyValue, Field "val" tyValue, Field "id" TInt]
 
 tyEvent :: Ty
 tyEvent = TMap

@@ -146,6 +146,8 @@ fake logRef = Backend
   , bSeal = note "seal" >> pure (Just sealed)
   , bGetEntities = \is -> note ("get-entities " ++ show is) >> pure [entity1, M.empty]
   , bHighest = \a c n -> note ("highest " ++ show a ++ " " ++ show c ++ " " ++ show n) >> pure [Datom 1002 a (VInt 75), Datom 1001 a (VInt 75)]
+  , bHighestIn = \a ks c n -> note ("highest-in " ++ show a ++ " " ++ show ks ++ " " ++ show c ++ " " ++ show n)
+      >> pure [Datom 1002 a (VTuple [Just (VStr "b"), Just (VInt 75)]), Datom 1001 a (VTuple [Just (VStr "a"), Just (VInt 75)])]
   , bQueryMany = \qs -> note ("query-many " ++ show qs) >> pure [[[VStr "Frege", VInt 70]], []]
   , bQueryCellsMany = \qs -> note ("query-cells-many " ++ show qs) >> pure
       [ [ [ CVal (VStr "Frege"), CPull (PEntity [(Keyword "person/name", PScalar (VStr "Frege")), (Keyword "person/tag", PMany [PScalar (VStr "a"), PScalar (VStr "b")])]) ] ] ]
@@ -394,6 +396,35 @@ opTests =
       m <- askErr d "{:op :highest :args {:attr :person/age :limit 0}}" StApp "bad-argument"
       check ("the message: " ++ T.unpack m) ("has to be 1 or more" `T.isInfixOf` m))
 
+  , ("op highest-in: the attribute, the keys, where to start and how many; the answer is the keyed places, in the order the backend gave them", withLog $ \ref d -> do
+      askOk d "{:op :highest-in :args {:attr :note/by+at :keys [\"a\" \"b\"] :limit 2}}" "[{:key \"b\" :val 75 :id 1002} {:key \"a\" :val 75 :id 1001}]"
+      askOk d "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 2 :after {:val 75 :id 1001}}}" "[{:key \"b\" :val 75 :id 1002} {:key \"a\" :val 75 :id 1001}]"
+      askOk d "{:op :highest-in :args {:attr :note/by+at :keys [] :limit 2 :after nil}}" "[{:key \"b\" :val 75 :id 1002} {:key \"a\" :val 75 :id 1001}]"
+      checkEq "what the backend was asked"
+        [ "highest-in :note/by+at [VStr \"a\",VStr \"b\"] Nothing 2"
+        , "highest-in :note/by+at [VStr \"a\"] Just (VInt 75,1001) 2"
+        , "highest-in :note/by+at [] Nothing 2" ] =<< readIORef ref)
+
+  , ("op highest-in: arguments of the wrong shape are refused before the backend is asked", withLog $ \ref d -> do
+      forM_ [ "{:op :highest-in}"
+            , "{:op :highest-in :args {:attr :note/by+at :limit 2}}"                              -- the keys are not optional
+            , "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"]}}"                         -- nor is how many
+            , "{:op :highest-in :args {:keys [\"a\"] :limit 2}}"
+            , "{:op :highest-in :args {:attr \"note/by+at\" :keys [\"a\"] :limit 2}}"             -- an attribute is a keyword
+            , "{:op :highest-in :args {:attr :note/by+at :keys \"a\" :limit 2}}"                   -- the keys are a vector
+            , "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit \"2\"}}"
+            , "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 2 :after {:val 75}}}"
+            , "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 2 :after {:val 75 :id 1001 :key \"a\"}}}"   -- a place has no key: the last answer is not one
+            , "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 2 :soon true}}" ] $ \req ->
+        void (askErr d req StProtocol "bad-args")
+      checkEq "the backend was not asked" [] =<< readIORef ref)
+
+  , ("op highest-in: what hosigraph refuses is the application's refusal, with its kind", do
+      ref <- newIORef []
+      let d = dispatchOver (fake ref) { bHighestIn = \_ _ _ _ -> throwIO (BadArgument "highestIn: x is not a tuple of two attributes, (key, order)") }
+      m <- askErr d "{:op :highest-in :args {:attr :note/at :keys [1] :limit 2}}" StApp "bad-argument"
+      check ("the message: " ++ T.unpack m) ("not a tuple" `T.isInfixOf` m))
+
   , ("op query-many: texts and inputs, in order", withLog $ \ref d -> do
       askOk d "{:op :query-many :args {:queries [{:q \"[:find ?n ?a :in $ ?x :where [?e :person/name ?n]]\" :inputs [[:scalar \"Frege\"] [:coll [1 2]]]} {:q \"[:find ?e :where [?e :a 1]]\"}]}}"
               "[[[\"Frege\" 70]] []]"
@@ -544,7 +575,7 @@ failureTests =
       let d = dispatchOver unattached
       forM_ ["{:op :stats}", "{:op :seal}", "{:op :verify}", "{:op :rebuild-khana}", "{:op :history :args {:id 1}}", "{:op :write :args {:ops []}}"
                  , "{:op :erase :args {:erasures []}}", "{:op :clean}", "{:op :freeze}"
-                 , "{:op :highest :args {:attr :a :limit 1}}"] $ \req ->
+                 , "{:op :highest :args {:attr :a :limit 1}}", "{:op :highest-in :args {:attr :a :keys [] :limit 1}}"] $ \req ->
         void (askErr d req StApp "bad-argument")
       askOk d "{:op :ping :args 1}" "1")
 
@@ -747,6 +778,53 @@ realTests khana =
         checkEq "a condition on the pair that holds" StOk stc
         _ <- askErr d (whenText a2 a1) StApp "conflict"
         void (askErr d "{:op :highest :args {:attr :follow/pair :limit 1}}" StApp "bad-argument"))
+        `finally` release)
+
+  , ("real: highest-in merges the keys' runs through the door, a page after a page; what cannot be walked is refused", withTmp $ \dir -> do
+      let uri = "{:dir " <> T.pack (show dir) <> " :schema {:note/by {:type :string} :note/at {:type :long} :note/by+at {:type :any :tuple [:note/by :note/at]}} :config {:khana "
+                <> khana <> "}}"
+          idText :: Show a => a -> Text
+          idText = T.pack . show
+      r <- libConnect library uri
+      (d, release) <- either (\f -> throwIO (userError (show f))) pure r
+      (do
+        let notes = [("a", 10), ("b", 30), ("a", 30), ("c", 20), ("b", 5), ("a", 5)] :: [(Text, Integer)]
+        (stw, w) <- ask d ("{:op :write :args {:ops [" <> T.intercalate " "
+          [ "[:create [:tmp " <> idText n <> "] :note/by " <> T.pack (show (T.unpack k)) <> "] [:create [:tmp " <> idText n <> "] :note/at " <> idText t <> "]"
+          | (n, (k, t)) <- zip [1 :: Int ..] notes ] <> "]}}")
+        checkEq "write status" StOk stw
+        ids <- case w of
+          ReplyOk (EMap ps) | Just (EVec ts) <- lookup (EKw "temps") ps -> pure [ i | EVec [_, EInt i] <- ts ]
+          other -> throwIO (userError ("write: " ++ show other))
+        checkEq "six ids" 6 (length ids)
+        let wanted ks = reverse (sort [ (t, i, k) | ((k, t), i) <- zip notes ids, k `elem` ks ])      -- the largest time, then the largest id, first
+            keyedEdn (t, i, k) = EMap [(EKw "key", EStr k), (EKw "val", EInt t), (EKw "id", EInt i)]
+            keysText ks = "[" <> T.unwords [ T.pack (show (T.unpack k)) | k <- ks ] <> "]"
+            afterText (t, i, _) = " :after {:val " <> idText t <> " :id " <> idText i <> "}"
+            page :: [Text] -> Maybe (Integer, Integer, Text) -> IO [Edn]
+            page ks after = do
+              (st, rep) <- ask d ("{:op :highest-in :args {:attr :note/by+at :keys " <> keysText ks <> " :limit 2" <> maybe "" afterText after <> "}}")
+              checkEq "highest-in status" StOk st
+              case rep of
+                ReplyOk (EVec ps) -> pure ps
+                other -> throwIO (userError ("highest-in: " ++ show other))
+            ab = wanted ["a", "b"]
+        p1 <- page ["a", "b"] Nothing
+        checkEq "the first page: the newest of a and b, whoever wrote it" (map keyedEdn (take 2 ab)) p1
+        p2 <- page ["a", "b"] (Just (ab !! 1))
+        checkEq "the page after it" (map keyedEdn (take 2 (drop 2 ab))) p2
+        p3 <- page ["a", "b"] (Just (ab !! 3))
+        checkEq "the last page is short" (map keyedEdn (drop 4 ab)) p3
+        p4 <- page ["a", "b"] (Just (ab !! 4))
+        checkEq "and after it, nothing" [] p4
+        checkEq "one key, and a key nobody has" (map keyedEdn (take 2 (wanted ["c"]))) =<< page ["c", "nobody"] Nothing
+        checkEq "no keys" [] =<< page [] Nothing
+        -- what the library refuses is the caller's: kind bad-argument
+        _ <- askErr d "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 0}}" StApp "bad-argument"
+        _ <- askErr d "{:op :highest-in :args {:attr :nobody/has :keys [\"a\"] :limit 1}}" StApp "bad-argument"
+        _ <- askErr d "{:op :highest-in :args {:attr :note/at :keys [1] :limit 1}}" StApp "bad-argument"
+        _ <- askErr d "{:op :highest-in :args {:attr :note/by+at :keys [1] :limit 1}}" StApp "bad-argument"
+        void (askErr d "{:op :highest-in :args {:attr :note/by+at :keys [\"a\"] :limit 1 :after {:val \"x\" :id 1}}}" StApp "bad-argument"))
         `finally` release)
 
   , ("real: write with :when through the door; a stale condition is a conflict that names it, and changes nothing", withTmp $ \dir -> do
