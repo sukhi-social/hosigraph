@@ -66,8 +66,12 @@ library
     , scientific  >=0.3  && <0.4
     , text        >=1.2  && <2.2
     , time        >=1.9  && <1.14
-    , unix        >=2.8  && <2.9
     , vector      >=0.12 && <0.14
+  -- fsync (Sync) and flock (WorldLock) are the system's: unix has them; on Windows it is Win32
+  if os(windows)
+    build-depends: Win32 >=2.13 && <2.15
+  else
+    build-depends: unix >=2.8 && <2.9
 
 executable hosigraph-demo
   import:           shared
