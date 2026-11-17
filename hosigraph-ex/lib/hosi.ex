@@ -105,6 +105,26 @@ defmodule Hosi do
   def write_many(conn, batches), do: request(conn, :"write-many", %{batches: batches})
   def seal(conn), do: request(conn, :seal)
   def get_entities(conn, ids), do: request(conn, :"get-entities", %{ids: ids})
+
+  @doc """
+  The facts of one attribute from the high end of its order, `limit` of them: the entities with the largest
+  value, the largest first and, among equal values, the largest id first (for a timeline, the newest, when the
+  attribute is a time). Each one is `%{val: value, id: id}`; ask for the entities with `get_entities/2`.
+
+      {:ok, page} = Hosi.highest(db, :"note/at", 20)
+      {:ok, next} = Hosi.highest(db, :"note/at", 20, after: List.last(page))   # the next 20
+
+  It reads about `limit` facts and not all of the attribute's (a `:limit` in a query sorts every row first),
+  and it cannot be given a filter: ask for more and filter, or use a query over a window. The attribute has to
+  be in the schema with a type (not `:any`) and not be a tuple, and `after:` has that type; otherwise the answer
+  is `{:error, {:app, :"bad-argument", message}}`.
+  """
+  def highest(conn, attr, limit, opts \\ []) do
+    args = %{attr: attr, limit: limit}
+    args = if place = Keyword.get(opts, :after), do: Map.put(args, :after, place), else: args
+    request(conn, :highest, args)
+  end
+
   @doc "Each query is `%{q: \"[:find ...]\", inputs: [[:scalar, v] | [:coll, vs] | [:rel, rows]]}`; `:inputs` may be left out."
   def query_many(conn, queries), do: request(conn, :"query-many", %{queries: queries})
   def query_cells_many(conn, queries), do: request(conn, :"query-cells-many", %{queries: queries})

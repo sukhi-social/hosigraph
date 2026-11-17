@@ -127,6 +127,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `writeMany` | Many batches with one append, one fsync, and one khana transaction. |
 | `getEntity`, `query`, `queryCells` | Read **now**. |
 | `getEntities`, `queryMany`, `queryCellsMany` | Read **now**, many questions at once. |
+| `highest` | The *n* facts of one attribute with the largest values, from the end of its index; a page after a page. See "Order and cut". |
 | `history`, `historyTrace` | Read **the past**: every event of one ID, from the chunks and the tail log. `historyTrace` also shows which chunks it skipped (by the zone map, and by the filter) and what each probe answered. |
 | `seal` | Turn the tail log into chunks. `HosiConfig` can also seal by itself, by size or by age. |
 | `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events** (a second khana is made in a temporary directory beside the first, and the two are compared 10,000 facts at a time). An empty list means all good. It takes about as long as a rebuild, and then some; see Measurements. |
@@ -136,6 +137,80 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `freeze` | Put a month that nobody has read or written for a while into one cold chunk. Does nothing unless `hcColdAfterMs` is set. |
 
 You can also use `Hosigraph.Events` alone, without a khana. The tests cover this. Which of its names are promised: see "What 0.1 promises".
+
+## Order and cut, tuples, and words
+
+What a timeline, a "does this pair exist" check and a search box need. All three are the khana's: they are about "now", and none of them is written into the events.
+
+### `:order-by`, `:limit`, `:offset`
+
+```haskell
+query h "[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a] :order-by [?a :desc ?n] :limit 20 :offset 40]" []
+```
+
+They are Datalevin's, and they work for a **relation** find (`:find ?n ?a`) only. With `:find ?x .` or `:find [?x ...]` Datalevin 1.2.10 answers the whole set, in no order, and says nothing;
+so hosigraph refuses those forms before they are asked (`parse-error` at the C door). Ask for the rows and take the column you want.
+
+* In the vector form, `:order-by [?a :desc ?n]` is a variable and then `:asc` (the default) or `:desc`. In the map form it is a vector of pairs, `{:order-by [[?a :desc] [?n]]}`; a flat `[?a :desc]` there is refused, because Datalevin would read it as ascending.
+* `:limit` is 1 or more (Datalevin: 0 is an error, and a negative number means no limit at all, so both are refused); `:offset` is 0 or more. Either may be a scalar of `:in`: `:in $ ?k ... :limit ?k`.
+* Rows come back in the order asked. (Without `:order-by` the order is still not promised.)
+
+**`:limit` does not make a query cheaper.** Datalevin finds every row that matches, sorts them, and then cuts. Measured on 200,000 notes (JVM, one machine, medians of 20 runs with the input changed each time, since Datalevin keeps answers):
+all rows 64 ms; `:order-by [?ts :desc] :limit 20` 94 ms (more: it sorts); the same inside a window of the newest 50,000, 21 ms; for one author's 400 notes, 1.5 ms.
+So narrow first (a window of ids or time, an author), and order and cut after. For "the newest *n*" of a whole attribute there is a call that does not sort: `highest`, next.
+
+### `highest`: the newest *n*, without sorting all of them
+
+```haskell
+page1 <- highest h "note/at" Nothing 20                                          -- [Datom id "note/at" value], the largest value first
+page2 <- highest h "note/at" (Just (dV (last page1), dE (last page1))) 20        -- the 20 after the last one
+notes <- getEntities h (map dE page1)                                            -- what they hold, from the same khana
+```
+
+It walks one attribute's index from its high end and stops after *n* facts (Datalevin's `rseek-datoms` with a count), so what it costs does not grow with the number of facts there are.
+On 200,000 notes (Datalevin in the JVM, medians of 20 runs with the count or the start changed each time): the first 20 took 0.05 ms, 20 from the middle 0.04 ms (at 20,000 notes, 0.15 ms and 0.11 ms);
+the query `:order-by [?ts :desc ?e :desc] :limit 20` on the same notes took 92 ms (9 ms at 20,000). Add the trip to the khana: a fraction of a millisecond with the JVM, a process start with the native `dtlv`.
+
+* **The order:** the largest value first and, among equal values, the largest id first (an id is made from its creation time, so it grows). It is the order a query with `:order-by [?v :desc ?e :desc]` gives (a test holds the two together).
+* **The cursor is a place, `(value, id)`:** a fact that need not exist. The answer is what comes after it in that order, and not the place itself, so the value and id of the last fact of a page is the cursor of the next.
+  (Datalevin applies the id of a start to every value of the range, and not to the first only, so the start is given as the value alone and what the cursor has passed at that value is dropped. A value that many facts share costs as many reads as it has facts;
+  when they are more than the page it asks again for twice as many, in the same call and the same snapshot.)
+* **No filter.** It cannot be given "only these authors" or "this month". Ask for more than you need and filter, or use a query over a window. A timeline of the people one follows is not this call's: a walk with a predicate, or one walk per author merged, is not built (`TODO.md`).
+* **The attribute has to be in the schema with a type** (`TLong`, `TString`, ...). Datalevin keeps an attribute with no type in an order of its bytes that is of no use (tried: 200, 5, 40, -3 came out in that order), so `TAny` is refused, and so is an attribute that is not in the schema.
+  A tuple is refused (its order was not tried). The cursor's value has the attribute's type. A refused call is a `BadArgument` (`bad-argument` at the C door), and the count is 1 or more.
+* The order is Datalevin's for the type: numbers by size (doubles with their sign, tried), strings by their bytes (a long string was not tried). A many-valued attribute has one place per value.
+* **Through the C door** it is `highest`: `{:op :highest :args {:attr :note/at :limit 20 :after {:val 1700000000000 :id 5678}}}`, and the answer is `[{:val .. :id ..} ...]`: give the last one as `:after` for the next page. In Elixir, `Hosi.highest(db, :"note/at", 20, after: place)`.
+
+### Tuples: `tuple`
+
+```haskell
+schema = M.fromList [ ("follow/from", ref), ("follow/to", ref)
+                    , ("follow/pair", identity (tuple ["follow/from", "follow/to"])) ]
+```
+
+`follow/pair` is the tuple of the other two (a *composite tuple*, Datalevin's). The khana keeps it up to date as they are written; you do not write it.
+
+* **A tuple is never written.** `Create … "follow/pair" (Lit (VTuple …))` is a `BadArgument` before anything is logged, and any other value written to it is a `WriteRejected`, which leaves nothing in the log either.
+* **Reading:** `getEntity` shows it as `VTuple [Just (VInt 12), Just (VInt 34)]` (`Nothing` for a part that is not there). It can be asked for in the query text, `[?e :follow/pair [12 34]]`, or as an input, `[InScalar (VTuple [Just (VInt 12), Just (VInt 34)])]` with `[?e :follow/pair ?p]`.
+* **With `identity`, a pair is held once:** a second entity with the same pair is refused (`WriteRejected`), so "follow" can be written without looking first. **Write the parts of one entity in one batch.** While a part is missing the tuple is `[a nil]`, and two entities that are alike so far have the same tuple, so the second write is refused.
+* A tuple holds plain values, not a tuple, and has one value (not `many`). Datalevin's other tuples (a tuple of one type) are not exposed.
+* **Through the C door** a tuple is a vector with `nil` for a part that is missing (`[12 34]`). It is read (`get-entities`, the rows of a query), and asked for in an input (`[:scalar [12 34]]`) or in a condition of `write`; it is not written there either.
+* The parts are in the schema mark: another list of parts is another schema, and the khana is made again at the next open.
+* `erase` and `clean` take it with its parts. A pull of a tuple attribute was not tried.
+
+### Words: `fulltext`
+
+```haskell
+schema = M.fromList [ ("note/body", fulltext (attr TString)) ]
+-- [:find ?e ?v :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]      with InScalar (VStr "fox")
+```
+
+* **Only with `KhanaDatalevinJvm`.** The words are made by an analyzer that has to run inside the JVM; with the native `dtlv` the schema is refused at open (`SchemaRefused`, before anything is made).
+* **What a word is:** a run of letters and digits, lower-cased. A run of Han, kana or hangul is cut into overlapping pairs of characters, so that it is found by any two of its characters in a row. (A search for one such character on its own does not find it.)
+  This is one analyzer, fixed; nothing about stems, stop words or a language was tried. Another analyzer will be another version (`words/1` is in the schema mark), and the khana is made again under it.
+* The query is Datalevin's `fulltext`: with the attribute, `(fulltext $ :note/body ?q)`; without it, `(fulltext $ ?q)` searches every fulltext attribute; `{:top 5}` is an option (a last argument). Several words are matched as Datalevin matches them (best first); a phrase search was not tried.
+* It follows the data: a value that is taken out or changed is out of the index, and an erased note is found no more.
+* **`clean` always makes the khana again from the events** when the schema has a `fulltext` attribute (`crKhanaRebuilt` is `True`). The quick way, a compacted copy, **keeps the words of an erased value** (tried: an erased word was still in two files of the copy). The cost is the cost of `rebuildKhana`.
 
 ## Where "now" lives
 
@@ -301,7 +376,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
   A canary test tells you when upstream fixes it.
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
-* The order of rows is not guaranteed (a Datalevin answer is a set). Sort the rows before you compare them.
+* The order of rows is not guaranteed (a Datalevin answer is a set), **unless the query has `:order-by`** (see "Order and cut"). Sort the rows before you compare them otherwise.
 * Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). Its numbers (calls, opens, memory) are in "Measurements", for one machine.
 * **One opener at a time.** A world (a directory) is open in one place at a time: the first `openHosi` takes a lock (`events/lock`, `flock(2)`) and keeps it until `closeHosi`;
   a second one, in this process or in another, stops with `WorldBusy` before it touches anything.
@@ -356,7 +431,7 @@ Not tried: a world written by a build *older* than 0.1.0 (0.0.1.0). Its chunks a
 ### The names
 
 `Hosigraph` lists them in the export list, in groups. Those **before the heading "Experimental"** are stable: within 0.1.x they are not removed, and what they mean does not change.
-New names, new fields in `HosiConfig` and in the reports, and new constructors of `HosiError` may come. So: build a config with `defaultConfig { … }`, and keep a catch-all case when you match an error.
+New names, new fields in `HosiConfig`, in the reports and in `AttrSchema`, and new constructors of `HosiError` and of `Value` may come. So: build a config with `defaultConfig { … }`, and keep a catch-all case when you match an error.
 
 | | Names |
 |---|---|
@@ -670,7 +745,7 @@ Neither touches `hosigraph` or `takka`, and `hosigraph`, `takka` and `setu` stil
   the operations, the shape of each argument and answer (`Ty`), and the error kinds. It is a set of pure functions from the description to text,
   so the files it writes are committed and `--check` tells you when they are out of date. It also holds what every door shares:
   the table of waiting requests (`Setu.Ticket`) and the table of operations (`Setu.Dispatch`).
-* **`hosigraph-abi/`** is the first customer. `Hosigraph.Abi.Api` describes hosigraph (`write`, `write-many`, `get-entities`, `query-many`,
+* **`hosigraph-abi/`** is the first customer. `Hosigraph.Abi.Api` describes hosigraph (`write`, `write-many`, `get-entities`, `highest`, `query-many`,
   `query-cells-many`, `history`, `history-trace`, `seal`, `verify`, `stats`, `rebuild-khana`, `erase`, `clean`, `freeze`); `gen/` holds what setu writes from it:
   `include/hosi.h`, the Haskell `foreign export`s, and a small C file that starts the Haskell runtime and guards the calls.
   The shared library is `libhosi`.

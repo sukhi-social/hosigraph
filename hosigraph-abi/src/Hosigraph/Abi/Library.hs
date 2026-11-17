@@ -94,7 +94,15 @@ attrSchema (EKw k, s) = do
     EKw "identity" -> Right UniqueIdentity
     EKw "value"   -> Right UniqueValue
     _             -> Left "bad :unique"
-  pure (Keyword k, AttrSchema t c u)
+  ps <- case field "tuple" s of
+    ENil    -> Right []
+    EVec xs -> mapM (\x -> case x of EKw p -> Right (Keyword p); _ -> Left "bad :tuple (keywords expected)") xs
+    _       -> Left "bad :tuple (a vector of keywords expected)"
+  ft <- case field "fulltext" s of
+    ENil      -> Right False
+    EBool b   -> Right b
+    _         -> Left "bad :fulltext"
+  pure (Keyword k, AttrSchema t c u ps ft)
 attrSchema _ = Left "bad :schema key"
 
 config :: Edn -> Either Text HosiConfig

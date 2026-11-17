@@ -13,7 +13,8 @@
 -- @{:ok ...}@ or @{:error :kind :message "..."}@.
 --
 -- [value]   @42@, @1.5@, @"text"@, @true@, @:keyword@ (hosigraph's own 'Value': an integer is
---           64 bits, a float is finite).
+--           64 bits, a float is finite); a vector of those, with @nil@ for a missing part, is a tuple
+--           (what a @:tuple@ attribute holds: read, and asked for, never written).
 -- [ref]     an entity: @1234@ (one that exists), or @[:tmp 1]@ (one this batch makes; the answer
 --           of @write@ says which id it got).
 -- [val]     what an event holds: a value, or @[:ref ref]@ (the id of another entity).
@@ -38,7 +39,7 @@
 module Hosigraph.Abi.Api
   ( api
   , openTy
-  , tyValue, tyRef, tyVal, tyOp, tyCond, tyInput, tyCell, tyEntity, tyEvent
+  , tyValue, tyRef, tyVal, tyOp, tyCond, tyInput, tyCell, tyEntity, tyEvent, tyPlace
   , tyWriteReport, tyChunk, tySealReport, tyTrace, tyStats
   , tyErasure, tyEraseReport, tyCleanReport, tyFreezeReport
   ) where
@@ -76,6 +77,10 @@ api = Api
           "Like query-many, with (pull ?e [...]) allowed in :find. Each answer is rows of cells."
           (TMap [Field "queries" (TVec tyQuery)])
           (TVec (TVec (TVec tyCell)))
+      , Op "highest"
+          "The facts of one attribute from the high end of its order, as many as limit: the entities with the largest value, the largest first and, among equal values, the largest id first (for a timeline, the newest, when the attribute is a time). Each answer is the :val and the :id; give the last one as :after to get the next page. It reads about limit facts and not all the attribute's (a :limit in a query sorts every row first), and it cannot be given a filter: ask for more and filter, or use a query over a window. The attribute has to be in the schema with a type (not any) and not be a tuple, and :after has that type. Ask for the entities with get-entities."
+          (TMap [Field "attr" TKw, Field "limit" TInt, Field "after" (TOpt tyPlace)])
+          (TVec tyPlace)
       , Op "history"
           "Every event about one entity, oldest first, from the chunks and the tail."
           (TMap [Field "id" TInt])
@@ -114,9 +119,11 @@ api = Api
 -- ---------------------------------------------------------------------------
 -- The words
 
--- | A hosigraph value.
+-- | A hosigraph value.  A vector is a tuple, what a composite-tuple attribute holds: its parts, @nil@ for one the
+-- entity does not have yet.  (It is read, and asked for by a query or a condition; it is never written, so 'tyVal'
+-- has none.)
 tyValue :: Ty
-tyValue = TUnion [TInt, TDouble, TStr, TBool, TKw]
+tyValue = TUnion [TInt, TDouble, TStr, TBool, TKw, TVec (TOpt (TUnion [TInt, TDouble, TStr, TBool, TKw]))]
 
 -- | An existing entity, or one the batch makes.
 tyRef :: Ty
@@ -148,15 +155,20 @@ tyInput = TTag
   , Variant "rel"    [TVec (TVec tyValue)]
   ]
 
--- | A cell of a row: a value, or a pulled tree (the tree is not described further).
+-- | A cell of a row: a value, or a pulled tree (the tree is not described further).  A tuple whose first part is the
+-- keyword @:pull@ cannot be told from a pull by its look.
 tyCell :: Ty
-tyCell = TUnion [TInt, TDouble, TStr, TBool, TKw, TTag [Variant "pull" [TAny]]]
+tyCell = TUnion [TInt, TDouble, TStr, TBool, TKw, TTag [Variant "pull" [TAny]], TVec (TOpt (TUnion [TInt, TDouble, TStr, TBool, TKw]))]
 
 tyQuery :: Ty
 tyQuery = TMap [Field "q" TStr, Field "inputs" (TOpt (TVec tyInput))]
 
 tyEntity :: Ty
 tyEntity = TDict (TVec tyValue)
+
+-- | A place in the order of an attribute: the value, and the entity that has it.
+tyPlace :: Ty
+tyPlace = TMap [Field "val" tyValue, Field "id" TInt]
 
 tyEvent :: Ty
 tyEvent = TMap
@@ -232,7 +244,9 @@ openTy = TMap
     attrSchema = TMap
       [ Field "type"   (TOpt (TEnum ["any", "string", "long", "double", "boolean", "keyword", "ref"]))
       , Field "card"   (TOpt (TEnum ["one", "many"]))
-      , Field "unique" (TOpt (TEnum ["identity", "value"])) ]
+      , Field "unique" (TOpt (TEnum ["identity", "value"]))
+      , Field "tuple"  (TOpt (TVec TKw))
+      , Field "fulltext" (TOpt TBool) ]
     config = TMap
       [ Field "seal-events"       (TOpt TInt)
       , Field "seal-age-ms"       (TOpt TInt)

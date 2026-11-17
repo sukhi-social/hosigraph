@@ -57,7 +57,7 @@ module Hosigraph
     -- * Letting erased things go from the disk
   , CleanOptions(..), defaultCleanOptions, CleanReport(..), clean
     -- * Reading "now" (the khana)
-  , getEntity, query, queryCells
+  , getEntity, query, queryCells, highest
     -- * Reading many at once (one snapshot; one round trip with Datalevin)
   , getEntities, queryMany, queryCellsMany
     -- * Reading the past (events: chunks + tail, point lookup by id)
@@ -67,7 +67,7 @@ module Hosigraph
     -- * Ids
   , HosiId, describeId, idMonth, showMonth, Month, Clock, systemClock
     -- * Re-exported (the words of the khana)
-  , Value(..), Keyword(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, ValueType(..)
+  , Value(..), Keyword(..), Datom(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, tuple, fulltext, ValueType(..)
   , Event(..), Kind(..), HosiError(..)
     -- * Experimental (may change, or go, in a 0.1.x)
     -- ** Cold storage: a quiet month goes cold
@@ -533,7 +533,7 @@ data CleanReport = CleanReport
   , crSkipped      :: [String]                    -- ^ chunks it gave up on because an erase changed them meanwhile; the next call finds them
   , crRecordsLeft  :: Int                         -- ^ chunks that still have an erase record (more than 0: call again)
   , crKhanaCleaned :: Bool                        -- ^ the khana was made into a new file, because the old one may still hold what erases took out
-  , crKhanaRebuilt :: Bool                        -- ^ ...and the quick way (a compacted copy) did not work, so it was folded again from the events (slow; look at why if it keeps happening)
+  , crKhanaRebuilt :: Bool                        -- ^ ...and it was folded again from the events, not copied: the quick way (a compacted copy) did not work (slow; look at why if it keeps happening), or the schema has a 'fulltext' attribute, which is always done so
   } deriving Show
 
 -- | Make what 'erase' took out go from the disk.  'erase' hides an id at once (and its chunk's bytes stay in the chunk,
@@ -546,7 +546,8 @@ data CleanReport = CleanReport
 --    khana is made into a new file.  The quick way is a compacted copy of the khana (no replay: what is alive is
 --    written, what was taken out is not); if the copy cannot be made, or does not agree with the khana (same folded
 --    seq, same number of facts), the khana is folded again from the events, which leave the erased ids out
---    ('rebuildKhana'), and 'crKhanaRebuilt' says so.  This holds the events lock.
+--    ('rebuildKhana'), and 'crKhanaRebuilt' says so.  A schema with a 'fulltext' attribute always takes the second
+--    way: the index of words keeps the words of what was erased, in a compacted copy too.  This holds the events lock.
 --
 -- Nothing to do costs a look at the manifest and at one small fact in the khana.  There is no scheduler: call it when
 -- the host is quiet.  Call it without holding any lock of this Hosi.
@@ -557,7 +558,9 @@ clean h opts = do
     conn <- readIORef (hKhana h)
     cg <- cleanGenOf conn
     gen <- E.eraseGeneration (hEvents h)
-    if cg >= gen then pure (False, False) else do
+    if cg >= gen then pure (False, False)
+    else if any asFulltext (M.elems (hSchema h)) then rebuildKhanaLocked h >> pure (True, True)     -- the index of words keeps the words of what was erased, in a copy too
+    else do
       copied <- try (compactKhanaLocked h gen)
       case copied of
         Right ()                    -> pure (True, False)
@@ -615,6 +618,41 @@ queryCells :: Hosi -> T.Text -> [Input] -> IO [[Cell]]
 queryCells h txt inputs = do
   k <- readIORef (hKhana h)
   khanaQueryCells k txt inputs
+
+-- | The facts of one attribute from the high end of its order, as many as @n@: the entities with the largest value,
+-- the largest value first and, among equal values, the largest id first.  For a timeline that is "the newest @n@" when
+-- the attribute is a time (or an id that grows).
+--
+-- @highest h attr Nothing n@ gives the first @n@; @highest h attr (Just (v, e)) n@ gives the @n@ after the place
+-- @(v, e)@ (the fact @(e, v)@ itself is not in the answer), so the cursor for the next page is the value and the id of
+-- the last fact of this one.  Ask for the entities of the answer with 'getEntities'.
+--
+-- Unlike @:limit@ of a query, which finds every row and sorts them before it cuts, this walks the attribute's index
+-- from its end and reads about @n@ facts, so what it costs does not grow with the number of facts there are.  It is a
+-- walk and not a search: it cannot be given a filter (not the followed, not a month); ask for more than you need and
+-- filter, or use a query over a window.
+--
+-- The attribute has to be in the schema with a type (@TLong@, @TString@, ...: an attribute with no type is kept in an order
+-- that is of no use), and not be a 'tuple'; the cursor's value has the attribute's type.  A refused call is a
+-- 'BadArgument'.  The order is Datalevin's for that type: numbers by size, strings by their bytes.
+highest :: Hosi -> Keyword -> Maybe (Value, HosiId) -> Int -> IO [Datom]
+highest h a cur n = do
+  when (n < 1) $ throwIO (BadArgument ("highest: the count is " ++ show n ++ ", and has to be 1 or more"))
+  case M.lookup a (hSchema h) of
+    Nothing -> throwIO (BadArgument ("highest: " ++ show a ++ " is not in the schema, and an attribute with no type has no order to walk"))
+    Just s
+      | not (null (asTuple s)) -> throwIO (BadArgument ("highest: " ++ show a ++ " is a tuple, and the order of a tuple was not tried"))
+      | asType s == TAny       -> throwIO (BadArgument ("highest: " ++ show a ++ " has no type (TAny): Datalevin keeps it in an order that is of no use; give it one"))
+      | Just (v, _) <- cur, not (fits (asType s) v) ->
+          throwIO (BadArgument ("highest: the cursor's value " ++ T.unpack (renderValue v) ++ " is not a " ++ show (asType s) ++ ", which is what " ++ show a ++ " holds"))
+      | otherwise -> pure ()
+  k <- readIORef (hKhana h)
+  khanaHighest k a cur n
+  where
+    fits t v = case (t, v) of
+      (TString, VStr _) -> True; (TLong, VInt _) -> True; (TRef, VInt _) -> True
+      (TDouble, VDouble _) -> True; (TBool, VBool _) -> True; (TKeyword, VKw _) -> True
+      _ -> False
 
 -- | Many entities, all from the same instant.  The answers are in the order asked.  With a Datalevin
 -- khana this is one round trip instead of one per entity.

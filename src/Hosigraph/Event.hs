@@ -89,6 +89,7 @@ putValue v = case v of
   VStr t          -> putU8 2 <> putText t
   VBool b         -> putU8 3 <> putU8 (if b then 1 else 0)
   VKw (Keyword t) -> putU8 4 <> putText t
+  VTuple _        -> error "putValue: a tuple is made by the khana and never written (Hosigraph.Events.validate refuses it)"
 
 getValue :: Get Value
 getValue = getU8 >>= getValueBody

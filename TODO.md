@@ -75,6 +75,11 @@ It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar)
 * **A `verify` that walks both khanas in one `dtlv` process.** Today it asks for a page at a time, and each page is a `dtlv` process (about 110 of them on real data; the 65 s is 34 s of rebuild and about 30 s of this walk, not measured call by call). The JVM keeps one process and takes 22 s. Not needed for 0.1: `verify` is rare work.
 * **Linux, for real.** CI runs on ubuntu with the JVM khana only; the native `dtlv` is not run there, and the `abi` job has been seen to pass on macOS only. Windows has no `System.Posix`; say it.
 
+* **`highest` with a filter, and the other way.** `highest` walks one attribute and cannot be given a filter, so a timeline of the people one follows has to ask for more and filter, or use a query over a window.
+  A walk with a predicate, or one walk per author merged, is not built; nor is the walk upwards (`lowest`: `seek-datoms` on `:ave`, a few lines when it is wanted). A tuple, or a long string, as the walked attribute was not tried.
+* **Fulltext without the JVM.** The analyzer is an `inter-fn`, which the native `dtlv` cannot run (`Can only freeze an inter-fn`), so the native khana refuses the schema. With the default analyzer it would work for English and not for Japanese; whether that half is worth having is open. Also not tried: a phrase search, other analyzers, an attribute name that is not `ns/name`.
+* **Tuples.** Not checked at open: a tuple of an attribute that is not in the schema, or of itself, or `many`. A pull of a tuple attribute was not tried.
+
 ### Not in 0.1.0
 
 S3 (the section below), live serving of a backfill (the section after it), distribution and sync, metrics, JSON-LD import, thaw and compression of cold chunks.
