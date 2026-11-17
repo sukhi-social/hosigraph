@@ -15,6 +15,7 @@ module Main (main) where
 import           Control.Concurrent (threadDelay)
 import           Control.Exception
 import           Control.Monad
+import qualified Data.ByteString as BS
 import           Data.IORef
 import           Data.List (sort, sortOn)
 import qualified Data.Map.Strict as M
@@ -36,6 +37,8 @@ import           Hosigraph.Abi.Codec
 import           Hosigraph.Abi.Files (generatedFiles)
 import           Hosigraph.Abi.Handlers
 import           Hosigraph.Abi.Library
+import           Hosigraph.Abi.Json
+import           Hosigraph.Abi.Stdio (Format(..), runStdio)
 import           Hosigraph.Manifest (ChunkEntry(..))
 import           Setu.Codec (ToEdn(..), FromEdn(..))
 import           Setu.Abi (Library(..))
@@ -48,6 +51,7 @@ import           Setu.Wire
 import           Takka.Edn (Edn(..), readEdn)
 import           Takka.Syntax (Pulled(..))
 import           Takka.Types (TakkaError(..))
+import qualified Takka.Types as K
 
 type Test = (String, IO ())
 
@@ -75,7 +79,7 @@ main = do
       real = maybe [] (\exe -> tag "[dtlv]" (realTests ("[:dtlv " <> tshow exe <> "]"))) mexe
           ++ maybe [] (\jar -> tag "[jvm]" (realTests ("[:jvm " <> tshow java <> " " <> tshow jar <> "]"))) mjar
   when (null real) $ putStrLn "  (real hosigraph tests skipped: set HOSIGRAPH_DTLV, or HOSIGRAPH_DATALEVIN_JAR and HOSIGRAPH_JAVA)"
-  results <- forM (apiTests ++ codecTests ++ opTests ++ failureTests ++ openTests ++ generatedTests ++ real) $ \(name, act) -> do
+  results <- forM (apiTests ++ codecTests ++ opTests ++ failureTests ++ openTests ++ stdioTests ++ jsonTests ++ generatedTests ++ real) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -649,6 +653,153 @@ openTests =
   ]
 
 -- ---------------------------------------------------------------------------
+-- hosigraph stdio
+
+-- | Open with the text, hand over the bytes as stdin, and give back the exit code and the lines of stdout.
+stdioRun :: Text -> BS.ByteString -> IO (ExitCode, [Text])
+stdioRun = stdioRunAs FormatEdn
+
+stdioRunAs :: Format -> Text -> BS.ByteString -> IO (ExitCode, [Text])
+stdioRunAs fmt open input = withTmp $ \dir -> do
+  let fin = dir ++ "/in"; fout = dir ++ "/out"
+  BS.writeFile fin input
+  code <- withBinaryFile fin ReadMode $ \i -> withBinaryFile fout WriteMode $ \o -> runStdio fmt open i o
+  out <- BS.readFile fout
+  pure (code, T.lines (TE.decodeUtf8 out))
+
+stdioTests :: [Test]
+stdioTests =
+  [ ("stdio: one line in, one line out, in order; a blank line is skipped; \\r\\n is a line end; a bad line is answered and the next goes on", do
+      (code, ls) <- stdioRun "{}" (TE.encodeUtf8 "{:op :ping :args 1}\n\n{:op :ping :args 2}\r\nnot edn (\n{:op :nope}\n{:op :ping :args 3}")
+      checkEq "exit" ExitSuccess code
+      checkEq "answers" 5 (length ls)
+      checkEq "the first two" ["{:ok 1}", "{:ok 2}"] (take 2 ls)
+      check "the bad line is bad-request" ("bad-request" `T.isInfixOf` (ls !! 2))
+      check "the unknown op is unknown-op" ("unknown-op" `T.isInfixOf` (ls !! 3))
+      checkEq "the last line has no newline and is still answered" "{:ok 3}" (ls !! 4))
+
+  , ("stdio: a newline inside a string stays inside the line, and so does what is not ASCII", do
+      (_, ls) <- stdioRun "{}" (TE.encodeUtf8 "{:op :ping :args \"a\\nb \26085\"}\n")
+      checkEq "one line back" ["{:ok \"a\\nb \26085\"}"] ls)
+
+  , ("stdio: bytes that are not UTF-8 are answered as a bad request, not a crash", do
+      (code, ls) <- stdioRun "{}" (BS.pack [0xff, 0xfe, 10] <> "{:op :ping}\n")
+      checkEq "exit" ExitSuccess code
+      checkEq "two answers" 2 (length ls)
+      check "the first says UTF-8" ("UTF-8" `T.isInfixOf` (ls !! 0)))
+
+  , ("stdio: without a database only ping and abi answer", do
+      (_, ls) <- stdioRun "{}" "{:op :stats}\n{:op :abi}\n"
+      check "stats is refused" ("bad-argument" `T.isInfixOf` (ls !! 0))
+      check "abi names hosi" ("\"hosi\"" `T.isInfixOf` (ls !! 1)))
+
+  , ("stdio: an open that is not the shape is the one line of stdout, and exit 1", do
+      (code, ls) <- stdioRun "{:dir 5}" "{:op :ping}\n"
+      checkEq "exit" (ExitFailure 1) code
+      checkEq "one line" 1 (length ls)
+      check "it says bad-open" ("bad-open" `T.isInfixOf` (ls !! 0)))
+  ]
+
+
+-- | A JSON request as the EDN it stands for (maps in one order).
+jsonAsEdn :: JsonOptions -> Text -> Either Text (Text, Edn)
+jsonAsEdn o txt = case jsonRequest api o (TE.encodeUtf8 txt) of
+  Left e -> Left e
+  Right (n, bs) -> Right (n, canon (edn (TE.decodeUtf8 bs)))
+
+jsonTests :: [Test]
+jsonTests =
+  let plain = JsonOptions False M.empty
+      schema = M.fromList
+        [ (K.Keyword "a/score", K.defaultAttrSchema { K.asType = K.TDouble })
+        , (K.Keyword "a/n", K.defaultAttrSchema { K.asType = K.TLong })
+        , (K.Keyword "a/to", K.defaultAttrSchema { K.asType = K.TRef }) ]
+      withSchema = JsonOptions False schema
+      readsAs o j e = case jsonAsEdn o j of
+        Right (_, got) -> checkEq (T.unpack j) (canon (edn e)) got
+        Left why       -> throwIO (userError (T.unpack j ++ ": " ++ T.unpack why))
+      refusedWith o j needle = case jsonAsEdn o j of
+        Left why -> check (T.unpack j ++ ": " ++ T.unpack why) (needle `T.isInfixOf` why)
+        Right r  -> throwIO (userError ("accepted: " ++ show r))
+      answers o op e = TE.decodeUtf8 (jsonReply api o op (TE.encodeUtf8 e))
+  in
+  [ ("json: a request reads by the shape: tags, keywords and ids", do
+      readsAs plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",[\"tmp\",1],\"a/name\",\"Frege\"],[\"delete\",12,\"a/f\",[\"ref\",[\"tmp\",1]]]]}}"
+        "{:op :write :args {:ops [[:create [:tmp 1] :a/name \"Frege\"] [:delete 12 :a/f [:ref [:tmp 1]]]]}}"
+      readsAs plain "{\"op\":\"stats\"}" "{:op :stats}"
+      readsAs plain "{\"op\":\":stats\"}" "{:op :stats}"
+      readsAs plain "{\"op\":\"get-entities\",\"args\":{\"ids\":[1,\"58047583928451072\"]}}" "{:op :get-entities :args {:ids [1 58047583928451072]}}"
+      readsAs plain "{\"op\":\"erase\",\"args\":{\"erasures\":[[\"owned-by\",[\"a/owner\"],[5]],[\"between\",1,2]]}}"
+        "{:op :erase :args {:erasures [[:owned-by [:a/owner] [5]] [:between 1 2]]}}")
+
+  , ("json: a value that starts with a colon is a keyword; ::x is the string :x", do
+      readsAs plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/m\",\":calm\"],[\"create\",1,\"a/s\",\"::x\"],[\"create\",1,\"a/t\",\"plain\"]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/m :calm] [:create 1 :a/s \":x\"] [:create 1 :a/t \"plain\"]]}}")
+
+  , ("json: 1 and 1.0: the schema of the attribute decides, then how the number is written", do
+      readsAs withSchema "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/score\",3],[\"create\",1,\"a/score\",3.5]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/score 3.0] [:create 1 :a/score 3.5]]}}"
+      readsAs withSchema "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/n\",\"58047583928451072\"],[\"create\",1,\"a/to\",[\"ref\",\"7\"]]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/n 58047583928451072] [:create 1 :a/to [:ref 7]]]}}"
+      -- an attribute the schema does not name: a fraction or an exponent is a double, a whole number is an integer
+      readsAs plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/x\",1.0],[\"create\",1,\"a/x\",1],[\"create\",1,\"a/x\",1.5]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/x 1.0] [:create 1 :a/x 1] [:create 1 :a/x 1.5]]}}"
+      -- where the shape asks for a double, a whole number is one
+      readsAs plain "{\"op\":\"ping\",\"args\":[1,1.0]}" "{:op :ping :args [1 1.0]}")
+
+  , ("json: {\"type\":..., \"value\":...} says the type of a value, and the schema does not change what was said", do
+      readsAs plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/x\",{\"type\":\"double\",\"value\":1}],[\"create\",1,\"a/x\",{\"type\":\"long\",\"value\":\"58047583928451072\"}],[\"create\",1,\"a/x\",{\"type\":\"string\",\"value\":\":not-a-keyword\"}],[\"create\",1,\"a/x\",{\"type\":\"keyword\",\"value\":\"calm\"}]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/x 1.0] [:create 1 :a/x 58047583928451072] [:create 1 :a/x \":not-a-keyword\"] [:create 1 :a/x :calm]]}}"
+      -- the author said long: the attribute is a :double, and it is hosigraph's own check that will say so
+      readsAs withSchema "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/score\",{\"type\":\"long\",\"value\":3}]]}}"
+        "{:op :write :args {:ops [[:create 1 :a/score 3]]}}"
+      readsAs plain "{\"op\":\"ping\",\"args\":{\"type\":\"double\",\"value\":2}}" "{:op :ping :args 2.0}"
+      -- where an object is a map of its own, it is a map
+      readsAs plain "{\"op\":\"query-many\",\"args\":{\"queries\":[{\"type\":\"double\",\"value\":1}]}}"
+        "{:op :query-many :args {:queries [{:type \"double\" :value 1}]}}"
+      refusedWith plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/x\",{\"type\":\"decimal\",\"value\":1}]]}}" "unknown type"
+      refusedWith plain "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",1,\"a/x\",{\"type\":\"double\",\"value\":\"1\"}]]}}" "double")
+
+  , ("json: what is not a request is said, with where", do
+      refusedWith plain "not json {" "not JSON"
+      refusedWith plain "[1]" "object"
+      refusedWith plain "{\"args\":1}" "\"op\""
+      refusedWith plain "{\"op\":\"stats\",\"id\":1}" "unknown key"
+      refusedWith plain "{\"op\":\"write\",\"args\":{\"ops\":\"x\"}}" "/args/ops"
+      refusedWith plain "{\"op\":\"get-entities\",\"args\":{\"ids\":[1.5]}}" "fraction"
+      refusedWith plain "{\"op\":\"get-entities\",\"args\":{\"ids\":[\"12a\"]}}" "integer")
+
+  , ("json: an answer is written by the shape: bare keywords where a keyword is asked, 1.0 stays 1.0", do
+      checkEq "stats" "{\"ok\":{\"generation\":0,\"chunks\":1,\"sealed-seq\":2,\"next-seq\":3,\"tail-events\":4,\"tail-bytes\":5,\"folded-seq\":6,\"khana-datoms\":7}}"
+        (answers plain "stats" "{:ok {:generation 0 :chunks 1 :sealed-seq 2 :next-seq 3 :tail-events 4 :tail-bytes 5 :folded-seq 6 :khana-datoms 7}}")
+      checkEq "history" "{\"ok\":[{\"seq\":1,\"kind\":\"create\",\"id\":9,\"attr\":\"a/m\",\"val\":\":calm\"},{\"seq\":2,\"kind\":\"delete\",\"id\":9,\"attr\":\"a/x\",\"val\":1.0}]}"
+        (answers plain "history" "{:ok [{:seq 1 :kind :create :id 9 :attr :a/m :val :calm} {:seq 2 :kind :delete :id 9 :attr :a/x :val 1.0}]}")
+      checkEq "a string that starts with a colon is written with one more" "{\"ok\":[[[\"::x\"]]]}"
+        (answers plain "query-many" "{:ok [[[\":x\"]]]}")
+      checkEq "entities: attribute names are keys" "{\"ok\":[{\"a/m\":[\":calm\"],\"a/n\":[2.0,\"s\"]}]}"
+        (answers plain "get-entities" "{:ok [{:a/m [:calm] :a/n [2.0 \"s\"]}]}")
+      checkEq "a tagged cell" "{\"ok\":[[[[\"pull\",{\"a/n\":[1]}]]]]}"
+        (answers plain "query-cells-many" "{:ok [[[[:pull {:a/n [1]}]]]]}")
+      checkEq "an error" "{\"error\":\"conflict\",\"message\":\"say \\\"x\\\"\"}"
+        (answers plain "write" "{:error :conflict :message \"say \\\"x\\\"\"}"))
+
+  , ("json: ids past 2^53 are strings when asked, and only then", do
+      let big = "{:ok {:temps [[1 58047583928451072] [2 9007199254740991]] :first-seq 1 :last-seq 1 :sealed false}}"
+      checkEq "as numbers" "{\"ok\":{\"temps\":[[1,58047583928451072],[2,9007199254740991]],\"first-seq\":1,\"last-seq\":1,\"sealed\":false}}"
+        (answers plain "write" big)
+      checkEq "as strings" "{\"ok\":{\"temps\":[[1,\"58047583928451072\"],[2,9007199254740991]],\"first-seq\":1,\"last-seq\":1,\"sealed\":false}}"
+        (answers plain { joIdsAsStrings = True } "write" big))
+
+  , ("json: through stdio, one line in and one line out, and a bad line is answered", do
+      (code, ls) <- stdioRunAs (FormatJson False) "{}" (TE.encodeUtf8 "{\"op\":\"ping\",\"args\":{\"k\":[1,1.0,\":a\",\"b\"]}}\nnot json\n{\"op\":\"abi\"}\n{\"op\":\"nope\"}\n")
+      checkEq "exit" ExitSuccess code
+      checkEq "ping comes back as it went" "{\"ok\":{\"k\":[1,1.0,\":a\",\"b\"]}}" (ls !! 0)
+      check "bad line" ("\"error\":\"bad-request\"" `T.isInfixOf` (ls !! 1))
+      check "abi" ("\"name\":\"hosi\"" `T.isInfixOf` (ls !! 2))
+      check "unknown op" ("unknown-op" `T.isInfixOf` (ls !! 3)))
+  ]
+
+-- ---------------------------------------------------------------------------
 -- The generated files
 
 generatedTests :: [Test]
@@ -673,7 +824,28 @@ withTmp act = do
 -- of @:khana@).  Not run when no Datalevin is set up.
 realTests :: Text -> [Test]
 realTests khana =
-  [ ("real: write, read now, read the past, seal, verify, rebuild", withTmp $ \dir -> do
+  [ ("real: through JSON stdio, 3 is 3.0 for a double attribute, and ids come back as strings when asked", withTmp $ \dir -> do
+      let open = "{:dir " <> T.pack (show dir) <> " :schema {:a/name {:type :string} :a/score {:type :double} :a/any {:type :any :card :many}} :config {:khana " <> khana <> "}}"
+      (c, ls) <- stdioRunAs (FormatJson True) open (TE.encodeUtf8 (T.unlines
+        [ "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",[\"tmp\",1],\"a/name\",\"F\"],[\"create\",[\"tmp\",1],\"a/score\",3],[\"create\",[\"tmp\",1],\"a/any\",1.0],[\"create\",[\"tmp\",1],\"a/any\",1]]}}"
+        , "{\"op\":\"query-many\",\"args\":{\"queries\":[{\"q\":\"[:find ?e ?s :where [?e :a/score ?s]]\"}]}}" ]))
+      checkEq "exit" ExitSuccess c
+      check ("the id is a string: " ++ T.unpack (ls !! 0)) ("\"temps\":[[1,\"" `T.isInfixOf` (ls !! 0))
+      check ("3 became 3.0: " ++ T.unpack (ls !! 1)) (",3.0]]]}" `T.isSuffixOf` (ls !! 1)))
+
+  , ("real: through stdio, a write and a query, and the database is there when opened again", withTmp $ \dir -> do
+      let open = "{:dir " <> T.pack (show dir) <> " :schema {:person/name {:type :string :unique :identity}} :config {:khana " <> khana <> "}}"
+          q = "{:op :query-many :args {:queries [{:q \"[:find ?n :where [?e :person/name ?n]]\"}]}}\n"
+      (c1, l1) <- stdioRun open (TE.encodeUtf8 ("{:op :write :args {:ops [[:create [:tmp 1] :person/name \"Frege\"]]}}\n" <> q))
+      checkEq "exit" ExitSuccess c1
+      checkEq "answers" 2 (length l1)
+      check "the write is ok" ("{:ok {:temps" `T.isPrefixOf` (l1 !! 0))
+      checkEq "the name is there" "{:ok [[[\"Frege\"]]]}" (l1 !! 1)
+      (c2, l2) <- stdioRun open (TE.encodeUtf8 q)
+      checkEq "exit again" ExitSuccess c2
+      checkEq "still there after close and open" ["{:ok [[[\"Frege\"]]]}"] l2)
+
+  , ("real: write, read now, read the past, seal, verify, rebuild", withTmp $ \dir -> do
       let uri = "{:dir " <> T.pack (show dir) <> " :schema {:person/name {:type :string :unique :identity} :person/age {:type :long} :person/friend {:type :ref :card :many}} :config {:khana "
                 <> khana <> "}}"
       r <- libConnect library uri

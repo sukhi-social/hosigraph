@@ -3456,6 +3456,11 @@ nativeTests exe =
         r <- try (query h "[:find (max ?a) . :where [?e :person/age ?a]]" []) :: IO (Either SomeException [[Value]])
         check "max is still answered with the whole collection, which we cannot read as a number" (either (const True) (const False) r)
         checkEq "avg works" [[VDouble 72.5]] =<< query h "[:find (avg ?a) . :where [?e :person/age ?a]]" [])
+
+  , ("fulltext: the native dtlv cannot run the analyzer, and says so before anything is made", withTmp $ \dir -> do
+      r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlv exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
+             :: IO (Either HosiError Hosi)
+      check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
   ]
 
 -- | Only the resident JVM.
@@ -3512,12 +3517,6 @@ jvmTests java jar =
       h3 <- openHosiWith cfg dir sch
       checkEq "with the flag again, the khana was made again and finds them" (ids [n1]) =<< search h3 "owl"
       closeHosi h3)
-
-  , ("fulltext: the native dtlv cannot run the analyzer, and says so before anything is made", withTmp $ \dir -> do
-      exe <- maybe "" id <$> lookupEnv "HOSIGRAPH_DTLV"
-      r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlv exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
-             :: IO (Either HosiError Hosi)
-      check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
 
   , ("the khana has a write-ahead log: an erased value is in txlog/ until clean, and in no file after it", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
