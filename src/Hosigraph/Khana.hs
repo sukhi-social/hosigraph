@@ -40,7 +40,7 @@ module Hosigraph.Khana
   , khanaFoldedAndCount
     -- * Erasing
   , peekKhana, setEraseGen, setSchemaMark, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
-  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany
+  , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany, khanaHighest, khanaHighestIn
   ) where
 
 import           Control.Exception (SomeException, try, throwIO, finally)
@@ -120,8 +120,16 @@ schemaMarkAttr = "hosi.meta/schema"
 schemaMark :: Schema -> Text
 schemaMark s = T.pack ("hosi-schema/1:" ++ sha256Hex (TE.encodeUtf8 (T.pack text)))
   where
-    text = concat [ T.unpack (kwText k) ++ " " ++ show (asType a) ++ " " ++ show (asCard a) ++ " " ++ show (asUnique a) ++ "\n"
+    text = concat [ T.unpack (kwText k) ++ " " ++ show (asType a) ++ " " ++ show (asCard a) ++ " " ++ show (asUnique a)
+                    ++ concat [ " tuple " ++ unwords (map (T.unpack . kwText) (asTuple a)) | not (null (asTuple a)) ]   -- only when set: a mark made before tuples stays the same
+                    ++ concat [ " fulltext " ++ analyzerVersion | asFulltext a ]
+                    ++ "\n"
                   | (k, a) <- M.toAscList s ]
+
+-- | Which words the fulltext index is made of (see 'Hosigraph.Khana.Sidecar.sidecarSource').  Datalevin keeps the analyzer in
+-- the database, so a khana made with another one has to be made again: the mark of a schema with a fulltext attribute has this in it.
+analyzerVersion :: String
+analyzerVersion = "words/1"
 
 -- | The caller's schema plus the bookkeeping attributes.
 khanaSchema :: Schema -> Schema
@@ -130,8 +138,11 @@ khanaSchema = M.insert schemaMarkAttr (attr TString) . M.insert cleanGenAttr (at
 -- | Open (creating if needed) a khana in a directory.
 openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> IO Khana
 openKhana (KhanaRuntime sc) backend dir schema = case backend of
-  KhanaDtlv exe ->
-    DtlvKhana <$> openDtlv (Native exe) dir (khanaSchema schema)
+  KhanaDtlv exe
+    | any asFulltext (M.elems schema) -> throwIO (SchemaRefused
+        ("the attribute(s) " ++ unwords [ T.unpack (kwText k) | (k, a) <- M.toList schema, asFulltext a ]
+         ++ " are fulltext, and the native dtlv cannot run the analyzer that makes their words: use KhanaDatalevinJvm"))
+    | otherwise -> DtlvKhana <$> openDtlv (Native exe) dir (khanaSchema schema)
   KhanaDatalevinJvm _ _ -> case sc of
     Just s  -> DtlvKhana <$> openDtlv (Resident s) dir (khanaSchema schema)
     Nothing -> throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)")
@@ -319,6 +330,16 @@ khanaEntity k i = case k of
 khanaEntities :: Khana -> [EntityId] -> IO [M.Map Keyword [Value]]
 khanaEntities k is = case k of
   DtlvKhana d     -> dtlvEntities d is
+
+-- | The facts of one attribute from the high end of its order, as 'dtlvHighest' gives them.
+khanaHighest :: Khana -> Keyword -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+khanaHighest k a cur n = case k of
+  DtlvKhana d -> dtlvHighest d a cur n
+
+-- | The facts of a two-part tuple attribute for some keys, from the high end of its order part, as 'dtlvHighestIn' gives them.
+khanaHighestIn :: Khana -> Keyword -> [Value] -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+khanaHighestIn k a keys cur n = case k of
+  DtlvKhana d -> dtlvHighestIn d a keys cur n
 
 -- | A Datalog query (EDN) against the khana.
 khanaQuery :: Khana -> Text -> [Q.Input] -> IO [[Value]]

@@ -336,11 +336,17 @@ recordMany k opss = do
 validate :: Erase.EraseSet -> [Op] -> Either HosiError ()
 validate erased ops
   | null ops  = Left (BadArgument "write: no operations")
+  | (a : _) <- [ a | op <- ops, (a, Lit (VTuple _)) <- [attrAndVal op] ]
+              = Left (BadArgument ("write: " ++ show a ++ ": a tuple is made by the khana from its parts, and is not written"))
   | otherwise = case [ i | op <- ops, i <- idsOf op, i <= lastReservedId ] of
       (i : _) -> Left (BadArgument ("write: " ++ show i ++ " is not a valid entity id"))
       []      -> case [ i | op <- ops, Id i <- [subjectOf op], Erase.member i erased ] of
         (i : _) -> Left (BadArgument ("write: " ++ show i ++ " was erased"))
         []      -> Right ()
+
+attrAndVal :: Op -> (Keyword, Val)
+attrAndVal (Create _ a v) = (a, v)
+attrAndVal (Delete _ a v) = (a, v)
 
 subjectOf :: Op -> Ref
 subjectOf (Create r _ _) = r

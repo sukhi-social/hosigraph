@@ -19,11 +19,11 @@
 -- by the dispatcher against the result's 'Setu.Spec.Ty'.
 module Hosigraph.Abi.Codec
   ( -- * The arguments of each operation
-    decWrite, decBatches, decIds, decId, decQueries
+    decWrite, decBatches, decIds, decId, decQueries, decHighest, decHighestIn
   , decErasures, decCleanOptions, decFreezeOptions
     -- * The answers that are not one instance
   , encWriteResult, encTrace, errorKind, conflictMessage
-  , encEraseReport, encCleanReport, encFreezeReport
+  , encEraseReport, encCleanReport, encFreezeReport, encPlaces, encKeyedPlaces
   ) where
 
 import qualified Data.Map.Strict as M
@@ -66,7 +66,7 @@ instance ToEdn Cond where
     Lacks i a v -> EVec [EKw "lacks", toEdn i, toEdn a, toEdn v]
     Unset i a   -> EVec [EKw "unset", toEdn i, toEdn a]
 
--- | By its shape: an integer, a float, a string, a boolean or a keyword.
+-- | By its shape: an integer, a float, a string, a boolean or a keyword; a vector of those (@nil@ for a part) is a tuple.
 instance FromEdn Value where
   fromEdn e = case e of
     EInt _   -> VInt <$> fromEdn e
@@ -74,7 +74,12 @@ instance FromEdn Value where
     EStr t   -> Right (VStr t)
     EBool b  -> Right (VBool b)
     EKw k    -> Right (VKw (Keyword k))
+    EVec xs  -> VTuple <$> mapM part xs
     _        -> Left "not a value"
+    where
+      part ENil     = Right Nothing
+      part (EVec _) = Left "a tuple does not hold a tuple"
+      part x        = Just <$> fromEdn x
 
 -- | An integer is an existing entity; @[:tmp n]@ is a placeholder.
 instance FromEdn Ref where
@@ -154,6 +159,23 @@ decCleanOptions e = do
   n <- fromEdn (field "max-chunks" e)
   pure defaultCleanOptions { coMaxChunks = maybe (coMaxChunks defaultCleanOptions) id n }
 
+-- | The attribute, where to start (@:after@ may be left out, or nil: from the top) and how many.
+decHighest :: Edn -> Either Text (Keyword, Maybe (Value, HosiId), Int)
+decHighest e = do
+  a <- fromEdn (field "attr" e)
+  n <- fromEdn (field "limit" e)
+  after <- case field "after" e of
+    ENil -> Right Nothing
+    p    -> (\v i -> Just (v, i)) <$> fromEdn (field "val" p) <*> fromEdn (field "id" p)
+  Right (a, after, n)
+
+-- | The tuple attribute, the keys, where to start (as for @highest@) and how many.
+decHighestIn :: Edn -> Either Text (Keyword, [Value], Maybe (Value, HosiId), Int)
+decHighestIn e = do
+  (a, after, n) <- decHighest e
+  ks <- fromEdn (field "keys" e)
+  Right (a, ks, after, n)
+
 decFreezeOptions :: Edn -> Either Text FreezeOptions
 decFreezeOptions e = do
   n <- fromEdn (field "max-units" e)
@@ -182,6 +204,16 @@ instance ToEdn Value where
     VStr t    -> EStr t
     VBool b   -> EBool b
     VKw k     -> toEdn k
+    VTuple xs -> EVec (map (maybe ENil toEdn) xs)
+
+-- | The facts of one attribute, as the places they hold in its order: @[{:val 75 :id 1001} ...]@.
+encPlaces :: [Datom] -> Edn
+encPlaces ds = EVec [ EMap [(EKw "val", toEdn (dV d)), (EKw "id", toEdn (dE d))] | d <- ds ]
+
+-- | The facts of a tuple of (key, order) as places: @[{:key k :val order :id e} ...]@.
+encKeyedPlaces :: [Datom] -> Edn
+encKeyedPlaces ds =
+  EVec [ EMap [(EKw "key", toEdn k), (EKw "val", toEdn o), (EKw "id", toEdn (dE d))] | d <- ds, VTuple [Just k, Just o] <- [dV d] ]
 
 instance ToEdn Kind where
   toEdn = EKw . T.pack . kindName

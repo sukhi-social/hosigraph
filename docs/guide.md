@@ -4,11 +4,9 @@ This is the whole guide. The short, friendly introduction is the [README](../REA
 
 A small embedded database that **keeps the past as events**, and keeps **"now" as a copy you can throw away**.
 
-This is the **Phase 1 prototype** of the [design document v0.2.0-draft](hosiDB-design-v0.2.0-draft.md),
-with the first half of **Phase 2** on top: the Binary Fuse filter and the "deep path" that reads a chunk by ranges (see "Phase 2 so far"),
-and the local part of **Phase 3**: Erase, cleaning and freezing (see "Phase 3 so far").
-**S3 itself is not here yet.**
-The project used to be called **hosiDB**, and the design document still uses that name. The code is in Haskell.
+It follows the [design document v0.2.0-draft](hosiDB-design-v0.2.0-draft.md), which calls the project **hosiDB**: the events and the khana,
+the Binary Fuse filter and the "deep path" that reads a chunk by ranges (see "The filter and the deep path"),
+and the local part of Erase, cleaning and freezing (see "Erase, clean and freeze"). **S3 itself is not here.** The code is in Haskell.
 
 ## The idea
 
@@ -26,7 +24,7 @@ The project used to be called **hosiDB**, and the design document still uses tha
                 └───────────── fold ───────────────┴──────────► khana/  (now, Datalog)
 ```
 
-The goal of Phase 1 is small: **write, seal, restart, and get the same answers.**
+What it promises first: **write, seal, restart, and get the same answers.**
 The tests stop the system in 5 places and check the result.
 They also test a khana that is behind the events and a khana that is ahead of them.
 
@@ -40,7 +38,7 @@ They also test a khana that is behind the events and a khana that is ahead of th
 | **Events** | The part that holds the truth: the tail log, the chunks, the manifest, and "find the events of one ID". The name is a placeholder (`Sky` was another candidate). |
 | **Probe** | The check for a point lookup. It is a pun: `Hosi` + `Khana` sounds like "hoshi kana", "is it a star?" |
 
-`historyTrace` asks the chunk's filter first (see "Phase 2 so far"); a chunk that the filter turns away is never opened.
+`historyTrace` asks the chunk's filter first (see "The filter and the deep path"); a chunk that the filter turns away is never opened.
 After the MPHF (see "How the files are laid out") says "it is here", Probe asks the slot twice. It answers one of four things:
 
 * `Star`: the key matches.
@@ -57,13 +55,12 @@ The khana lives in Datalevin, so to use a database you also need either a JDK 21
 
 Everything is in this repository. [`takka/`](../takka/README.md) holds the words that hosigraph and Datalevin share
 (values, schema, EDN, and the syntax of Datalog queries and pull patterns), in plain Haskell. cabal builds it together with hosigraph.
-Takka was called Hevin before; "takka" is Pali for reasoning and logic.
-(Takka once also had a small database engine on dlmdb, and hosigraph could keep its khana there. That was removed. It is in the git history, commit `2aee1d7`.)
+"Takka" is Pali for reasoning and logic.
 
 ```sh
 cabal build all
 cabal run hosigraph-demo                 # a walk-through that moves a clock from November to December
-cabal test                               # 30 tests that need no Datalevin; more with Datalevin (see below)
+cabal test                               # the tests that need no Datalevin; more with Datalevin (see below)
 ```
 
 Tested: GHC 9.10.3 with `cabal build all`, on macOS (arm64). Linux is not tested here;
@@ -71,8 +68,7 @@ the GitHub Actions workflow ([`test.yml`](../.github/workflows/test.yml)) runs t
 
 > **`scripts/build-ghc.sh`** builds with plain `ghc`, for machines where cabal cannot reach Hackage:
 > `scripts/build-ghc.sh app` (or `test`). It writes to `build/`. Plain `ghc` must be able to see `aeson` (and `QuickCheck` for the tests).
-> **It has not been run to the end yet.** An older version stopped at once because `$target` was never set; that is fixed,
-> but on the Mac where this was tried, plain `ghc` could not see `aeson`. Use cabal until then.
+> **It has not been run to the end.** On the Mac where it was tried, plain `ghc` could not see `aeson`. Use cabal.
 
 ### Run the tests against Datalevin
 
@@ -85,10 +81,10 @@ HOSIGRAPH_DATALEVIN_JAR=/path/to/datalevin-1.2.10-standalone.jar HOSIGRAPH_JAVA=
 
 | You give | Tests that run |
 |---|---|
-| nothing | 30 (events, chunks, filters, the deep path, tail log, the EDN writer) |
-| `dtlv` | not counted again since Phase 2 (it was 46) |
-| the JVM | not counted again since Phase 2 (it was 47) |
-| `dtlv` and the JVM | all 100 (including: write with the JVM and read with `dtlv`, and the reverse) |
+| nothing | those of the events, chunks, filters, the deep path, the tail log and the EDN writer |
+| `dtlv` | those, and the ones that use the khana through `dtlv` |
+| the JVM | those, and the ones that use the khana through the JVM |
+| `dtlv` and the JVM | all of them (including: write with the JVM and read with `dtlv`, and the reverse) |
 
 The same scenarios run on `dtlv` and on the JVM. The tests choose the khana themselves.
 
@@ -127,15 +123,139 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `writeMany` | Many batches with one append, one fsync, and one khana transaction. |
 | `getEntity`, `query`, `queryCells` | Read **now**. |
 | `getEntities`, `queryMany`, `queryCellsMany` | Read **now**, many questions at once. |
+| `highest` | The *n* facts of one attribute with the largest values, from the end of its index; a page after a page. See "Order and cut". |
+| `highestIn` | `highest` for the facts of some keys only (the newest notes of the people one follows), merged from a tuple `(key, order)`. See "`highestIn`". |
 | `history`, `historyTrace` | Read **the past**: every event of one ID, from the chunks and the tail log. `historyTrace` also shows which chunks it skipped (by the zone map, and by the filter) and what each probe answered. |
 | `seal` | Turn the tail log into chunks. `HosiConfig` can also seal by itself, by size or by age. |
 | `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events** (a second khana is made in a temporary directory beside the first, and the two are compared 10,000 facts at a time). An empty list means all good. It takes about as long as a rebuild, and then some; see Measurements. |
 | `rebuildKhana` | Throw the khana away and fold the events again. |
-| `erase` | Make entities gone, from the events and from "now": some ids, a range of ids, a span of creation time, or what an account owns. See "Phase 3 so far". |
+| `erase` | Make entities gone, from the events and from "now": some ids, a range of ids, a span of creation time, or what an account owns. See "Erase, clean and freeze". |
 | `clean` | Let what `erase` took out go from the disk: write the chunks again without it, and make the khana a new file. |
 | `freeze` | Put a month that nobody has read or written for a while into one cold chunk. Does nothing unless `hcColdAfterMs` is set. |
 
 You can also use `Hosigraph.Events` alone, without a khana. The tests cover this. Which of its names are promised: see "What 0.1 promises".
+
+## Order and cut, tuples, and words
+
+What a timeline, a "does this pair exist" check and a search box need. All three are the khana's: they are about "now", and none of them is written into the events.
+
+### `:order-by`, `:limit`, `:offset`
+
+```haskell
+query h "[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a] :order-by [?a :desc ?n] :limit 20 :offset 40]" []
+```
+
+They are Datalevin's, and they work for a **relation** find (`:find ?n ?a`) only. With `:find ?x .` or `:find [?x ...]` Datalevin 1.2.10 answers the whole set, in no order, and says nothing;
+so hosigraph refuses those forms before they are asked (`parse-error` at the C door). Ask for the rows and take the column you want.
+
+* In the vector form, `:order-by [?a :desc ?n]` is a variable and then `:asc` (the default) or `:desc`. In the map form it is a vector of pairs, `{:order-by [[?a :desc] [?n]]}`; a flat `[?a :desc]` there is refused, because Datalevin would read it as ascending.
+* `:limit` is 1 or more (Datalevin: 0 is an error, and a negative number means no limit at all, so both are refused); `:offset` is 0 or more. Either may be a scalar of `:in`: `:in $ ?k ... :limit ?k`.
+* Rows come back in the order asked. (Without `:order-by` the order is still not promised.)
+
+**`:limit` does not make a query cheaper.** Datalevin finds every row that matches, sorts them, and then cuts. Measured on 200,000 notes (JVM, one machine, medians of 20 runs with the input changed each time, since Datalevin keeps answers):
+all rows 64 ms; `:order-by [?ts :desc] :limit 20` 94 ms (more: it sorts); the same inside a window of the newest 50,000, 21 ms; for one author's 400 notes, 1.5 ms.
+So narrow first (a window of ids or time, an author), and order and cut after. For "the newest *n*" of a whole attribute there is a call that does not sort: `highest`, next.
+
+### `highest`: the newest *n*, without sorting all of them
+
+(`highest` and `highestIn` are **experimental** in 0.2: [the names](#the-names).)
+
+```haskell
+page1 <- highest h "note/at" Nothing 20                                          -- [Datom id "note/at" value], the largest value first
+page2 <- highest h "note/at" (Just (dV (last page1), dE (last page1))) 20        -- the 20 after the last one
+notes <- getEntities h (map dE page1)                                            -- what they hold, from the same khana
+```
+
+It walks one attribute's index from its high end and stops after *n* facts (Datalevin's `rseek-datoms` with a count), so what it costs does not grow with the number of facts there are.
+On 200,000 notes (Datalevin in the JVM, medians of 20 runs with the count or the start changed each time): the first 20 took 0.05 ms, 20 from the middle 0.04 ms (at 20,000 notes, 0.15 ms and 0.11 ms);
+the query `:order-by [?ts :desc ?e :desc] :limit 20` on the same notes took 92 ms (9 ms at 20,000). Add the trip to the khana: a fraction of a millisecond with the JVM, a process start with the native `dtlv`.
+
+* **The order:** the largest value first and, among equal values, the largest id first (an id is made from its creation time, so it grows). It is the order a query with `:order-by [?v :desc ?e :desc]` gives (a test holds the two together).
+* **The cursor is a place, `(value, id)`:** a fact that need not exist. The answer is what comes after it in that order, and not the place itself, so the value and id of the last fact of a page is the cursor of the next.
+  (Datalevin applies the id of a start to every value of the range, and not to the first only, so the start is given as the value alone and what the cursor has passed at that value is dropped. A value that many facts share costs as many reads as it has facts;
+  when they are more than the page it asks again for twice as many, in the same call and the same snapshot.)
+* **No filter.** It cannot be given "only these authors" or "this month". For "only these keys" (the people one follows) there is `highestIn`, next. For any other filter, ask for more than you need and drop what fails, or use a query over a window.
+* **The attribute has to be in the schema with a type** (`TLong`, `TString`, ...). Datalevin keeps an attribute with no type in an order of its bytes that is of no use (tried: 200, 5, 40, -3 came out in that order), so `TAny` is refused, and so is an attribute that is not in the schema.
+  A tuple is refused (its order was not tried). The cursor's value has the attribute's type. A refused call is a `BadArgument` (`bad-argument` at the C door), and the count is 1 or more.
+* The order is Datalevin's for the type: numbers by size (doubles with their sign, tried), strings by their bytes (a long string was not tried). A many-valued attribute has one place per value.
+* **Through the C door** it is `highest`: `{:op :highest :args {:attr :note/at :limit 20 :after {:val 1700000000000 :id 5678}}}`, and the answer is `[{:val .. :id ..} ...]`: give the last one as `:after` for the next page. In Elixir, `Hosi.highest(db, :"note/at", 20, after: place)`.
+
+### `highestIn`: the newest *n* of some keys
+
+"The newest 20 notes of the people I follow." The facts are *some keys'*, not the whole attribute, so `highest` does not do it. `highestIn` does: it walks a short run for each key and merges them.
+
+```haskell
+-- the schema: the notes' author and time, and the pair of them, which the khana keeps
+schema = M.fromList [ ("note/by", attr TString), ("note/at", attr TLong)
+                    , ("note/by+at", tuple ["note/by", "note/at"]) ]
+
+let keys = map VStr followed
+    place d = case dV d of VTuple [_, Just t] -> (t, dE d); _ -> error "a pair"     -- (the order value, the id)
+page1 <- highestIn h "note/by+at" keys Nothing 20                  -- [Datom id "note/by+at" (VTuple [Just author, Just time])], newest first
+page2 <- highestIn h "note/by+at" keys (Just (place (last page1))) 20   -- the 20 after the last one
+```
+
+* **The attribute is a pair `(key, order)`** of two attributes of one entity, in the schema with a type: the key is of any type but `TAny` (a string, a number, a reference: an author is an entity, so `ref` works), and **the order part has to be a `TLong`** (a time, a number). A pair that is not so is a `BadArgument`.
+  The answer is the facts of the pair attribute: `VTuple [Just key, Just order]`, so the author and the time are in it, and `getEntities` gives the rest.
+* **The order and the cursor are `highest`'s:** the largest order value first and, among equal values, the largest id first, *whichever key they are under*. The cursor is `Just (order value, id)` of the last fact of the page before (the place, which is not in the next page).
+  Two notes of one author at one time are told apart by the id, and are neither lost nor doubled between pages (tested with ties, in pages of 1, 2, 7 and 100).
+* **The keys:** a list, in any order. A key that has no facts, and a key given twice, are harmless. A key that is not of the key part's type is refused. An empty list gives an empty answer.
+* **What stays out:** an entity that has the key and not the order (or the order and not the key) has a half-made pair, and it is not in the answer.
+* **What it costs** is one seek for each key and one for each fact it gives, and so it does not depend on how many notes those keys have. Walking `highest` and dropping what is not the keys' costs a read for every fact newer than the last one that passes:
+  nothing when the keys are busy, the whole attribute when they are quiet (a walk of that kind, measured in Datalevin alone on 200,000 notes and 400 keys: 0.7 ms and 900 ms; that run did not go through hosigraph).
+  **Through hosigraph**, with the JVM khana (Apple M4; 200,000 made-up notes; the newest 20 of the first *k* keys; medians of 15 calls with the count changed each time, since Datalevin keeps answers; `Hosi.query` with `:order-by [?ts :desc ?e :desc] :limit 20` is the same question asked as a query, and gave the same facts every time):
+
+  | notes for each key | keys | `highestIn` | the query |
+  |---|---|---|---|
+  | about 40 (5,000 keys) | 10 | 5.9 ms | 5.9 ms |
+  | | 100 | 5.7 ms | 12.6 ms |
+  | | 400 | 6.4 ms | 28.5 ms |
+  | | 1,000 | 15 ms | 65 ms |
+  | 400 (500 keys) | 10 | 2.8 ms | 11 ms |
+  | | 100 | 2.4 ms | 50 ms |
+  | | 400 | 3.9 ms | 240 ms |
+
+  The query's time follows the notes the keys have (about 1.5 µs a row, and it sorts them all); `highestIn`'s follows the keys (about 10 µs a key) over **a floor of 2 to 6 ms** for every call.
+  So with few keys that wrote little (10 keys, 40 notes each) the query does as well, and the more the people have written, the more `highestIn` is for.
+  Where the floor goes was not looked into. The same walk written as compiled Clojure took 0.27 ms in a spike, so it is probably the script, which the khana reads and runs afresh for each call.
+  With `KhanaDtlv`, every call starts a process, and both are tens of milliseconds (400 keys, 40 notes each: 29 ms against 55 ms).
+  The program that took these numbers is not in the repository (a small one over `openHosiWith`, `write` in batches of 5,000 notes, `highestIn` and `query`).
+* **A filter that is not "the key is one of these"** (hidden, muted, followers only): ask for more than you need, drop what fails, and go on from the last fact you looked at. It was not measured how that does when the filter drops most of what it sees.
+* **What the tuple costs at write** (one more datom and one more index entry for each note) was not measured.
+* **Through the C door** it is `highest-in`: `{:op :highest-in :args {:attr :note/by+at :keys ["u1" "u7"] :limit 20 :after {:val 1700000000000 :id 5678}}}`, and the answer is `[{:key "u7" :val 1700000000000 :id 5678} ...]`; give the last one's `:val` and `:id` as `:after`. In Elixir, `Hosi.highest_in(db, :"note/by+at", ["u1", "u7"], 20, after: place)`.
+  Only the shape of the call was tested there, on a small world; the times above are the Haskell call's.
+
+### Tuples: `tuple`
+
+```haskell
+schema = M.fromList [ ("follow/from", ref), ("follow/to", ref)
+                    , ("follow/pair", identity (tuple ["follow/from", "follow/to"])) ]
+```
+
+`follow/pair` is the tuple of the other two (a *composite tuple*, Datalevin's). The khana keeps it up to date as they are written; you do not write it.
+
+* **A tuple is never written.** `Create … "follow/pair" (Lit (VTuple …))` is a `BadArgument` before anything is logged, and any other value written to it is a `WriteRejected`, which leaves nothing in the log either.
+* **Reading:** `getEntity` shows it as `VTuple [Just (VInt 12), Just (VInt 34)]` (`Nothing` for a part that is not there). It can be asked for in the query text, `[?e :follow/pair [12 34]]`, or as an input, `[InScalar (VTuple [Just (VInt 12), Just (VInt 34)])]` with `[?e :follow/pair ?p]`.
+* **With `identity`, a pair is held once:** a second entity with the same pair is refused (`WriteRejected`), so "follow" can be written without looking first. **Write the parts of one entity in one batch.** While a part is missing the tuple is `[a nil]`, and two entities that are alike so far have the same tuple, so the second write is refused.
+* A tuple holds plain values, not a tuple, and has one value (not `many`). Datalevin's other tuples (a tuple of one type) are not exposed.
+* **Through the C door** a tuple is a vector with `nil` for a part that is missing (`[12 34]`). It is read (`get-entities`, the rows of a query), and asked for in an input (`[:scalar [12 34]]`) or in a condition of `write`; it is not written there either.
+* The parts are in the schema mark: another list of parts is another schema, and the khana is made again at the next open.
+* `erase` and `clean` take it with its parts. A pull of a tuple attribute was not tried.
+* **A tuple `(key, order)` is what `highestIn` walks:** the newest facts of some keys, merged. See "`highestIn`".
+
+### Words: `fulltext`
+
+```haskell
+schema = M.fromList [ ("note/body", fulltext (attr TString)) ]
+-- [:find ?e ?v :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]      with InScalar (VStr "fox")
+```
+
+* **Only with `KhanaDatalevinJvm`.** The words are made by an analyzer that has to run inside the JVM; with the native `dtlv` the schema is refused at open (`SchemaRefused`, before anything is made).
+* **What a word is:** a run of letters and digits, lower-cased. A run of Han, kana or hangul is cut into overlapping pairs of characters, so that it is found by any two of its characters in a row. (A search for one such character on its own does not find it.)
+  This is one analyzer, fixed; nothing about stems, stop words or a language was tried. Another analyzer will be another version (`words/1` is in the schema mark), and the khana is made again under it.
+* The query is Datalevin's `fulltext`: with the attribute, `(fulltext $ :note/body ?q)`; without it, `(fulltext $ ?q)` searches every fulltext attribute; `{:top 5}` is an option (a last argument). Several words are matched as Datalevin matches them (best first); a phrase search was not tried.
+* It follows the data: a value that is taken out or changed is out of the index, and an erased note is found no more.
+* **`clean` always makes the khana again from the events** when the schema has a `fulltext` attribute (`crKhanaRebuilt` is `True`). The quick way, a compacted copy, **keeps the words of an erased value** (tried: an erased word was still in two files of the copy). The cost is the cost of `rebuildKhana`.
 
 ## Where "now" lives
 
@@ -204,7 +324,7 @@ bump h post = do
 * `writeMany` has no conditions: a later batch may depend on what an earlier one did.
 * The check reads the same "now" that `getEntity` reads, so what you read and what the check sees can only differ
   if somebody wrote in between. That is what `Holds` is for.
-* Seen in testing: with `KhanaDtlv`, a read made at the very moment another call writes could fail to open the
+* With `KhanaDtlv`, a read made at the very moment another call writes can fail to open the
   database. The lock only orders the writers; it does not stop an outside read. (The JVM backend was not tried for this.)
 
 Through the C door it is the same call: `write` takes an optional `:when`, a vector of `[:holds id attr v]`,
@@ -262,7 +382,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 
 * **Grouping helps `KhanaDtlv` most**, because starting a process is almost all of its time (200 entities: about 180 times faster; 6 queries: about 5 times).
   A JVM call is cheap already (about 50 times; about 2 times).
-* The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms; measured earlier, not again). hosigraph calls only `fsync(2)`,
+* The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms; not part of the run above). hosigraph calls only `fsync(2)`,
   and on macOS that does not wait for the disk write cache. On systems that really wait, the time is higher. It is not measured.
 
 **What a world costs.** A made-up world: 25,000 entities of 4 facts each (name, age, score, tag), so **100,000 events**, written in groups of 500 by `writeMany`:
@@ -279,7 +399,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 
 * Opening with the JVM takes about 1.4 s even when nothing is to be done: that is the JVM starting.
 * **Real data is much slower to make again than this.** A copy of a real server's data (527,971 events, 54,402 entities, 288 attributes, 53 chunks, 96 MB, 2026-11-07), one run each:
-  with `KhanaDtlv` the khana was made again in **34 s** with the world on the Mac's internal disk (an earlier run, with the world on an external SSD: 71 to 111 s, about 0.13 ms for each event, against 0.02 ms above),
+  with `KhanaDtlv` the khana was made again in **34 s** with the world on the Mac's internal disk (with the world on an external SSD: 71 to 111 s, about 0.13 ms for each event, against 0.02 ms above),
   and with the JVM in **7 s** (an open that has to do it: 10 s). The same again when the schema changes.
   Plan the worst open for `KhanaDtlv` as **events × 0.15 ms** (the slower disk) and for the JVM as **events × 0.02 ms**; use these, not the made-up number.
 * **`verify` makes a second khana and compares the two a page at a time** (10,000 facts, whole entities), so it costs a rebuild and a walk through both, and what it holds is a page, not the khanas.
@@ -288,7 +408,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
   Each page is asked from Datalevin with a count (`seek-datoms` with `n`). Without the count, Datalevin makes every fact after the start before anything is cut (read in its source), and the JVM ran out of 2 GB.
   A page of 50,000 facts held 605 MB in hosigraph, which is why the page is 10,000.
 * The memory of `KhanaDtlv` is the largest of its processes, from `time -l` over the whole run; sampling every 25 ms misses a process that lives for 25 ms (the sampling saw 40 MB, and `time -l` saw 89 MB).
-  An earlier measure (2026-11-13, a made-up world of 100,000 *people*) saw about 260 MB for one `dtlv` and about 300 MB resident for the JVM that a smaller heap did not remove. The memory depends on the data.
+  On a made-up world of 100,000 *people* (2026-11-13) one `dtlv` took about 260 MB, and the JVM about 300 MB resident that a smaller heap did not remove. The memory depends on the data.
   The JVM is started with no heap setting.
 * A world of 25,000 entities is **small**. Nothing here was measured above 530,000 events.
 
@@ -301,16 +421,15 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
   A canary test tells you when upstream fixes it.
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
-* The order of rows is not guaranteed (a Datalevin answer is a set). Sort the rows before you compare them.
+* The order of rows is not guaranteed (a Datalevin answer is a set), **unless the query has `:order-by`** (see "Order and cut"). Sort the rows before you compare them otherwise.
 * Tested only with Datalevin 1.2.10 on macOS arm64 (JVM: Temurin 21). Its numbers (calls, opens, memory) are in "Measurements", for one machine.
 * **One opener at a time.** A world (a directory) is open in one place at a time: the first `openHosi` takes a lock (`events/lock`, `flock(2)`) and keeps it until `closeHosi`;
   a second one, in this process or in another, stops with `WorldBusy` before it touches anything.
   The lock is let go when the process dies, however it dies; a `lock` file left behind means nothing.
-  Without it two writers overwrite each other's records in the tail log, and each is told that its write went in
-  (tried on 2026-11-16: two processes, 300 writes each, 300 records left; with seals going on, a second one died on `manifest.tmp`).
+  It keeps two writers from overwriting each other's records in the tail log.
   Not promised: a directory on a network file system (`flock` may say yes to two machines), and Windows (there is no `System.Posix` there).
-  This is for writers and readers alike: **in 0.1 a world has one opener, and a second process cannot even read a world that the first one has open.**
-  A lock that readers share (for a backup, or an inspector) is not in 0.1; it is in `TODO.md`. To read a world that is open elsewhere, copy `events/` while its owner is closed, or ask its owner.
+  This is for writers and readers alike: **in 0.2 a world has one opener, and a second process cannot even read a world that the first one has open.**
+  A lock that readers share (for a backup, or an inspector) is not in 0.2; it is in `TODO.md`. To read a world that is open elsewhere, copy `events/` while its owner is closed, or ask its owner.
 
 ## Errors
 
@@ -326,24 +445,25 @@ A `HosiError` says which kind it is, so that you can answer it without reading t
 | `SchemaRefused` | `schema-refused` | the khana cannot be made under this schema (a type that clashes with the data, a unique value that is not unique); nothing was changed | open again with the schema the world was made with |
 
 A khana that fails while it runs (the `dtlv` process or the JVM) is not a `HosiError` yet. It is a `DtlvError`, a bare string, and the C door tells it as `HOSI_ERR_INTERNAL`.
-So a backend that has failed cannot be told from a query that the caller wrote wrongly and that reached the khana (a Haskell caller's `query`; the C door reads the query first and refuses it as `parse-error`). That is left for after 0.1.0 (see `TODO.md`).
+So a backend that has failed cannot be told from a query that the caller wrote wrongly and that reached the khana (a Haskell caller's `query`; the C door reads the query first and refuses it as `parse-error`). Making it a kind of its own is in `TODO.md`.
 
 ## What 0.1 promises
 
-hosigraph 0.1 is **an embedded database for one process on one machine, on a local disk.** It brings Datalevin along
+hosigraph 0.1 was, and 0.2 still is, **an embedded database for one process on one machine, on a local disk.** It brings Datalevin along
 (the `dtlv` program, or JDK 21 and the standalone jar), and the README says so on its first screen.
-**What 0.1.0 wrote, every 0.1.x reads.** The names listed as stable stay. The rest may change.
-The reason for this size: "local, one process" can be promised now. S3 brings failures of the network, which is a different promise (0.2).
+**What 0.1.0 wrote, every 0.1.x and 0.2.x reads.** The names listed as stable stay. The rest may change.
+0.2 asks more of the khana (an order, tuples, words) and **nothing more of the files**: the fixture of 0.1.0 is opened by every build, and a schema that uses none of the new things is the schema it was, so its khana is not made again.
+The reason for this size: "local, one process" can be promised now. S3 brings failures of the network, which is a different promise (0.3).
 
 ### The files
 
 | File | What is promised |
 |---|---|
-| `events/manifest` | `hosi-manifest/1` and `/2` are read by every 0.1.x. A format this code does not know is refused (`Corrupt`), and nothing is touched. |
+| `events/manifest` | `hosi-manifest/1` and `/2` are read by every 0.1.x and 0.2.x. A format this code does not know is refused (`Corrupt`), and nothing is touched. |
 | `events/chunks/*/chunk.hosi` | `HOSICHK1`, **versions 1 and 2**, are both read (a world that began before 0.1 has version 1). New chunks are version 2. A later layout will have a new version number, not a changed meaning. |
-| `filter.bin`, `mphf.idx` | Version 1 of each. A chunk may have neither (a chunk from before Phase 2, or a cold chunk). |
+| `filter.bin`, `mphf.idx` | Version 1 of each. A chunk may have no `filter.bin` (it is read without it) or no `mphf.idx` (a cold chunk). |
 | `events/erase/*.bin` | `HOSIERS1`. |
-| `events/tail.log` | Records of `length:4  crc32:4  payload`, with **no header**. The first four bytes `HOSI` are reserved: no record of this format starts that way (read as a length, it would be 1.1 GiB), so a later format may begin with a mark that starts with them. 0.1.x **refuses** such a file (`Corrupt`) and does not cut it. Without the refusal, a log that cannot be read at its first record looks like a torn end, and the open cuts the file there (this is from reading the code; the cut was not run). A **torn end** (a crash in the middle of an append: the last record is short, or does not match its CRC) is cut at the open. A bad record with a **whole record after it** is not a torn end but damage: the open is refused (`Corrupt`, with the byte where the bad record begins), and the file is not cut. To open anyway, keep a copy and cut `tail.log` at that byte (what follows is lost). A damaged *last* record cannot be told from a torn one, and is cut. |
+| `events/tail.log` | Records of `length:4  crc32:4  payload`, with **no header**. The first four bytes `HOSI` are reserved: no record of this format starts that way (read as a length, it would be 1.1 GiB), so a later format may begin with a mark that starts with them. 0.1.x and 0.2.x **refuse** such a file (`Corrupt`) and do not cut it. A **torn end** (a crash in the middle of an append: the last record is short, or does not match its CRC) is cut at the open. A bad record with a **whole record after it** is not a torn end but damage: the open is refused (`Corrupt`, with the byte where the bad record begins), and the file is not cut. To open anyway, keep a copy and cut `tail.log` at that byte (what follows is lost). A damaged *last* record cannot be told from a torn one, and is cut. |
 | `khana-dtlv/` | **Nothing.** It is derived. A khana that is missing, behind, or made under another schema is made again from the events. |
 | `events/access.json`, `events/lock` | Nothing. A hint, and a lock; both may be missing. |
 
@@ -355,13 +475,13 @@ Not tried: a world written by a build *older* than 0.1.0 (0.0.1.0). Its chunks a
 
 ### The names
 
-`Hosigraph` lists them in the export list, in groups. Those **before the heading "Experimental"** are stable: within 0.1.x they are not removed, and what they mean does not change.
-New names, new fields in `HosiConfig` and in the reports, and new constructors of `HosiError` may come. So: build a config with `defaultConfig { … }`, and keep a catch-all case when you match an error.
+`Hosigraph` lists them in the export list, in groups. Those **before the heading "Experimental"** are stable: within 0.2.x they are not removed, and what they mean does not change.
+New names, new fields in `HosiConfig`, in the reports and in `AttrSchema`, and new constructors of `HosiError` and of `Value` may come. So: build a config with `defaultConfig { … }`, and keep a catch-all case when you match an error.
 
 | | Names |
 |---|---|
 | **Stable** | Opening (`Hosi`, `HosiConfig`, `defaultConfig`, `openHosi`, `openHosiWith`, `closeHosi`, `withHosi`, `KhanaBackend`); writing (`Op`, `Ref`, `Val`, `write`, `writeMany`, `writeIf`, `Cond`, `seal`, and their reports); `erase`, `clean`; reading now (`getEntity`, `query`, `queryCells`, and the `…Many` forms); `history`; `rebuildKhana`, `verify`; ids; `HosiError`, `Event`, `Kind`; the words of the khana that `Hosigraph` re-exports. |
-| **Experimental** (may change, or go, in a 0.1.x; the changelog says so) | `freeze` (when a month is cold is not settled; the cold chunk's file is promised, the call that makes it is not); `historyTrace`, `LookupTrace`, `Probe`; `Stats`, `stats`; `Coverage`, `backfillSince`. |
+| **Experimental** (may change, or go, in a 0.2.x; the changelog says so) | `freeze` (when a month is cold is not settled; the cold chunk's file is promised, the call that makes it is not); `historyTrace`, `LookupTrace`, `Probe`; `Stats`, `stats`; `Coverage`, `backfillSince`; `highest`, `highestIn` (an order that is not a long, and the other direction, may come; what they answer now is not meant to change). |
 | **Not promised** | Every module other than `Hosigraph`. They are exposed so that the tests and tools can reach them. |
 
 One exception: `Hosigraph.Events` **used alone** (no khana) is promised for `EventsConfig`, `defaultEventsConfig`, `openEvents`, `closeEvents`, `withEventsLock`, `record`, `recordMany`, `commit`, `rollback`, `seal`, `history`, `eventsAfter`, `lastSeq` and `verifyEvents`.
@@ -370,7 +490,7 @@ Whoever uses the events alone owns "now": there is no khana to keep in step with
 
 The C door (`hosigraph-abi`, `libhosi`) is not covered here. It was seen working on macOS only, and it has its own documents.
 
-### Not in 0.1
+### Not in 0.2
 
 S3, live serving of a backfill, distribution and sync, metrics, JSON-LD import, thaw and compression of cold chunks. Windows, and a directory on a network file system.
 
@@ -379,7 +499,7 @@ S3, live serving of a backfill, distribution and sync, metrics, JSON-LD import, 
 | Word in the design document | Form here |
 |---|---|
 | Tail log | `events/tail.log`. One `write` is one record (length + CRC32). If a record is cut, hosigraph keeps what is before the cut and removes the rest. |
-| Hot chunk | `chunk.hosi`, `mphf.idx` and `filter.bin` in `events/chunks/<name>/`. One chunk for each kind and (creation) month. Nobody changes it. A chunk from before Phase 2 has no `filter.bin` and is still read. |
+| Hot chunk | `chunk.hosi`, `mphf.idx` and `filter.bin` in `events/chunks/<name>/`. One chunk for each kind and (creation) month. Nobody changes it. A chunk with no `filter.bin` is still read. |
 | ID | `(milliseconds since 2026-01-01) << 21 \| sequence number` (63 bits). The ID alone tells you the month. |
 | MPHF | A *minimal perfect hash*: it gives each known key its own slot, with no collisions. This one is PTHash-style and written for this project (`Hosigraph.Mphf`). Each slot has a 32-bit fingerprint and the position of the body, which `Probe` checks. |
 | Lock | `events/lock`: empty. Held with `flock(2)` for as long as the world is open ("One opener at a time", under Limits). A file left behind means nothing. |
@@ -412,16 +532,15 @@ The names of the file formats (`HOSICHK1`, `hosi-manifest/1`, `hosi.meta/folded-
 | While `clean` made the khana new | The old khana stays until the new one is checked and renamed. A leftover `….new` directory goes at open. If it stopped between the remove and the rename, there is no khana at open, so hosigraph builds it again. |
 | While `access.json` was written | A leftover `access.json.tmp` goes at open. A missing or unreadable `access.json` means every month was just used, so nothing is frozen early. |
 
-## Phase 2 so far
+## The filter and the deep path
 
-The design document says Phase 2 is "S3 and the deep path. Zone maps, Binary Fuse filters, Range GET."
-and "A question about the past skips the chunks that it does not need to read."
-The zone map was already here. This is what was added, and what is still missing.
+The design document says "S3 and the deep path. Zone maps, Binary Fuse filters, Range GET."
+and "A question about the past skips the chunks that it does not need to read." Here are the zone map, the filter and the deep path; S3 is not here.
 
 **The order of the gates.** `history` (and `historyTrace`) asks each chunk the cheapest question first:
 
 1. the zone map in the manifest (month, ID range): no file is touched;
-2. the chunk's erase record, if it has one (Phase 3): it is in memory, so an erased ID is turned away without a read;
+2. the chunk's erase record, if it has one (see "Erase, clean and freeze"): it is in memory, so an erased ID is turned away without a read;
 3. the chunk's filter, `filter.bin`: one small file, read once and kept in memory;
 4. only for a "maybe": open the chunk reader;
 5. the MPHF slot, its fingerprint, and the key check.
@@ -430,7 +549,7 @@ The zone map was already here. This is what was added, and what is still missing
 (a test checks that `xsReadersOpen` stays 0). `verify` also checks that the filter never says no to an ID that is in the chunk.
 (The design document puts the erase check last. Asking it first gives the same answer for less work; see item 9 of [`design-notes.md`](design-notes.md).)
 
-**The deep path.** A reader now takes a `ChunkSource` (`Hosigraph.Chunk`): "give me these bytes of this file",
+**The deep path.** A reader takes a `ChunkSource` (`Hosigraph.Chunk`): "give me these bytes of this file",
 "give me this small file whole", "how big is `chunk.hosi`". `localSource` answers from a directory.
 An S3 bucket would answer the first one with Range GET. If the source has no `mphf.idx`, the reader does not need it:
 it binary-searches the footer's block table (first and last ID of each block) and reads **one block**.
@@ -448,18 +567,16 @@ The tests count the ranges too: opening takes 4 and less than a quarter of the f
 an ID past the last block takes none. The MPHF way and the block way give the same answers (a property test, for both chunk versions).
 `mphf.idx` is bigger than the data here (about 13 bytes an ID). On the deep path a chunk could do without it.
 
-**Still missing.**
+**Not here.**
 
-* **S3.** There is no S3 `ChunkSource`, no upload, and no manifest tier for a chunk that lives far away. `Events` only builds local sources.
-  The object store to build against is **RustFS** (decided). How hosigraph talks to it is not chosen yet. The package has no C and no HTTP or TLS stack,
-  so the candidates are a `curl` subprocess (`--aws-sigv4`, `-r` for ranges) or our own signing over an HTTP library. The plan is in [`TODO.md`](../TODO.md).
+* **S3.** There is no S3 `ChunkSource`, no upload, and no manifest tier for a chunk that lives far away. `Events` only builds local sources. The plan is in [`TODO.md`](../TODO.md).
 * The filters are kept in memory with no limit, outside `hcReaderCacheBytes` (about 2.3 to 2.8 bytes an ID). A bucket with millions of chunks needs a limit.
-* Only a cold chunk (Phase 3, `freeze`) is written without `mphf.idx`; the deep path is reached by it, and by a source that does not have the file.
+* Only a cold chunk (`freeze`) is written without `mphf.idx`; the deep path is reached by it, and by a source that does not have the file.
 
-## Phase 3 so far
+## Erase, clean and freeze
 
-The design document says Phase 3 is "Erase, cleaning, freezing". What is here is the **local** part: it needs no S3.
-The S3 side (a remote chunk that must be written again, old object versions, the sweep of a bucket) comes with S3 itself; see "Still missing" at the end of this section.
+The design document says "Erase, cleaning, freezing". What is here is the **local** part: it needs no S3.
+The S3 side (a remote chunk that must be written again, old object versions, the sweep of a bucket) is not here; see "Not here" at the end of this section.
 
 ### Erase: make entities gone
 
@@ -546,7 +663,6 @@ so a freeze **also finishes the Erase** on that unit (the records of the chunks 
 * `events/access.json` holds the use of each unit. It is written at every seal, at the end of `freeze`, and at close (a tmp file and a rename; no fsync, it is a hint; a failed write is ignored).
   Without `hcColdAfterMs` nothing is kept in memory and the file is never written. A stop between two writes of it loses the reads since the last one, so a month may look colder than it is and be frozen a little early.
   That costs a slower read, nothing else. A missing or unreadable file means "every month was just used".
-* No format number changed: `tier` was always in the manifest, and the reader already coped without `mphf.idx`.
 
 ### From the C door
 
@@ -595,13 +711,13 @@ So a record is small, and asking it costs nothing next to reading a block. The s
 | `freeze` of the month | 404 ms; one cold chunk, 5.97 MB (`chunk.hosi` 5.85 MB, no `mphf.idx`, `filter.bin` 0.12 MB) |
 | `history`, cold, warm | 87 µs an id (about 2.3 times the hot one); the same answers as before the freeze, and `verify` is clean |
 
-What to take from it: `freeze` saved **about 7 %** here, not "half". Its saving is the size of `mphf.idx`, and that is large only when an entity has few events (4,000 entities with one event each, in the Phase 2 numbers:
-the chunk without `mphf.idx` was about half the size). With 4 events an entity the events are most of the bytes and `mphf.idx` is 10 % of them. How much a real world saves depends on how many events an entity has.
+What to take from it: `freeze` saved **about 7 %** here, not "half". Its saving is the size of `mphf.idx`, and that is large only when an entity has few events (in the chunk of 4,000 entities with one event each under "The filter and the deep path",
+the chunk without `mphf.idx` would be about half the size). With 4 events an entity the events are most of the bytes and `mphf.idx` is 10 % of them. How much a real world saves depends on how many events an entity has.
 The cold read is slower for each id because it reads a block of 4,096 events and not 256; it is still microseconds. A first `history` after a reopen, with nothing cached, took 2 ms on the cold chunk.
 `ownedBy` is a scan: 73 ms for 200,000 events says about 0.4 µs an event, while writers wait; if it grows in a straight line, a world a hundred times bigger would hold writers for several seconds. The numbers for `clean`'s second half
 (the khana made new: a compacted copy, or a rebuild) were not taken at this size; in the tests the khana is small.
 
-### Still missing
+### Not here
 
 * **S3.** A remote chunk that has an erase record must be downloaded, written again and uploaded, and the old one deleted, with its old versions, and a sweep of the bucket needs a grace period.
   `ObjectStore.delete` waits for this. The count of deletions still pending belongs in `CleanReport` and `Stats`. Where the upload happens (at seal, as [`TODO.md`](../TODO.md) item 5 says, or at freeze,
@@ -609,9 +725,8 @@ The cold read is slower for each id because it reads a block of 4,096 events and
 * **Left out on purpose:** thaw, compression of cold chunks, merging cold chunks, a timer inside hosigraph, the other rules of freezing (the share of sequential reads, capacity pressure, free space),
   metrics and the capacity outlook (Phase 4), pruning horizons.
 * **Not tested:** "the world changed between the read and the lock" in a rewrite or a freeze (it needs a second writer at an exact moment; the check reads right to me, but I have not seen it bite);
-  stamping of use under real clocks and many readers at once; `clean` called from two threads at once; the Elixir binding (`hosigraph-ex`) has no wrapper for the three new calls yet.
-* **Not decided:** which attributes mean "owned by" in sukhi (they are an argument of each call, so hosigraph needs no setting); a separate S3 object for each owner and a dictionary for the cold data
-  (proposed in the plan, not built); how many chunks a world may have (below 10,000 chunks nothing was slower than 0.35 s in a probe; at 100,000 a seal took 1.2 to 1.7 s and the first `history` 14 s).
+  stamping of use under real clocks and many readers at once; `clean` called from two threads at once.
+* **How many chunks a world may have:** below 10,000 nothing was slower than 0.35 s in a probe; at 100,000 a seal took 1.2 to 1.7 s and the first `history` 14 s.
 
 ## Reading the past into a khana, newest first
 
@@ -657,8 +772,7 @@ Entities created before the month you gave are not read at all: their chunks are
 * It holds the events lock for the whole reading, so writes wait, and the callback must not write to this `Hosi`. Serving it as the world's own khana while it is still being built ("live serving") is not built (note 10 of the design notes says what it needs, and [`TODO.md`](../TODO.md) lists the open points).
 * The erased ids are left out, as a rebuild leaves them out.
 
-**Measured** on the sukhi cold copy (527,971 events in 53 chunks, one month: they were all written when the world was loaded; `dtlv` khana): 54 steps, **106.6 to 109 s** (in the same run the world's own khana took 111 s to build from the events;
-an earlier run of that build took 71 s), the Haskell process peaked at **about 131 MB** (the `dtlv` processes are not counted), and the khana it made held the same 527,971 facts as the world's own (the sets are equal).
+**Measured** on the sukhi cold copy (527,971 events in 53 chunks, one month: they were all written when the world was loaded; `dtlv` khana): 54 steps, **106.6 to 109 s** (in the same run the world's own khana took 111 s to build from the events), the Haskell process peaked at **about 131 MB** (the `dtlv` processes are not counted), and the khana it made held the same 527,971 facts as the world's own (the sets are equal).
 Almost all of the time is `dtlv` (one process for each transaction of 2,000 facts): the program's own CPU time was 2.8 s, and 3.5 s of garbage collection. This world has no updates or deletes, so the run says what the reading costs, not how a half-built entity looks; the tests do that.
 
 ## From other languages (`setu/`, `hosigraph-abi/`)
@@ -670,7 +784,7 @@ Neither touches `hosigraph` or `takka`, and `hosigraph`, `takka` and `setu` stil
   the operations, the shape of each argument and answer (`Ty`), and the error kinds. It is a set of pure functions from the description to text,
   so the files it writes are committed and `--check` tells you when they are out of date. It also holds what every door shares:
   the table of waiting requests (`Setu.Ticket`) and the table of operations (`Setu.Dispatch`).
-* **`hosigraph-abi/`** is the first customer. `Hosigraph.Abi.Api` describes hosigraph (`write`, `write-many`, `get-entities`, `query-many`,
+* **`hosigraph-abi/`** is the first customer. `Hosigraph.Abi.Api` describes hosigraph (`write`, `write-many`, `get-entities`, `highest`, `highest-in`, `query-many`,
   `query-cells-many`, `history`, `history-trace`, `seal`, `verify`, `stats`, `rebuild-khana`, `erase`, `clean`, `freeze`); `gen/` holds what setu writes from it:
   `include/hosi.h`, the Haskell `foreign export`s, and a small C file that starts the Haskell runtime and guards the calls.
   The shared library is `libhosi`.
@@ -693,10 +807,10 @@ python3 -I hosigraph-abi/test/abi_conformance.py <path to libhosi>   # the rules
 cabal test setu:spec hosigraph-abi:spec
 ```
 
-`erase`, `clean` and `freeze` are in the description, so the door has them (see "Phase 3 so far"); the generated files did not change when they were added.
+`erase`, `clean` and `freeze` are in the description, so the door has them (see "Erase, clean and freeze").
 The ctypes conformance does not call them (it uses a fake database); the Haskell tests do, through the dispatcher, over a real hosigraph.
 
-What has been seen working: the Haskell tests above, and the ctypes conformance on macOS (arm64, GHC 9.6.7 when it was first tried; the Haskell tests also pass on 9.10.3). What has not:
+What has been seen working: the Haskell tests above, and the ctypes conformance on macOS (arm64; the Haskell tests also pass on GHC 9.10.3). What has not:
 
 * The operations against a real database. `hosigraph-abi:spec` runs them when `HOSIGRAPH_DTLV` (or `HOSIGRAPH_DATALEVIN_JAR` and `HOSIGRAPH_JAVA`) is set,
   as in CI; without one they are skipped, with a line saying so.
@@ -705,28 +819,24 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
   (`--install-signal-handlers=no`), so Ctrl-C stays with the host.
 * Shipping. The dylib names GHC's libraries by absolute path; a copy for someone else's machine needs them gathered with it.
 
-## Not in Phase 1
+## What is inside a chunk
 
-* Phase 2 (the rest) and later: S3 and Range GET over a real network, the S3 side of Erase and freezing,
-  metrics and capacity forecasts, anonymous metrics.
-* Not done yet, though they belong to Phase 1: compression of chunk values,
-  JSON-LD import (Phase 0 decides this part), and a dictionary for IRIs from outside the ID space.
 * **Each chunk has a value dictionary** (chunk format version 2). A value that the chunk says many times is written once in the header,
   and the runs say "number 17" instead (2-3 bytes). A value goes in only when that makes the chunk smaller:
   a value of `len` bytes that appears `n` times is worth it when `n * (len - 4) > len`.
   Values are told apart by their bytes, not by `==`, so `0.0` and `-0.0` stay two values.
   The dictionary is read when a chunk is opened and stays in memory with the reader (it is part of what `hcReaderCacheBytes` counts).
-  Chunks of version 1 (no dictionary) are still read; nothing rewrites them. The tail log's format did not change.
+  Chunks of version 1 (no dictionary) are still read; nothing rewrites them.
 * **Version 2 also writes numbers short.** Every number in a run is a variable-length one (LEB128, 1-10 bytes): the attribute number, the seq
   (counted from the chunk's first seq), the entity id (counted from the chunk's first id), the lengths, and integer values (zigzag, so `-1` is short too).
   A text value's length is one byte, not four. Point lookups work as before: the slot still points at the start of a run, and the run's head is
-  read with one read of at most 30 bytes. It is a new chunk format only; nothing else needed to change.
+  read with one read of at most 30 bytes.
   On 20,000 made-up events (4,000 entities with a name, a type, an age, a language and a friend), `chunk.hosi` was 595,208 bytes in version 1
   and 205,466 in version 2, with no compressor (the dictionary alone took version 1 to 474,462; the short numbers did the rest).
   Invented data is only a hint: names made of a few repeated words, random friend ids.
   A general compressor on top does not make version 2 smaller than version 1 (xz -9: 72.6 KB vs 70.0 KB; zstd -19: 94.4 KB vs 91.1 KB),
   because it had been squeezing the same fixed-width zeros. `mphf.idx` was not touched (about 13 bytes for each id).
-  The dictionary is per chunk; one for the whole khana, or one shared by IRIs from outside the ID space, is the item above.
+  The dictionary is per chunk; one for the whole khana, or one shared by IRIs from outside the ID space, is not built (`TODO.md`).
 * The open chunk readers (each holds the chunk's slot table, 12 bytes per id) have a memory limit: `hcReaderCacheBytes`, 64 MiB by default.
   The least recently used reader is closed first; the one just used is always kept, so a single huge chunk still opens.
   The count is about the slot tables only (`Events.xsReadersOpen`, `xsReaderBytes` show it).
@@ -743,8 +853,7 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
   The choice between PtrHash, PTHash, and RecSplit is open.
 * `takka/` exports the types (`Value`, `Schema`, …), EDN, and the Datalog and pull syntax (`Takka.Types`, `Takka.Edn`, `Takka.Syntax`).
   hosigraph needs these to write to Datalevin and to read its answers back.
-* **There is no in-process khana any more.** An earlier version could keep the khana in a small Haskell engine on dlmdb (`KhanaDatalevinNative`).
-  It was removed, so the C sources and that engine's tests are gone. They stay in the git history (commit `2aee1d7`).
+* **There is no in-process khana.** The khana is Datalevin, through `dtlv` or a JVM.
   If Datalevin gets a native core of its own, it would be a new backend next to the two above.
 * The license is the Blue Oak Model License 1.0.0 (see [`LICENSE`](../LICENSE) and [`dependency-licenses.md`](dependency-licenses.md)).
 

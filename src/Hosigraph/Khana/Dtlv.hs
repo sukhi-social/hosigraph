@@ -27,7 +27,7 @@
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
   ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..)
-  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvQueryCells
+  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvHighest, dtlvHighestIn, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
     -- * Taking out whole entities
@@ -158,8 +158,8 @@ dtlvRetractRanges d ranges extra = do
     gs -> sum <$> forM (zip [1 :: Int ..] gs) (\(n, g) -> do
       let lastGroup = n == length gs
           dat  = "[" <> T.unwords [ "[" <> T.pack (show lo) <> " " <> T.pack (show hi) <> "]" | (lo, hi) <- g ] <> "]"
-          body = "(let [ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
-                 <> "(take-while (fn [x] (<= (:e x) hi)) (seek-datoms @c :eav lo)))) data))] "
+          body = "(let [skip " <> derived <> " ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
+                 <> "(remove (fn [x] (contains? skip (:a x))) (take-while (fn [x] (<= (:e x) hi)) (seek-datoms @c :eav lo))))) data))] "
                  <> (if lastGroup then "(" <> tx <> " c (conj ops " <> extraForm <> "))" else "(when (seq ops) (" <> tx <> " c ops))")
                  <> " (count ops))"
       r <- readReplyWith d dat body
@@ -168,6 +168,8 @@ dtlvRetractRanges d ranges extra = do
         _      -> bad ("a count of retracted facts: " ++ T.unpack (T.take 200 (renderEdn r))))
   where
     tx = transactFn d
+    -- a tuple is made by the khana from its parts: it goes when they go, and Datalevin refuses to take it out by itself
+    derived = "#{" <> T.unwords [ ednKw k | (k, a) <- M.toList (dtlvSchema d), not (null (asTuple a)) ] <> "}"
     groupsOf _ [] = []
     groupsOf m xs = let (a, b) = splitAt m xs in a : groupsOf m b
 
@@ -250,6 +252,83 @@ dtlvDatomPage d lo n0 = go (max 1 n0)
           case takeWhile ((< dE x) . dE) ds of
             []   -> go (n * 2)                              -- one entity with more than n facts: ask for a bigger page
             page -> pure (page, Just (dE x))
+
+-- | The facts of one attribute from the high end of its index: at most @n@, the largest value first and, among equal
+-- values, the largest entity id first.  With @Just (v, e)@ it starts after that place (the fact @(e, v)@ itself is not
+-- in the answer), so the last fact of one answer is the cursor of the next.
+--
+-- It is Datalevin's @rseek-datoms@ on @:ave@ with a count: it reads about @n@ facts and not every fact of the attribute.
+-- Datalevin's bound on the entity id applies to every value of the range and not only to the first (tried), so the
+-- start is given as the value alone, and the facts at that value that the cursor has passed are dropped here, in the
+-- same round trip and from the same snapshot; when the ties at the cursor's value are more than the count, it asks again for
+-- twice as many.  The order is the one the index keeps for the attribute's declared type (a number by size, a string by
+-- its bytes); an attribute with no declared type is in no order anyone could use, and the caller refuses it.
+dtlvHighest :: Dtlv -> Keyword -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+dtlvHighest d a cur n0 = do
+  (from, skip, m0) <- case cur of
+    Nothing     -> pure ("nil", "(fn [_] false)", n)
+    Just (v, e) -> do
+      vt <- either bad pure (ednVal v)
+      pure (vt, "(fn [x] (and (= (:v x) " <> vt <> ") (>= (:e x) " <> T.pack (show e) <> ")))", n + 1)
+  rows <- asRows =<< readReply d (T.unwords
+    [ "(let [db @c skip? " <> skip <> " n " <> T.pack (show n) <> "]"
+    , "(loop [m " <> T.pack (show m0) <> "]"
+    , "(let [rows (vec (rseek-datoms db :ave " <> ednKw a <> " " <> from <> " nil m))"
+    , "kept (vec (drop-while skip? rows))]"
+    , "(if (or (>= (count kept) n) (< (count rows) m))"
+    , "(mapv (fn [x] [(:e x) (:a x) (:v x)]) (take n kept))"
+    , "(recur (* 2 m))))))" ])
+  forM rows $ \r -> case r of
+    [EInt e, EKw k, v] -> Datom (fromInteger e) (Keyword k) <$> value v
+    _                  -> bad ("a datom row: " ++ show r)
+  where n = max 1 n0
+
+-- | The facts of a two-part tuple attribute @(key, order)@ from the high end of the order part, for the given keys only:
+-- at most @n@, the largest order value first and, among equal values, the largest entity id first, whichever key they
+-- are under.  With @Just (v, e)@ it starts after that place, as 'dtlvHighest' does.  The facts are the tuple's: their
+-- value is @VTuple [key, order]@.
+--
+-- It does not read the facts of the keys it is given; it reads the head of each key's run in the tuple's index (a seek
+-- each) and merges the runs lazily, taking the next of a key only when that key's head was taken, so the cost is about
+-- one seek per key plus one per fact answered, and does not depend on how the facts are spread among the keys.  (A walk
+-- from the top of the order that looks each fact's key up has no such bound: it reads every fact newer than the @n@th
+-- one that passes, and when the keys are quiet that is all of them.)
+--
+-- The tuple's index puts a key's facts together in order of the order part (tried with keys that are prefixes of one
+-- another, and not ASCII).  The order part has to be a long, because the walk of a key starts at the largest one.
+-- An entity that has the key and not the order part has a half-made tuple, @[key nil]@, at the low end of that key's
+-- run: it has no place in the order, and the walk of the key ends there.
+-- Facts that tie (the same key and order, which a tuple that is not unique allows) are told apart by the entity id, so
+-- the next fact of a key is found by asking for the facts at the same order value again and dropping the ones taken,
+-- never by "the order value minus one", which loses the ties.
+dtlvHighestIn :: Dtlv -> Keyword -> [Value] -> Maybe (Value, EntityId) -> Int -> IO [Datom]
+dtlvHighestIn d a keys cur n0 = do
+  ks <- either bad (pure . T.unwords) (mapM ednVal keys)
+  (hi, skipE) <- case cur of
+    Nothing     -> pure ("9223372036854775807", "nil")
+    Just (v, e) -> do
+      vt <- either bad pure (ednVal v)
+      pure (vt, T.pack (show e))
+  rows <- asRows =<< readReply d (T.unwords
+    [ "(let [db @c a " <> ednKw a <> " n " <> T.pack (show n) <> " hi0 " <> hi <> " skip0 " <> skipE
+    , "desc (fn [x y] (compare [(nth y 0) (nth y 1)] [(nth x 0) (nth x 1)]))"
+    , "head (fn [k hi skip-e]"
+    , "(loop [m 2]"
+    , "(let [rs (vec (rseek-datoms db :ave a [k hi] nil m))"
+    , "x (first (drop-while (fn [x] (and skip-e (= k (first (:v x))) (= (second (:v x)) hi) (>= (:e x) skip-e))) rs))]"
+    , "(cond (and x (= k (first (:v x))) (some? (second (:v x)))) [(second (:v x)) (:e x) k]"
+    , "x nil"
+    , "(< (count rs) m) nil"
+    , ":else (recur (* 2 m))))))]"
+    , "(loop [pq (into (sorted-set-by desc) (keep (fn [k] (head k hi0 skip0)) (distinct [" <> ks <> "]))) out []]"
+    , "(if (or (= (count out) n) (empty? pq))"
+    , "out"
+    , "(let [top (first pq) [o e k] top nx (head k o e) pq (disj pq top)]"
+    , "(recur (if nx (conj pq nx) pq) (conj out [e a [k o]]))))))" ])
+  forM rows $ \r -> case r of
+    [EInt e, EKw k, v] -> Datom (fromInteger e) (Keyword k) <$> value v
+    _                  -> bad ("a datom row: " ++ show r)
+  where n = max 1 n0
 
 dtlvDatomCount :: Dtlv -> IO Integer
 dtlvDatomCount d = do
@@ -392,8 +471,12 @@ runResident sc d dat body = do
       | Just (EStr m) <- lookup (EKw "err") kvs -> throwIO (DtlvError (T.unpack m))
     _ -> throwIO (DtlvError ("an answer we did not expect: " ++ T.unpack (T.take 400 line)))
   where
+    -- the attributes whose words are searched: the JVM gives each of them its analyzer ('Hosigraph.Khana.Sidecar.sidecarSource')
+    search = case fulltextAttrs (dtlvSchema d) of
+      [] -> ""
+      ks -> " :search [" <> T.unwords [ ednStr (kwText k) | k <- ks ] <> "]"
     request = "{:dir " <> ednStr (T.pack (dtlvDir d)) <> " :schema " <> ednStr (schemaEdn (dtlvSchema d))
-              <> " :opts " <> walOpts <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> "}"
+              <> " :opts " <> walOpts <> search <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> "}"
 
 -- | Run a body and read its value as EDN.
 readReply :: Dtlv -> Text -> IO Edn
@@ -480,12 +563,19 @@ ednVal v = case v of
   VStr s    -> Right (ednStr s)
   VBool b   -> Right (if b then "true" else "false")
   VKw k     -> Right (ednKw k)
+  VTuple xs -> (\ps -> "[" <> T.unwords ps <> "]") <$> mapM (maybe (Right "nil") ednVal) xs
+
+-- | The attributes of a schema whose words are searched.
+fulltextAttrs :: Schema -> [Keyword]
+fulltextAttrs sch = [ k | (k, a) <- M.toList sch, asFulltext a ]
 
 -- | The schema as a Datalevin schema map.  Our @TAny@ is an attribute with no declared type.
 schemaEdn :: Schema -> Text
 schemaEdn sch = "{" <> T.intercalate " " [ ednKw k <> " " <> one s | (k, s) <- M.toList sch ] <> "}"
   where
-    one (AttrSchema t c u) = "{" <> T.unwords (catMaybes [typ t, card c, uniq u]) <> "}"
+    one (AttrSchema t c u ps ft) = "{" <> T.unwords (catMaybes [typ t, card c, uniq u, parts ps, words_ ft]) <> "}"
+    words_ ft = if ft then Just ":db/fulltext true :db.fulltext/autoDomain true" else Nothing
+    parts ps = if null ps then Nothing else Just (":db/tupleAttrs [" <> T.unwords (map ednKw ps) <> "]")
     typ t = case t of
       TAny     -> Nothing
       TString  -> Just ":db/valueType :db.type/string"

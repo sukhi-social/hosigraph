@@ -177,7 +177,8 @@ escapeChar c = case c of
     | otherwise              -> T.singleton c
   where pad s = replicate (4 - length s) '0' ++ s
 
--- | Scalars that can be stored in a datom.  @nil@ and collections are rejected.
+-- | Scalars that can be stored in a datom, and a vector of them (@nil@ for a part that is not there) as a tuple
+-- ('VTuple').  @nil@ by itself and the other collections are rejected.
 ednToValue :: Edn -> Either String Value
 ednToValue e = case e of
   EInt n
@@ -187,5 +188,10 @@ ednToValue e = case e of
   EStr s   -> Right (VStr s)
   EBool b  -> Right (VBool b)
   EKw k    -> Right (VKw (Keyword k))
+  EVec xs  -> VTuple <$> mapM part xs
   ENil     -> Left "nil cannot be stored (omit the attribute instead)"
   _        -> Left ("not a scalar value: " ++ T.unpack (renderEdn e))
+  where
+    part ENil       = Right Nothing
+    part (EVec _)   = Left "a tuple does not hold a tuple"
+    part x          = Just <$> ednToValue x

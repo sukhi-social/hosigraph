@@ -5,9 +5,10 @@
 A small embedded database that **keeps the past as events**, and keeps **"now" as a copy you can put down**.
 
 > [!NOTE]
-> **0.1 is for one process on one machine, on a local disk.** It is written in Haskell, and it brings [Datalevin](https://github.com/datalevin/datalevin) along:
+> **0.2 is for one process on one machine, on a local disk.** It is written in Haskell, and it brings [Datalevin](https://github.com/datalevin/datalevin) along:
 > the `dtlv` program, or JDK 21 and the standalone jar.
-> What 0.1.0 wrote, every 0.1.x reads ([what is promised, and what is not](docs/guide.md#what-01-promises)). **S3 is not here yet.**
+> What 0.1.0 wrote, every 0.1.x and 0.2.x reads ([what is promised, and what is not](docs/guide.md#what-01-promises)). **S3 is not here yet** (it waits in 0.3).
+> 0.2 changes no file. It asks more of "now": an order and a cut, pairs, words, and the newest *n* of what some people wrote ([below](#a-timeline)).
 > Come and sit with it for a while; if anything puzzles you, an issue is welcome.
 
 ## The idea
@@ -33,7 +34,7 @@ flowchart LR
 * **`seal`** (thin arrow): the tail log is frozen into chunks. The khana is not touched.
 * **Rebuild** (dotted arrow): only when the khana is lost or doubted (`rebuildKhana`). It folds the chunks, then the tail log, into a fresh khana.
 
-The first goal was small, and we kept it small: **write, seal, restart, and get the same answers.**
+It promises one thing first: **write, seal, restart, and get the same answers.**
 The tests stop the system in five places and check what comes back.
 
 ## A taste
@@ -50,6 +51,20 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 ```
 
 A write goes in whole, or not at all. `verify` rebuilds a khana from the events and checks that it equals yours.
+
+## A timeline
+
+"The newest 20 notes of the people I follow", a page after a page: what a feed asks for.
+
+```haskell
+-- the schema: ("note/by", attr TString), ("note/at", attr TLong), and the pair of the two, which the khana keeps for you:
+--             ("note/by+at", tuple ["note/by", "note/at"])
+page1 <- highestIn h "note/by+at" (map VStr followed) Nothing 20
+```
+
+It takes a short walk for each person and merges them, so what it costs follows the number of people, and not how much they have written.
+On 200,000 made-up notes, 400 people with 400 notes each: **3.9 ms** (the same question as a query, `:order-by … :limit 20`, took 240 ms). For a few people who wrote little, the query does as well.
+[Where it stops, and the numbers](docs/guide.md#highestin-the-newest-n-of-some-keys).
 
 <details>
 <summary><b>How does it ask the past without waking everything?</b></summary>
@@ -86,7 +101,8 @@ Tested with GHC 9.10.3 on macOS arm64.
 - [x] Phase 2, first half: the filter, and reading a chunk by ranges
 - [x] A C interface, `libhosi`, written by [setu](docs/guide.md#from-other-languages-setu-hosigraph-abi) (seen working on macOS only)
 - [x] Phase 3, the local part: `erase` (ids, a span of ids or time, or what an account owns), `clean`, `freeze` (cold chunks), also through the C door
-- [ ] S3 ([plan](TODO.md))
+- [x] 0.2: an order and a cut (`:order-by`, `:limit`), pairs (`tuple`), words (`fulltext`), and the newest *n* (`highest`, `highestIn`), also through the C door and in Elixir
+- [ ] S3 ([plan](TODO.md), for 0.3)
 
 Speed is only roughly measured, and the guide lists the limits.
 

@@ -17,6 +17,7 @@ import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalat
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import           Data.Time.Calendar (fromGregorian)
 import           Data.Time.Clock (UTCTime(..))
 import           Data.Time.Clock.POSIX (getPOSIXTime)
@@ -38,7 +39,7 @@ import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
 import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
-import           Takka.Syntax (Pulled(..))
+import           Takka.Syntax (Amount(..), Binding(..), Clause(..), Dir(..), Pulled(..), Query(..), Term(..), clauseVars, parseQuery)
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
 import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana, newKhanaRuntime, closeKhanaRuntime, openKhana, applyFacts, khanaDatoms, khanaDatomPage, compareKhanas)
 import           Takka.Types (Datom(..))
@@ -114,7 +115,10 @@ runTests = do
       dtlvRun = nativeRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
-  results <- forM (pureTests ++ worldLockTests ++ formatTests ++ dtlvRun) $ \(name, act) -> do
+  -- HOSIGRAPH_TEST_ONLY=text runs only the tests whose name has that text in it (for trying one thing; a full run is the one that counts)
+  only <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_TEST_ONLY"
+  let wanted (name, _) = maybe True (`isInfixOf` name) only
+  results <- forM (filter wanted (pureTests ++ worldLockTests ++ formatTests ++ dtlvRun)) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -220,6 +224,7 @@ renderValue v = case v of
   VStr t          -> "s:" ++ show (T.unpack t)
   VBool b         -> "b:" ++ (if b then "t" else "f")
   VKw (Keyword k) -> "k:" ++ T.unpack k
+  VTuple _        -> error "renderValue: a tuple is never in an event"
 
 renderEvent :: E.Event -> String
 renderEvent e = unwords [ show (E.evSeq e), E.kindName (E.evKind e), show (E.evId e), attrName, renderValue (E.evVal e) ]
@@ -1746,6 +1751,69 @@ pureTests =
   , ("dtlv edn: tameEdn spells \\f and \\b as \\u escapes and leaves \\\\f alone", do
       checkEq "f, b and an escaped backslash before f" (Right (EStr "x\fy\bz\\f")) (readEdn (tameEdn "\"x\\fy\\bz\\\\f\""))
       checkEq "other escapes are untouched" (Right (EStr "a\nb\"c")) (readEdn (tameEdn "\"a\\nb\\\"c\"")))
+  , ("schemaMark: a schema with no tuple and no fulltext has the mark it had before they were (a world made then is not made again); each of them changes it", do
+      checkEq "the mark of the test schema, as 0.1.0 made it" "hosi-schema/1:ccbb256ed4236b3f24acc25834ec25fc5c4f0f7d4cfb2bd4db33cb998cd7ee50" (schemaMark schema)
+      let with a = schemaMark (M.insert "person/pair" a schema)
+          plain  = with (attr TString)
+      check "a tuple makes another mark" (with (tuple ["person/name", "person/age"]) /= plain)
+      check "its parts are in it" (with (tuple ["person/name", "person/age"]) /= with (tuple ["person/age", "person/name"]))
+      check "fulltext makes another mark" (with (fulltext (attr TString)) /= plain))
+
+  , ("takka syntax: :order-by, :limit and :offset are read in both forms; a form Datalevin would take no notice of is refused", do
+      let parse t = readEdn t >>= parseQuery
+          seen t = fmap (\q -> (qOrderBy q, qLimit q, qOffset q)) (parse t)
+          refused t = either (const True) (const False) (parse t)
+          rows = ":where [?e :person/age ?a] [?e :person/name ?n]"
+      checkEq "vector form; a direction is optional"
+        (Right ([("?a", Desc), ("?n", Asc), ("?e", Asc)], Just (AInt 20), Just (AInt 40)))
+        (seen ("[:find ?a ?n ?e " <> rows <> " :order-by [?a :desc ?n ?e] :limit 20 :offset 40]"))
+      checkEq "map form is a vector of pairs"
+        (Right ([("?a", Desc), ("?n", Asc)], Just (AInt 5), Just (AInt 0)))
+        (seen ("{:find [?a ?n] :where [[?e :person/age ?a] [?e :person/name ?n]] :order-by [[?a :desc] [?n]] :limit 5 :offset 0}"))
+      checkEq "nothing asked: nothing in the query"
+        (Right ([], Nothing, Nothing)) (seen ("[:find ?a ?n " <> rows <> "]"))
+      checkEq "a limit may be a scalar of :in"
+        (Right ([], Just (AVar "?k"), Just (AVar "?o")))
+        (seen ("[:find ?a ?n :in $ ?k ?o " <> rows <> " :limit ?k :offset ?o]"))
+      -- the shapes Datalevin 1.2.10 answers whole, without a word
+      check "a scalar find" (refused ("[:find ?a . " <> rows <> " :order-by [?a]]"))
+      check "a collection find" (refused ("[:find [?a ...] " <> rows <> " :limit 3]"))
+      check "...and :offset" (refused ("[:find ?a . " <> rows <> " :offset 3]"))
+      check "map form, flat order-by (Datalevin reads it as ascending whatever it says)"
+        (refused "{:find [?a ?n] :where [[?e :person/age ?a] [?e :person/name ?n]] :order-by [?a :desc]}")
+      check "vector form, pairs" (refused ("[:find ?a ?n " <> rows <> " :order-by [[?a :desc]]]"))
+      check "a direction that is not one" (refused ("[:find ?a ?n " <> rows <> " :order-by [?a :up]]"))
+      check "empty order-by" (refused ("[:find ?a ?n " <> rows <> " :order-by []]"))
+      check "limit 0 (Datalevin: error)" (refused ("[:find ?a ?n " <> rows <> " :limit 0]"))
+      check "limit -1 (Datalevin: no limit at all)" (refused ("[:find ?a ?n " <> rows <> " :limit -1]"))
+      check "offset -1" (refused ("[:find ?a ?n " <> rows <> " :offset -1]"))
+      check "limit a string" (refused ("[:find ?a ?n " <> rows <> " :limit \"3\"]"))
+      check "limit two numbers" (refused ("[:find ?a ?n " <> rows <> " :limit 3 4]"))
+      check "a variable that :in does not give" (refused ("[:find ?a ?n " <> rows <> " :limit ?k]"))
+      check "a variable that is not a scalar" (refused ("[:find ?a ?n :in $ [?k ...] " <> rows <> " :limit ?k]"))
+      check "limit 1 is fine" (not (refused ("[:find ?a ?n " <> rows <> " :limit 1]"))))
+  , ("takka syntax: a function puts its answer in a binding (scalar, tuple, collection, relation, _); $ and an option map are arguments; a vector of values is a tuple", do
+      let parse t = readEdn t >>= parseQuery
+          ok t = either (const False) (const True) (parse t)
+          clauses t = fmap qWhere (parse t)
+      checkEq "fulltext, with the attribute, a relation binding and options"
+        (Right [CFn "fulltext" [TSrc "$", TConst (VKw "note/body"), TVar "?q", TOpts [("top", VInt 5)]] (BRel ["?e", "?a", "?v"])])
+        (clauses "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q {:top 5}) [[?e ?a ?v]]]]")
+      checkEq "fulltext in every attribute, _ keeps nothing"
+        (Right [CFn "fulltext" [TSrc "$", TVar "?q"] (BRel ["?e", "_", "?v"])])
+        (clauses "[:find ?e :in $ ?q :where [(fulltext $ ?q) [[?e _ ?v]]]]")
+      checkEq "a tuple" (Right [CFn "f" [TVar "?x"] (BTuple ["?a", "?b"])]) (clauses "[:find ?a :in $ ?x :where [(f ?x) [?a ?b]]]")
+      checkEq "a collection" (Right [CFn "f" [TVar "?x"] (BColl "?a")]) (clauses "[:find ?a :in $ ?x :where [(f ?x) [?a ...]]]")
+      checkEq "a scalar" (Right [CFn "+" [TVar "?x", TConst (VInt 1)] (BScalar "?y")]) (clauses "[:find ?y :in $ ?x :where [(+ ?x 1) ?y]]")
+      checkEq "a tuple of values in a pattern, nil for a part that is not there"
+        (Right [CPattern (TVar "?e") (TConst (VKw "follow/pair")) (TConst (VTuple [Just (VInt 1), Nothing]))])
+        (clauses "[:find ?e :where [?e :follow/pair [1 nil]]]")
+      check "a binding that is not one" (not (ok "[:find ?a :in $ ?x :where [(f ?x) 5]]"))
+      check "a binding with a name that is not a variable" (not (ok "[:find ?a :in $ ?x :where [(f ?x) [a b]]]"))
+      check "a tuple does not hold a tuple" (not (ok "[:find ?e :where [?e :follow/pair [[1 2] 3]]]"))
+      check "an option map takes keywords" (not (ok "[:find ?e :in $ ?q :where [(fulltext $ ?q {1 2}) [[?e ?a ?v]]]]"))
+      checkEq "the variables of a binding are the variables of the clause, and _ is none" (Right ["?a", "?e", "?q"])
+        (fmap (S.toList . S.fromList . concatMap clauseVars) (clauses "[:find ?e :in $ ?q :where [(f ?q) [?a _]] [?e :x/a ?a]]")))
   , ("dtlv edn: numbers, keywords and the schema", do
       checkEq "small double" (Right "1.0e-2") (ednVal (VDouble 0.01))
       checkEq "smallest long" (Right "-9223372036854775808") (ednVal (VInt minBound))
@@ -3011,6 +3079,239 @@ dtlvTests be =
       checkEq "...and the khana is still good" [] =<< verify h
       closeHosi h)
 
+  , ("dtlv: :order-by, :limit and :offset sort and cut a relation; a form Datalevin would ignore is refused before it is asked", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do
+        mapM_ (\(n, a) -> person h n a) [("Frege", 70), ("Peirce", 75), ("Boole", 49), ("Cantor", 75), ("Godel", 71)]
+        let rows = ":where [?e :person/age ?a] [?e :person/name ?n]"
+            row a n = [VInt a, VStr n]
+            q t = query h ("[:find ?a ?n " <> t <> "]")
+            young = [row 49 "Boole", row 70 "Frege", row 71 "Godel", row 75 "Cantor", row 75 "Peirce"]
+        checkEq "ascending, the second variable breaks the tie" young =<< q (rows <> " :order-by [?a ?n]") []
+        checkEq "descending, then ascending"
+          [row 75 "Cantor", row 75 "Peirce", row 71 "Godel", row 70 "Frege", row 49 "Boole"]
+          =<< q (rows <> " :order-by [?a :desc ?n :asc]") []
+        checkEq "limit" (take 2 young) =<< q (rows <> " :order-by [?a ?n] :limit 2") []
+        checkEq "offset and limit" (take 2 (drop 1 young)) =<< q (rows <> " :order-by [?a ?n] :offset 1 :limit 2") []
+        checkEq "offset past the end" [] =<< q (rows <> " :order-by [?a ?n] :offset 9") []
+        checkEq "a limit from :in" (take 3 young)
+          =<< query h ("[:find ?a ?n :in $ ?k " <> rows <> " :order-by [?a ?n] :limit ?k]") [InScalar (VInt 3)]
+        checkEq "the map form, a vector of pairs" (take 2 (reverse young))
+          =<< query h "{:find [?a ?n] :where [[?e :person/age ?a] [?e :person/name ?n]] :order-by [[?a :desc] [?n :desc]] :limit 2}" []
+        -- the cut is after the sort and does not cut the join short: the oldest two, whichever way the rows came
+        checkEq "the two oldest of all" [row 75 "Cantor", row 75 "Peirce"] =<< q (rows <> " :order-by [?a :desc ?n] :limit 2") []
+        s1 <- try (query h "[:find ?a . :where [?e :person/age ?a] :order-by [?a]]" []) :: IO (Either SomeException [[Value]])
+        check "a scalar find is refused, not answered whole" (either (const True) (const False) s1)
+        s2 <- try (query h "[:find [?a ...] :where [?e :person/age ?a] :limit 2]" []) :: IO (Either SomeException [[Value]])
+        check "so is a collection find" (either (const True) (const False) s2)
+        checkEq "...and the khana is still good" [] =<< verify h)
+
+  , ("dtlv: highest walks one attribute from its top: the largest first, ties by id, a page after a page; what it cannot walk is refused", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+      withHosiCfg cfg dir $ \h -> do
+        let ages = [70, 75, 49, 75, 71, 75, 30, 49] :: [Integer]
+        ids <- zipWithM (\i a -> person h (T.pack ("p" ++ show (i :: Int))) a) [1 ..] ages
+        let facts = [ Datom e "person/age" (VInt (fromIntegral a)) | (e, a) <- zip ids ages ]
+            top = reverse (sortOn (\d -> (dV d, dE d)) facts)           -- the largest value, then the largest id, first
+            place d = (dV d, dE d)
+            pages n = go Nothing
+              where go cur = do
+                      ds <- highest h "person/age" cur n
+                      if null ds then pure [] else (ds :) <$> go (Just (place (last ds)))
+        checkEq "the top three" (take 3 top) =<< highest h "person/age" Nothing 3
+        checkEq "a count larger than there are" top =<< highest h "person/age" Nothing 50
+        forM_ [1, 2, 3, 8, 9 :: Int] $ \n -> do
+          ps <- endsIn ("pages of " ++ show n) (pages n)
+          checkEq ("pages of " ++ show n ++ ", one after the other, are all of it") top (concat ps)
+          check ("...and none is longer than " ++ show n) (all ((<= n) . length) ps)
+        -- the cursor is a place in the order, a fact that is there or not: what comes after it, and not itself
+        forM_ (map place top ++ [(VInt 73, 5), (VInt 1000, 1), (VInt (-5), 1)]) $ \p@(v, e) ->
+          checkEq ("after " ++ show (v, e)) [ d | d <- top, place d < p ] =<< highest h "person/age" (Just p) 50
+        viaQuery <- query h "[:find ?e ?a :where [?e :person/age ?a] :order-by [?a :desc ?e :desc]]" []
+        checkEq "the order is the one :order-by gives" [ [VInt (dE d), dV d] | d <- top ] viaQuery
+        -- strings by their bytes, doubles with a sign, a many-valued attribute: every fact is one
+        checkEq "strings" (map (VStr . T.pack . ("p" ++) . show) [8, 7, 6 :: Int]) . map dV =<< highest h "person/name" Nothing 3
+        sc <- forM [1.5, -2.0, 3.25] $ \x -> (\r -> wrTemps r M.! 1) <$> write h [Create (Tmp 1) "person/score" (Lit (VDouble x))]
+        checkEq "doubles, a negative one last" [VDouble 3.25, VDouble 1.5, VDouble (-2.0)] . map dV =<< highest h "person/score" Nothing 9
+        checkEq "...and the ids that go with them" [sc !! 2, sc !! 0, sc !! 1] . map dE =<< highest h "person/score" Nothing 9
+        tg <- (\r -> wrTemps r M.! 1) <$> write h [ Create (Tmp 1) "person/tag" (Lit (VStr t)) | t <- ["a", "b", "c"] ]
+        checkEq "one entity's many values are many facts" [Datom tg "person/tag" (VStr "c"), Datom tg "person/tag" (VStr "b")]
+          =<< highest h "person/tag" Nothing 2
+        checkEq "an attribute nobody has" [] =<< highest h "person/friend" Nothing 5
+        -- it is "now": a fact that was taken out, or an entity that was erased, is not in it
+        _ <- write h [Delete (Id (ids !! 1)) "person/age" (Lit (VInt 75))]
+        checkEq "a deleted fact" [ d | d <- top, dE d /= ids !! 1 ] =<< highest h "person/age" Nothing 50
+        _ <- erase h [EraseIds [ids !! 3]]
+        checkEq "an erased entity" [ d | d <- top, dE d `notElem` [ids !! 1, ids !! 3] ] =<< highest h "person/age" Nothing 50
+        -- what is refused is the caller's, and nothing is asked of Datalevin
+        let refused why act = do
+              r <- try act :: IO (Either HosiError [Datom])
+              check why (case r of Left (BadArgument _) -> True; _ -> False)
+        refused "a count of 0" (highest h "person/age" Nothing 0)
+        refused "a negative count" (highest h "person/age" Nothing (-3))
+        refused "an attribute that is not in the schema" (highest h "no/such" Nothing 3)
+        refused "a cursor of another type" (highest h "person/age" (Just (VStr "x", 1)) 3)
+        refused "a cursor of another type (a double for a long)" (highest h "person/age" (Just (VDouble 70, 1)) 3)
+        checkEq "...and the khana is still good" [] =<< verify h
+      -- a schema with an attribute of no type, and a tuple: neither has an order to walk
+      withTmp $ \dir2 -> do
+        let sch2 = M.fromList [ ("a/any", attr TAny), ("f/from", ref), ("f/to", ref), ("f/pair", identity (tuple ["f/from", "f/to"])) ]
+        h2 <- openHosiWith cfg dir2 sch2
+        _ <- write h2 [Create (Tmp 1) "a/any" (Lit (VInt 5)), Create (Tmp 2) "f/from" (Lit (VInt 5)), Create (Tmp 2) "f/to" (Lit (VInt 6))]
+        let refused2 why act = do
+              r <- try act :: IO (Either HosiError [Datom])
+              check why (case r of Left (BadArgument _) -> True; _ -> False)
+        refused2 "an attribute with no type" (highest h2 "a/any" Nothing 3)
+        refused2 "a tuple" (highest h2 "f/pair" Nothing 3)
+        closeHosi h2)
+
+  , ("dtlv: highestIn merges the runs of some keys: the newest first whoever wrote it, ties by id, a page after a page; the keys not asked for, a half-made tuple and what cannot be walked stay out", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          sch = M.fromList
+            [ ("note/by", attr TString), ("note/at", attr TLong), ("note/by+at", tuple ["note/by", "note/at"])
+            , ("x/any", attr TAny), ("x/txt", attr TString)
+            , ("r/by", ref), ("r/at", attr TLong), ("r/by+at", tuple ["r/by", "r/at"])
+            , ("x/three", tuple ["note/by", "note/at", "x/txt"]), ("x/txtorder", tuple ["note/by", "x/txt"])
+            , ("x/anykey", tuple ["x/any", "note/at"]) ]
+          -- authors that are prefixes of one another and one that is not ASCII; the notes of a group have the same author and time
+          authors = ["a", "a1", "a10", "a100", "b", "\233"] :: [T.Text]
+          spec = [ (authors !! (g `mod` 6), fromIntegral g * 10 + 5) | i <- [0 .. 59 :: Int], let g = i `div` 3 ] :: [(T.Text, Int64)]
+          newest ns = reverse (sortOn (\(_, t, e) -> (t, e)) ns)
+          mk (a, t, e) = Datom e "note/by+at" (VTuple [Just (VStr a), Just (VInt t)])
+          place (_, t, e) = (t, e)
+      h <- openHosiWith cfg dir sch
+      notes0 <- forM spec $ \(a, t) -> do
+        r <- write h [Create (Tmp 1) "note/by" (Lit (VStr a)), Create (Tmp 1) "note/at" (Lit (VInt t))]
+        pure (a, t, wrTemps r M.! 1)
+      -- a note with a key and no time, and one with a time and no key: a tuple that is half made
+      _ <- write h [Create (Tmp 1) "note/by" (Lit (VStr "a"))]
+      _ <- write h [Create (Tmp 1) "note/at" (Lit (VInt 99999))]
+      let wantFor ns ks = map mk [ x | x@(a, _, _) <- newest ns, a `elem` ks ]
+          ask ks cur n = highestIn h "note/by+at" (map VStr ks) cur n
+          sets = [ ["a"], ["a1"], ["a", "a1"], ["a1", "a10", "a100"], authors, ["b", "\233"], ["a", "a", "b"], ["a", "nobody"], ["nobody"], [] ] :: [[T.Text]]
+          pagesOf ks n = go Nothing
+            where go cur = do
+                    ds <- ask ks cur n
+                    case ds of
+                      [] -> pure []
+                      _  -> case dV (last ds) of
+                              VTuple [_, Just o] -> (ds :) <$> go (Just (o, dE (last ds)))
+                              v                  -> error ("a fact that is not a pair: " ++ show v)
+      forM_ sets $ \ks -> checkEq ("all of it for " ++ show ks) (wantFor notes0 ks) =<< ask ks Nothing 500
+      checkEq "the top four of all" (take 4 (wantFor notes0 authors)) =<< ask authors Nothing 4
+      forM_ [1, 2, 7, 100 :: Int] $ \n ->
+        forM_ [authors, ["a1", "a10"], ["a"]] $ \ks -> do
+          ps <- endsIn ("pages of " ++ show n) (pagesOf ks n)
+          checkEq ("pages of " ++ show n ++ " for " ++ show ks ++ " are all of it") (wantFor notes0 ks) (concat ps)
+          check "...and none is longer than the count" (all ((<= n) . length) ps)
+      -- the cursor is a place in the order: what is after it, and not itself; a place that nobody has works too
+      forM_ (map place notes0 ++ [(73, 5), (100000, 1), (-5, 1)]) $ \p@(t, e) ->
+        forM_ [authors, ["a1", "b"]] $ \ks ->
+          checkEq ("after " ++ show p ++ " for " ++ show ks)
+            (map mk [ x | x@(a, _, _) <- newest notes0, a `elem` ks, place x < p ]) =<< ask ks (Just (VInt t, e)) 500
+      -- it is "now": a fact that was taken out takes the note out of it (its tuple is half made), and so does an erase
+      let (a5, t5, e5) = notes0 !! 5
+          (_, _, e7)   = notes0 !! 7
+      _ <- write h [Delete (Id e5) "note/at" (Lit (VInt t5))]
+      _ <- erase h [EraseIds [e7]]
+      let notes1 = [ x | x@(_, _, e) <- notes0, e /= e5, e /= e7 ]
+      checkEq ("a deleted time (" ++ T.unpack a5 ++ ") and an erased note") (wantFor notes1 authors) =<< ask authors Nothing 500
+      -- the keys may be references (an author is an entity): three authors, twelve notes, some of the same author and time
+      let ents = [ e | (_, _, e) <- take 3 notes1 ]
+      rs <- forM [0 .. 11 :: Int] $ \i -> do
+        let au = ents !! (i `mod` 3); at = 1000 + fromIntegral (i `div` 4) :: Int64
+        r <- write h [Create (Tmp 1) "r/by" (RefTo (Id au)), Create (Tmp 1) "r/at" (Lit (VInt at))]
+        pure (au, at, wrTemps r M.! 1)
+      let wantR ks = [ Datom e "r/by+at" (VTuple [Just (VInt (fromIntegral au)), Just (VInt at)])
+                     | (au, at, e) <- reverse (sortOn (\(_, t, e) -> (t, e)) rs), au `elem` ks ]
+          askR ks cur n = highestIn h "r/by+at" (map (VInt . fromIntegral) ks) cur n
+      forM_ [[head ents], [head ents, ents !! 2], ents] $ \ks -> do
+        checkEq ("references as keys: " ++ show ks) (wantR ks) =<< askR ks Nothing 500
+        let go cur = do
+              ds <- askR ks cur 3
+              case ds of
+                [] -> pure []
+                _  -> case dV (last ds) of
+                        VTuple [_, Just o] -> (ds ++) <$> go (Just (o, dE (last ds)))
+                        v                  -> error ("a fact that is not a pair: " ++ show v)
+        checkEq ("...in pages of 3: " ++ show ks) (wantR ks) =<< endsIn "pages of references" (go Nothing)
+      -- what is refused is the caller's
+      let refused why act = do
+            r <- try act :: IO (Either HosiError [Datom])
+            check why (case r of Left (BadArgument _) -> True; _ -> False)
+      refused "a count of 0" (ask authors Nothing 0)
+      refused "an attribute that is not in the schema" (highestIn h "no/such" [VStr "a"] Nothing 3)
+      refused "an attribute that is not a tuple" (highestIn h "note/at" [VInt 1] Nothing 3)
+      refused "a tuple of three" (highestIn h "x/three" [VStr "a"] Nothing 3)
+      refused "an order part that is not a long" (highestIn h "x/txtorder" [VStr "a"] Nothing 3)
+      refused "a key part with no type" (highestIn h "x/anykey" [VInt 1] Nothing 3)
+      refused "a key of another type" (highestIn h "note/by+at" [VStr "a", VInt 7] Nothing 3)
+      refused "a cursor of another type" (highestIn h "note/by+at" [VStr "a"] (Just (VStr "x", 1)) 3)
+      checkEq "...and the khana is still good" [] =<< verify h
+      closeHosi h)
+
+  , ("dtlv: a composite tuple is made by the khana: it is read and looked up, one pair is held once, it follows its parts, and it is not written", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          sch ps = M.fromList [ ("person/name", identity (attr TString)), ("follow/from", ref), ("follow/to", ref), ("follow/pair", identity (tuple ps)) ]
+          fromTo = sch ["follow/from", "follow/to"]
+          pairOf x y = VTuple [Just (VInt (fromIntegral x)), Just (VInt (fromIntegral y))]
+          follow h x y = (\r -> wrTemps r M.! 1) <$> write h [ Create (Tmp 1) "follow/from" (RefTo (Id x)), Create (Tmp 1) "follow/to" (RefTo (Id y)) ]
+          pairs h = sort <$> query h "[:find ?e ?p :where [?e :follow/pair ?p]]" []
+          pairText x y = "[" <> T.pack (show x) <> " " <> T.pack (show y) <> "]"
+          rejected r = case r of Left (WriteRejected _) -> True; _ -> False
+      h0 <- openHosiWith cfg dir fromTo
+      let named n = (\r -> wrTemps r M.! 1) <$> write h0 [Create (Tmp 1) "person/name" (Lit (VStr n))]
+      a <- named "Frege"; b <- named "Peirce"; c <- named "Boole"
+      ab <- follow h0 a b
+      checkEq "the entity carries its pair" (Just [pairOf a b]) . M.lookup "follow/pair" =<< getEntity h0 ab
+      checkEq "looked up by a tuple written in the query" [[VInt (fromIntegral ab)]]
+        =<< query h0 ("[:find ?e :where [?e :follow/pair " <> pairText a b <> "]]") []
+      checkEq "looked up by a tuple given as an input" [[VInt (fromIntegral ab)]]
+        =<< query h0 "[:find ?e :in $ ?p :where [?e :follow/pair ?p]]" [InScalar (pairOf a b)]
+      checkEq "the other way round is another pair" [] =<< query h0 "[:find ?e :in $ ?p :where [?e :follow/pair ?p]]" [InScalar (pairOf b a)]
+      s0 <- stats h0
+      dup <- try (follow h0 a b)
+      check "the same pair again is refused" (rejected dup)
+      s1 <- stats h0
+      checkEq "...and left nothing in the log" (stTailBytes s0, stNextSeq s0) (stTailBytes s1, stNextSeq s1)
+      ba <- follow h0 b a
+      ac <- follow h0 a c
+      checkEq "three pairs" [ [VInt (fromIntegral e), pairOf x y] | (e, x, y) <- sort [(ab, a, b), (ba, b, a), (ac, a, c)] ] =<< pairs h0
+      w1 <- try (write h0 [Create (Tmp 1) "follow/pair" (Lit (pairOf a b))]) :: IO (Either HosiError WriteReport)
+      check "a tuple is not written" (case w1 of Left (BadArgument _) -> True; _ -> False)
+      w2 <- try (write h0 [Create (Id ab) "follow/pair" (Lit (VInt 1))])
+      check "...and nothing else is written to its place" (rejected w2)
+      -- a part that goes takes the pair with it: the half that is left is a pair with nil
+      _ <- write h0 [Delete (Id ac) "follow/to" (Lit (VInt (fromIntegral c)))]
+      checkEq "a part taken out: the pair has a nil" (Just [VTuple [Just (VInt (fromIntegral a)), Nothing]]) . M.lookup "follow/pair" =<< getEntity h0 ac
+      -- ...and two half-made pairs that are alike are one pair, to a unique tuple
+      half1 <- try (write h0 [Create (Tmp 1) "follow/from" (RefTo (Id c))]) :: IO (Either HosiError WriteReport)
+      check "a first half-made pair is taken" (either (const False) (const True) half1)
+      half2 <- try (write h0 [Create (Tmp 1) "follow/from" (RefTo (Id c))]) :: IO (Either HosiError WriteReport)
+      check "a second one like it is refused" (rejected half2)
+      checkEq "verify" [] =<< verify h0
+      before <- pairs h0
+      closeHosi h0
+      h1 <- openHosiWith cfg dir fromTo
+      checkEq "after a reopen the pairs are the same" before =<< pairs h1
+      rebuildKhana h1
+      checkEq "the khana made again from the events holds the same pairs" before =<< pairs h1
+      checkEq "verify after the rebuild" [] =<< verify h1
+      -- erase takes a pair out like anything else, and clean leaves no trace of it in the file
+      _ <- erase h1 [EraseIds [ab]]
+      checkEq "the erased entity has no pair" [] =<< query h1 "[:find ?e :in $ ?p :where [?e :follow/pair ?p]]" [InScalar (pairOf a b)]
+      _ <- clean h1 defaultCleanOptions
+      checkEq "verify after clean" [] =<< verify h1
+      closeHosi h1
+      -- the parts of a tuple are part of the schema: another order is another tuple, and the khana is made again under it
+      h2 <- openHosiWith cfg dir (sch ["follow/to", "follow/from"])
+      checkEq "the other order, from the same events" (Just [pairOf a b]) . M.lookup "follow/pair" =<< getEntity h2 ba
+      checkEq "verify under the other schema" [] =<< verify h2
+      closeHosi h2)
+
   , ("dtlv: awkward strings and keywords come back exactly as they went in", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do
@@ -3160,7 +3461,65 @@ nativeTests exe =
 -- | Only the resident JVM.
 jvmTests :: FilePath -> FilePath -> [Test]
 jvmTests java jar =
-  [ ("the khana has a write-ahead log: an erased value is in txlog/ until clean, and in no file after it", withTmp $ \dir -> do
+  [ ("fulltext: words are found (letters and digits, lower-cased; Han, kana and hangul by pairs); an erased note is found no more, and clean leaves its words in no file", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg (KhanaDatalevinJvm java jar)) { hcClock = clock }
+          sch = M.fromList [ ("note/body", fulltext (attr TString)), ("note/by", attr TString) ]
+          search h q = sort <$> query h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]" [InScalar (VStr q)]
+          note h t = (\r -> wrTemps r M.! 1) <$> write h [Create (Tmp 1) "note/body" (Lit (VStr t)), Create (Tmp 1) "note/by" (Lit (VStr "x"))]
+          ids = map (\i -> [VInt (fromIntegral i)])
+          secret = "秘密の言葉"
+      h <- openHosiWith cfg dir sch
+      n1 <- note h "The quick brown fox, 3 jumps!"
+      n2 <- note h (T.pack ("zebra " ++ T.unpack secret ++ " crossing"))
+      n3 <- note h "ZEBRA zebra Zebra crossing"
+      n4 <- note h "한국어 문장입니다"
+      checkEq "a word" (ids [n1]) =<< search h "fox"
+      checkEq "...in any case" (ids [n2, n3]) =<< search h "ZeBrA"
+      checkEq "a number" (ids [n1]) =<< search h "3"
+      checkEq "the punctuation is not a word" (ids [n1]) =<< search h "jumps"
+      checkEq "a word of Han and kana, found by two of its characters" (ids [n2]) =<< search h "秘密"
+      checkEq "...and by the whole of it" (ids [n2]) =<< search h secret
+      checkEq "hangul too" (ids [n4]) =<< search h "문장"
+      checkEq "a word that is nowhere" [] =<< search h "unicorn"
+      checkEq "{:top 1} gives the best one only" 1 . length
+        =<< query h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q {:top 1}) [[?e ?a ?v]]]]" [InScalar (VStr "zebra")]
+      checkEq "with no attribute, every fulltext attribute is searched" (ids [n1])
+        =<< (sort <$> query h "[:find ?e :in $ ?q :where [(fulltext $ ?q) [[?e _ _]]]]" [InScalar (VStr "fox")])
+      -- a word is found in a note that has it, whichever attribute: the attribute is part of the question
+      checkEq "the other attribute is not searched" [] =<< search h "x"
+      checkEq "verify" [] =<< verify h
+      -- it follows the data: a value taken out is not found, a new one is
+      _ <- write h [Delete (Id n1) "note/body" (Lit (VStr "The quick brown fox, 3 jumps!")), Create (Id n1) "note/body" (Lit (VStr "a quiet owl"))]
+      checkEq "the old words of a changed value are gone" [] =<< search h "fox"
+      checkEq "...and the new ones are there" (ids [n1]) =<< search h "owl"
+      -- an erased note is not found, and after clean its words are in no file
+      before <- markerCount (TE.encodeUtf8 "秘密") dir
+      check "(the words are in some file before an erase)" (before > 0)
+      _ <- erase h [EraseIds [n2]]
+      checkEq "an erased note is not found" [] =<< search h "秘密"
+      rep <- clean h defaultCleanOptions
+      check "clean made the khana again, as it must for an index of words" (crKhanaCleaned rep && crKhanaRebuilt rep)
+      checkEq "its words are in no file" 0 =<< markerCount (TE.encodeUtf8 "秘密") dir
+      checkEq "the others are still found" (ids [n3]) =<< search h "zebra"
+      checkEq "verify after clean" [] =<< verify h
+      closeHosi h
+      -- another schema is another khana: no fulltext, then fulltext again
+      h2 <- openHosiWith cfg dir (M.fromList [ ("note/body", attr TString), ("note/by", attr TString) ])
+      r <- try (search h2 "owl") :: IO (Either SomeException [[Value]])
+      check "without the flag there is nothing to search with" (either (const True) (const False) r)
+      closeHosi h2
+      h3 <- openHosiWith cfg dir sch
+      checkEq "with the flag again, the khana was made again and finds them" (ids [n1]) =<< search h3 "owl"
+      closeHosi h3)
+
+  , ("fulltext: the native dtlv cannot run the analyzer, and says so before anything is made", withTmp $ \dir -> do
+      exe <- maybe "" id <$> lookupEnv "HOSIGRAPH_DTLV"
+      r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlv exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
+             :: IO (Either HosiError Hosi)
+      check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
+
+  , ("the khana has a write-ahead log: an erased value is in txlog/ until clean, and in no file after it", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       h <- openHosiWith ((backendCfg (KhanaDatalevinJvm java jar)) { hcClock = clock }) dir schema
       _ <- person h (T.pack (marker 1)) 1

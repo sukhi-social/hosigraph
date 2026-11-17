@@ -24,24 +24,26 @@
 -- >                 │                              │          (events/manifest lists the chunks)
 -- >                 └──────────── fold ────────────┴───────► khana/  ("now", Datalog)
 --
--- == What 0.1 promises
+-- == What 0.1 promises (and 0.2 keeps)
 --
 -- hosigraph is for /one process on one machine, on a local disk/ (a world has one opener: a second one is refused,
--- 'WorldBusy', even if it only wants to read; a shared lock for readers is not in 0.1), and it brings Datalevin along
--- (the @dtlv@ program, or a JVM and the standalone jar).
+-- 'WorldBusy', even if it only wants to read; a shared lock for readers is not in 0.2), and it brings Datalevin along
+-- (the @dtlv@ program, or a JVM and the standalone jar).  0.2 asks more of the khana (tuples, words, an order) and nothing
+-- more of the files.
 --
--- * /What it wrote, it reads./  A world that 0.1.0 wrote is read by every 0.1.x (the files, not the khana: that is derived,
+-- * /What it wrote, it reads./  A world that 0.1.0 wrote is read by every 0.1.x and 0.2.x (the files, not the khana: that is derived,
 --   and is simply made again).  A test opens such a world, kept in the repository.  A format that this code does not know
 --   is refused ('Corrupt') and not touched.
--- * /Stable/ are the names under the headings of the export list /before/ "Experimental".  Within 0.1.x they are not
+-- * /Stable/ are the names under the headings of the export list /before/ "Experimental".  Within 0.2.x they are not
 --   removed, and what they mean does not change.  New names, new fields of 'HosiConfig' and the reports, and new constructors
 --   of 'HosiError' may come (build a config with @defaultConfig { .. }@; keep a catch-all case when you match an error).
--- * /Experimental/ (the last headings) may change, or go, in a 0.1.x; the changelog says so when it happens.
+-- * /Experimental/ (the last headings) may change, or go, in a 0.2.x; the changelog says so when it happens.
 --   They are the ones whose meaning is not settled yet: cold storage ('freeze'), how a question was answered ('historyTrace'),
---   the numbers ('stats'), and reading the past into a khana ('backfillSince').
+--   the numbers ('stats'), reading the past into a khana ('backfillSince'), and the newest /n/ from the end of an index
+--   ('highest', 'highestIn': an order that is not a long, and the other direction, may come).
 -- * /Not promised/: any module other than this one, except the part of "Hosigraph.Events" that the guide lists
 --   (use the events alone, without a khana).  The others are exposed so that the tests and tools can reach them.
--- * /Not in 0.1/: S3, live serving of a backfill, sync, metrics, JSON-LD import, thaw and compression of cold chunks,
+-- * /Not in 0.2/: S3, live serving of a backfill, sync, metrics, JSON-LD import, thaw and compression of cold chunks,
 --   Windows, a network file system.
 module Hosigraph
   ( -- * Opening
@@ -67,13 +69,15 @@ module Hosigraph
     -- * Ids
   , HosiId, describeId, idMonth, showMonth, Month, Clock, systemClock
     -- * Re-exported (the words of the khana)
-  , Value(..), Keyword(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, ValueType(..)
+  , Value(..), Keyword(..), Datom(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, tuple, fulltext, ValueType(..)
   , Event(..), Kind(..), HosiError(..)
-    -- * Experimental (may change, or go, in a 0.1.x)
+    -- * Experimental (may change, or go, in a 0.2.x)
     -- ** Cold storage: a quiet month goes cold
   , FreezeOptions(..), defaultFreezeOptions, FreezeReport(..), freeze
     -- ** How a question about the past was answered
   , historyTrace, LookupTrace(..), Probe(..), probeSays
+    -- ** The newest n, from the end of an index
+  , highest, highestIn
     -- ** The numbers
   , Stats(..), stats
     -- ** Reading the past into a khana, newest first
@@ -533,7 +537,7 @@ data CleanReport = CleanReport
   , crSkipped      :: [String]                    -- ^ chunks it gave up on because an erase changed them meanwhile; the next call finds them
   , crRecordsLeft  :: Int                         -- ^ chunks that still have an erase record (more than 0: call again)
   , crKhanaCleaned :: Bool                        -- ^ the khana was made into a new file, because the old one may still hold what erases took out
-  , crKhanaRebuilt :: Bool                        -- ^ ...and the quick way (a compacted copy) did not work, so it was folded again from the events (slow; look at why if it keeps happening)
+  , crKhanaRebuilt :: Bool                        -- ^ ...and it was folded again from the events, not copied: the quick way (a compacted copy) did not work (slow; look at why if it keeps happening), or the schema has a 'fulltext' attribute, which is always done so
   } deriving Show
 
 -- | Make what 'erase' took out go from the disk.  'erase' hides an id at once (and its chunk's bytes stay in the chunk,
@@ -546,7 +550,8 @@ data CleanReport = CleanReport
 --    khana is made into a new file.  The quick way is a compacted copy of the khana (no replay: what is alive is
 --    written, what was taken out is not); if the copy cannot be made, or does not agree with the khana (same folded
 --    seq, same number of facts), the khana is folded again from the events, which leave the erased ids out
---    ('rebuildKhana'), and 'crKhanaRebuilt' says so.  This holds the events lock.
+--    ('rebuildKhana'), and 'crKhanaRebuilt' says so.  A schema with a 'fulltext' attribute always takes the second
+--    way: the index of words keeps the words of what was erased, in a compacted copy too.  This holds the events lock.
 --
 -- Nothing to do costs a look at the manifest and at one small fact in the khana.  There is no scheduler: call it when
 -- the host is quiet.  Call it without holding any lock of this Hosi.
@@ -557,7 +562,9 @@ clean h opts = do
     conn <- readIORef (hKhana h)
     cg <- cleanGenOf conn
     gen <- E.eraseGeneration (hEvents h)
-    if cg >= gen then pure (False, False) else do
+    if cg >= gen then pure (False, False)
+    else if any asFulltext (M.elems (hSchema h)) then rebuildKhanaLocked h >> pure (True, True)     -- the index of words keeps the words of what was erased, in a copy too
+    else do
       copied <- try (compactKhanaLocked h gen)
       case copied of
         Right ()                    -> pure (True, False)
@@ -615,6 +622,95 @@ queryCells :: Hosi -> T.Text -> [Input] -> IO [[Cell]]
 queryCells h txt inputs = do
   k <- readIORef (hKhana h)
   khanaQueryCells k txt inputs
+
+-- | The facts of one attribute from the high end of its order, as many as @n@: the entities with the largest value,
+-- the largest value first and, among equal values, the largest id first.  For a timeline that is "the newest @n@" when
+-- the attribute is a time (or an id that grows).
+--
+-- @highest h attr Nothing n@ gives the first @n@; @highest h attr (Just (v, e)) n@ gives the @n@ after the place
+-- @(v, e)@ (the fact @(e, v)@ itself is not in the answer), so the cursor for the next page is the value and the id of
+-- the last fact of this one.  Ask for the entities of the answer with 'getEntities'.
+--
+-- Unlike @:limit@ of a query, which finds every row and sorts them before it cuts, this walks the attribute's index
+-- from its end and reads about @n@ facts, so what it costs does not grow with the number of facts there are.  It is a
+-- walk and not a search: it cannot be given a filter (not a month); for the facts of some keys (the followed) see
+-- 'highestIn'; for any other, ask for more than you need and filter, or use a query over a window.
+--
+-- The attribute has to be in the schema with a type (@TLong@, @TString@, ...: an attribute with no type is kept in an order
+-- that is of no use), and not be a 'tuple'; the cursor's value has the attribute's type.  A refused call is a
+-- 'BadArgument'.  The order is Datalevin's for that type: numbers by size, strings by their bytes.
+highest :: Hosi -> Keyword -> Maybe (Value, HosiId) -> Int -> IO [Datom]
+highest h a cur n = do
+  when (n < 1) $ throwIO (BadArgument ("highest: the count is " ++ show n ++ ", and has to be 1 or more"))
+  case M.lookup a (hSchema h) of
+    Nothing -> throwIO (BadArgument ("highest: " ++ show a ++ " is not in the schema, and an attribute with no type has no order to walk"))
+    Just s
+      | not (null (asTuple s)) -> throwIO (BadArgument ("highest: " ++ show a ++ " is a tuple, and the order of a tuple was not tried"))
+      | asType s == TAny       -> throwIO (BadArgument ("highest: " ++ show a ++ " has no type (TAny): Datalevin keeps it in an order that is of no use; give it one"))
+      | Just (v, _) <- cur, not (fits (asType s) v) ->
+          throwIO (BadArgument ("highest: the cursor's value " ++ T.unpack (renderValue v) ++ " is not a " ++ show (asType s) ++ ", which is what " ++ show a ++ " holds"))
+      | otherwise -> pure ()
+  k <- readIORef (hKhana h)
+  khanaHighest k a cur n
+  where fits = valueFits
+
+-- | Whether a value is of the type an attribute declares.
+valueFits :: ValueType -> Value -> Bool
+valueFits t v = case (t, v) of
+  (TString, VStr _) -> True; (TLong, VInt _) -> True; (TRef, VInt _) -> True
+  (TDouble, VDouble _) -> True; (TBool, VBool _) -> True; (TKeyword, VKw _) -> True
+  _ -> False
+
+-- | Like 'highest', for the facts of some keys only: "the newest @n@ of the notes of these authors".
+--
+-- The attribute is a two-part 'tuple', @(key, order)@, of attributes of one entity: say @tuple ["note/by", "note/at"]@
+-- under the name @"note/by+at"@, and @highestIn h "note/by+at" authors Nothing 20@.  The answer is the facts of that tuple attribute whose key is one of
+-- @keys@: at most @n@, the largest order value first and, among equal values, the largest id first, whichever key they are
+-- under; the value of a fact is @VTuple [Just key, Just order]@.  The cursor is the same as @highest@'s: @Just (order, id)@
+-- of the last fact of the page before (the order value, not the tuple).
+--
+-- What it costs is about one seek in the index per key plus one per fact in the answer, and does not depend on how the
+-- facts are spread among the keys.  Walking 'highest' and dropping the facts whose key is not wanted costs a read for every
+-- fact newer than the last one that passes: nothing when the keys are busy, the whole attribute when they are quiet
+-- (that walk, measured in Datalevin alone: 0.7 ms against 900 ms, 200k facts, 400 keys).  Through hosigraph with the
+-- JVM khana, 400 keys that have 400 facts each: 3.9 ms, against 240 ms for the same question as an @:order-by … :limit@
+-- query; there is a floor of 2 to 6 ms for every call, so with few keys that wrote little the query does as well (the
+-- guide has the table).  A key that has no facts, and a key given twice, are harmless.  The keys are not limited in
+-- number, but the cost is per key, so a very long list is a long call.
+--
+-- The tuple has to have exactly two parts, both in the schema with a type; the order part has to be
+-- a @TLong@ (the walk of a key starts at the largest long); each key has the key part's type; the cursor's value is a
+-- long.  The tuple may be not unique: the facts of one key that tie in the order value are told apart by the id.  A refused
+-- call is a 'BadArgument'.  For a filter that is not "the key is one of these", ask for more than you need and drop what
+-- fails (what the first rows of the answer lack is not lost: the cursor goes on from them).
+highestIn :: Hosi -> Keyword -> [Value] -> Maybe (Value, HosiId) -> Int -> IO [Datom]
+highestIn h a keys cur n = do
+  when (n < 1) $ refuse ("the count is " ++ show n ++ ", and has to be 1 or more")
+  case M.lookup a (hSchema h) of
+    Nothing -> refuse (show a ++ " is not in the schema")
+    Just s -> case asTuple s of
+      [kp, op] -> do
+        ks <- part kp
+        os <- part op
+        when (asType os /= TLong) $
+          refuse (show op ++ " is the order part of " ++ show a ++ " and has to be a TLong (it is " ++ show (asType os) ++ "): the walk of a key starts at the largest long")
+        case [ v | v <- keys, not (valueFits (asType ks) v) ] of
+          v : _ -> refuse ("the key " ++ T.unpack (renderValue v) ++ " is not a " ++ show (asType ks) ++ ", which is what " ++ show kp ++ " holds")
+          []    -> pure ()
+        case cur of
+          Just (v, _) | not (valueFits TLong v) ->
+            refuse ("the cursor's value " ++ T.unpack (renderValue v) ++ " is not a TLong, which is what " ++ show op ++ " holds")
+          _ -> pure ()
+      _ -> refuse (show a ++ " is not a tuple of two attributes, (key, order)")
+  k <- readIORef (hKhana h)
+  khanaHighestIn k a keys cur n
+  where
+    refuse msg = throwIO (BadArgument ("highestIn: " ++ msg))
+    part p = case M.lookup p (hSchema h) of
+      Nothing -> refuse (show p ++ ", a part of " ++ show a ++ ", is not in the schema")
+      Just ps
+        | asType ps == TAny -> refuse (show p ++ ", a part of " ++ show a ++ ", has no type (TAny): Datalevin keeps it in an order that is of no use")
+        | otherwise         -> pure ps
 
 -- | Many entities, all from the same instant.  The answers are in the order asked.  With a Datalevin
 -- khana this is one round trip instead of one per entity.
