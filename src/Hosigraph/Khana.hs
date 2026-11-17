@@ -35,23 +35,28 @@
 module Hosigraph.Khana
   ( KhanaBackend(..), khanaDirName, Khana
   , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
-  , metaEntity, foldedSeqAttr, eraseGenAttr, khanaSchema
-  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, khanaDatoms, khanaDatomCount
+  , metaEntity, foldedSeqAttr, eraseGenAttr, schemaMarkAttr, schemaMark, khanaSchema
+  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, applyFacts, foldRefused, khanaDatoms, khanaDatomPage, compareKhanas, khanaDatomCount
   , khanaFoldedAndCount
     -- * Erasing
-  , foldedState, setEraseGen, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
+  , peekKhana, setEraseGen, setSchemaMark, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
   , khanaEntity, khanaEntities, khanaQuery, khanaQueryMany, khanaQueryCells, khanaQueryCellsMany
   ) where
 
-import           Control.Exception (SomeException, try, throwIO)
+import           Control.Exception (SomeException, try, throwIO, finally)
 import           Control.Monad
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import           Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import           Data.Word
 
+import           Hosigraph.Backfill (Fact)
 import           Hosigraph.Event
 import           Hosigraph.Khana.Dtlv
 import           Hosigraph.Khana.Sidecar (Sidecar, newSidecar, stopSidecar)
+import           Hosigraph.Sha256 (sha256Hex)
 import qualified Takka.Syntax as Q
 import           Takka.Types
 
@@ -104,9 +109,23 @@ eraseGenAttr = "hosi.meta/erase-gen"
 cleanGenAttr :: Keyword
 cleanGenAttr = "hosi.meta/clean-gen"
 
+-- | The schema the events in this khana were folded under, as 'schemaMark' says it.  What a fold makes of the events
+-- depends on the schema (one value or many, which types are taken, which values are unique), and the schema is an
+-- argument of open that nobody keeps; so the khana keeps a mark of it, and open can tell a khana made under another one.
+schemaMarkAttr :: Keyword
+schemaMarkAttr = "hosi.meta/schema"
+
+-- | A mark of a schema: a hash of every attribute's name, type, cardinality and uniqueness (in name order), so two
+-- schemas have the same mark exactly when they fold the same events the same way.
+schemaMark :: Schema -> Text
+schemaMark s = T.pack ("hosi-schema/1:" ++ sha256Hex (TE.encodeUtf8 (T.pack text)))
+  where
+    text = concat [ T.unpack (kwText k) ++ " " ++ show (asType a) ++ " " ++ show (asCard a) ++ " " ++ show (asUnique a) ++ "\n"
+                  | (k, a) <- M.toAscList s ]
+
 -- | The caller's schema plus the bookkeeping attributes.
 khanaSchema :: Schema -> Schema
-khanaSchema = M.insert cleanGenAttr (attr TLong) . M.insert eraseGenAttr (attr TLong) . M.insert foldedSeqAttr (attr TLong)
+khanaSchema = M.insert schemaMarkAttr (attr TString) . M.insert cleanGenAttr (attr TLong) . M.insert eraseGenAttr (attr TLong) . M.insert foldedSeqAttr (attr TLong)
 
 -- | Open (creating if needed) a khana in a directory.
 openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> IO Khana
@@ -136,11 +155,34 @@ genIn m = case M.lookup eraseGenAttr m of
   Just (VInt n : _) -> fromIntegral n
   _                 -> 0
 
--- | Where the khana stands, from one read of its bookkeeping entity: the seq of the last event folded in, and the
--- number of the last erase it has followed (0: none).  Open asks this, and a process costs time, so it is one question.
-foldedState :: Khana -> IO (Word64, Int)
-foldedState k = case k of
-  DtlvKhana d -> (\m -> (seqIn m, genIn m)) <$> dtlvEntity d metaEntity
+-- | The mark of the schema the khana was folded under ('schemaMark'); 'Nothing' for a khana that was made before the mark
+-- was kept, or that has not been stamped yet.
+markIn :: M.Map Keyword [Value] -> Maybe Text
+markIn m = case M.lookup schemaMarkAttr m of
+  Just (VStr t : _) -> Just t
+  _                 -> Nothing
+
+-- | Where the khana stands, from one read of its bookkeeping entity: the seq of the last event folded in, the
+-- number of the last erase it has followed (0: none), and the mark of the schema it was folded under.  Open asks this,
+-- and a process costs time, so it is one question.
+--
+-- The khana is opened with only its own bookkeeping declared, and let go of at once.  Datalevin writes the schema it is
+-- opened with into the file, so a schema that may still be refused must not be given to a khana that is to be left as it was.
+peekKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> IO (Word64, Int, Maybe Text)
+peekKhana (KhanaRuntime sc) backend dir = do
+  runner <- case backend of
+    KhanaDtlv exe         -> pure (Native exe)
+    KhanaDatalevinJvm _ _ -> maybe (throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)"))
+                                   (pure . Resident) sc
+  d <- attachDtlv runner dir (khanaSchema M.empty)
+  m <- dtlvEntity d metaEntity `finally` closeDtlv d
+  pure (seqIn m, genIn m, markIn m)
+
+-- | Say that the events in this khana were folded under this schema.  A khana made from the events says it when it is
+-- whole; an empty one (nothing folded yet) is stamped at open.
+setSchemaMark :: Khana -> Schema -> IO ()
+setSchemaMark k s = case k of
+  DtlvKhana d -> dtlvTransact d [ DAdd metaEntity schemaMarkAttr (VStr (schemaMark s)) ]
 
 -- | Say that the khana has followed the erases up to this one, and holds nothing they took out: for a khana just
 -- made from the events, which left the erased ids out from the start (so both numbers are this one).
@@ -199,6 +241,10 @@ applyEvents k evs = case k of
   DtlvKhana d     -> dtlvTransact d (map eventToDtlv evs ++ [DAdd metaEntity foldedSeqAttr marker])
   where marker = VInt (fromIntegral (maximum (map evSeq evs)))
 
+-- | How the 'Corrupt' that 'applyBatched' throws begins (a caller can tell this refusal from other kinds of 'Corrupt').
+foldRefused :: String
+foldRefused = "could not fold sealed events into the khana: "
+
 -- | Fold many events (already in seq order) in transactions of at most @n@ events.
 -- Used for catching up and rebuilding, where the events were all accepted once before.
 applyBatched :: Int -> Khana -> [Event] -> IO ()
@@ -206,14 +252,57 @@ applyBatched n k evs = do
   r <- try (forM_ (chunksOf n evs) (applyEvents k))
   case r of
     Right () -> pure ()
-    Left (e :: SomeException) -> throwIO (Corrupt ("could not fold sealed events into the khana: " ++ show e))
+    Left (e :: SomeException) -> throwIO (Corrupt (foldRefused ++ show e))
   where chunksOf _ [] = []
         chunksOf m xs = let (a, b) = splitAt m xs in a : chunksOf m b
+
+-- | Put facts in (adds only), in transactions of at most @n@ facts.  For a backfill ("Hosigraph.Backfill"): the folded seq
+-- and the schema mark are not written, so a khana built this way is never taken for a whole one at open.
+applyFacts :: Int -> Khana -> [Fact] -> IO ()
+applyFacts n k fs = do
+  r <- try (forM_ (chunksOf fs) $ \c -> case k of
+              DtlvKhana d -> dtlvTransact d [ DAdd e a v | (e, a, v) <- c ])
+  case r of
+    Right () -> pure ()
+    Left (e :: SomeException) -> throwIO (Corrupt ("could not put backfilled facts into the khana: " ++ show e))
+  where chunksOf [] = []
+        chunksOf xs = let (a, b) = splitAt n xs in a : chunksOf b
 
 -- | Every fact in the khana except the bookkeeping one.
 khanaDatoms :: Khana -> IO [Datom]
 khanaDatoms k = filter ((/= metaEntity) . dE) <$> case k of
   DtlvKhana d     -> dtlvDatoms d
+
+-- | A page of the facts, as 'dtlvDatomPage' gives it: whole entities, at most @n@ facts (more if one entity has more), from
+-- the entity @lo@ (the first there is, for 'Nothing'), and where the next page starts ('Nothing': the end).
+khanaDatomPage :: Khana -> Maybe EntityId -> Int -> IO ([Datom], Maybe EntityId)
+khanaDatomPage k lo n = case k of
+  DtlvKhana d -> do
+    (ds, next) <- dtlvDatomPage d lo n
+    pure (filter ((/= metaEntity) . dE) ds, next)
+
+-- | How the facts of two khanas differ: how many only the first has, and how many only the second has.
+-- Neither is ever held whole: the two are read in pages of about @n@ facts, each page up to the first entity where
+-- either of them stops, and compared there.  What it holds at a time is a page of each, however large the khanas are.
+compareKhanas :: Int -> Khana -> Khana -> IO (Int, Int)
+compareKhanas n a b = go Nothing 0 0
+  where
+    go lo extra missing = do
+      (pa, na) <- khanaDatomPage a lo n
+      (pb, nb) <- khanaDatomPage b lo n
+      let hi = case (na, nb) of                      -- the first entity where one of the pages stops short of the end
+            (Just x, Just y) -> Just (min x y)
+            (Just x, Nothing) -> Just x
+            (Nothing, y)      -> y
+          within ds = maybe ds (\h -> takeWhile ((< h) . dE) ds) hi
+          sa = S.fromList (within pa)
+          sb = S.fromList (within pb)
+          -- counted now, not later: a count left as a thunk holds the page's two sets until the end (4GB on real data)
+          !extra'   = extra   + S.size (sa `S.difference` sb)
+          !missing' = missing + S.size (sb `S.difference` sa)
+      case hi of
+        Nothing -> pure (extra', missing')
+        Just h  -> h `seq` go (Just h) extra' missing'
 
 khanaDatomCount :: Khana -> IO Word64
 khanaDatomCount k = case k of

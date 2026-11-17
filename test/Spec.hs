@@ -13,7 +13,7 @@ import qualified Data.ByteString.Char8 as BC
 import           Data.Bits (xor)
 import           Data.IORef
 import           Data.Int (Int64)
-import           Data.List (sort, sortOn, nub, isInfixOf)
+import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import qualified Data.Text as T
@@ -22,15 +22,17 @@ import           Data.Time.Clock (UTCTime(..))
 import           Data.Time.Clock.POSIX (getPOSIXTime)
 import           Data.Word
 import           System.Directory
-import           System.Environment (lookupEnv)
+import           System.Environment (getArgs, getExecutablePath, lookupEnv)
 import           System.Exit
 import           System.FilePath ((</>))
 import           System.IO
-import           System.Process (callProcess)
+import           System.Process (CreateProcess(..), StdStream(..), callProcess, createProcess, proc, readProcess, terminateProcess, waitForProcess)
+import           System.Timeout (timeout)
 import           Test.QuickCheck
 import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
 import           Hosigraph
+import           Hosigraph.Backfill
 import           Hosigraph.Bin
 import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
@@ -38,7 +40,9 @@ import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
-import           Hosigraph.Khana.Dtlv (ednKw, ednStr, ednVal, schemaEdn, tameEdn)
+import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana, newKhanaRuntime, closeKhanaRuntime, openKhana, applyFacts, khanaDatoms, khanaDatomPage, compareKhanas)
+import           Takka.Types (Datom(..))
+import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
 import           Hosigraph.Probe (confirmSlot)
@@ -60,6 +64,10 @@ checkEq msg expected actual =
   unless (expected == actual) $
     throwIO (userError (msg ++ "\n      expected: " ++ show expected ++ "\n      actual:   " ++ show actual))
 
+-- | A walk that never ends is a failure, not a hang (a pager that stands still would loop for ever).
+endsIn :: String -> IO a -> IO a
+endsIn what act = timeout 20000000 act >>= maybe (throwIO (userError (what ++ ": did not end in 20 s"))) pure
+
 prop :: Testable p => Int -> p -> IO ()
 prop n p = do
   r <- quickCheckWithResult stdArgs { maxSuccess = n, chatty = False } p
@@ -67,6 +75,23 @@ prop n p = do
 
 main :: IO ()
 main = do
+  args <- getArgs
+  case args of
+    ["--hold-world", dir] -> holdWorld dir        -- a helper for the world-lock tests: not a test run
+    ["--make-fixture", dir] -> makeFixture dir    -- writes test/fixtures/world-0.1.0 (see "The shape on disk is a promise"); not a test run
+    _                     -> runTests
+
+-- | Run again by the world-lock test as a second process: open this world, say so, and hold it until stdin is closed.
+-- (If the test kills it instead, it dies holding the world: that is the point.)
+holdWorld :: FilePath -> IO ()
+holdWorld dir = do
+  ev <- Ev.openEvents Ev.defaultEventsConfig dir
+  putStrLn "held" >> hFlush stdout
+  _ <- try (hGetLine stdin) :: IO (Either IOException String)
+  Ev.closeEvents ev
+
+runTests :: IO ()
+runTests = do
   hSetEncoding stdout utf8
   hSetBuffering stdout LineBuffering
   -- The Datalevin khana is tried too: through the native `dtlv` when HOSIGRAPH_DTLV names it, and
@@ -78,10 +103,10 @@ main = do
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
       nativeRun = case mexe of
-        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ nativeTests exe)
+        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ formatHosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ nativeTests exe)
         Nothing  -> []
       jvmRun = case mjar of
-        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
+        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
         Nothing  -> []
       mixedRun = case (mexe, mjar) of
         (Just exe, Just jar) -> tag "[dtlv+jvm]" (mixedTests exe java jar)
@@ -89,7 +114,7 @@ main = do
       dtlvRun = nativeRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
-  results <- forM (pureTests ++ dtlvRun) $ \(name, act) -> do
+  results <- forM (pureTests ++ worldLockTests ++ formatTests ++ dtlvRun) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -100,6 +125,311 @@ main = do
 
 nonEmpty :: String -> Maybe String
 nonEmpty x = if null x then Nothing else Just x
+
+-- ---------------------------------------------------------------------------
+-- One opener at a time
+
+-- | Every path under a directory, with the size of each file: what "nothing was touched" compares.
+listAll :: FilePath -> IO [(FilePath, Integer)]
+listAll root = go ""
+  where
+    go rel = do
+      names <- sort <$> listDirectory (root </> rel)
+      fmap concat . forM names $ \n -> do
+        let r = rel </> n
+        isDir <- doesDirectoryExist (root </> r)
+        if isDir then ((r, -1) :) <$> go r else (\sz -> [(r, sz)]) <$> getFileSize (root </> r)
+
+isWorldBusy :: Either HosiError a -> Bool
+isWorldBusy r = case r of Left (WorldBusy _) -> True; _ -> False
+
+worldLockTests :: [Test]
+worldLockTests =
+  [ ("world lock: a second open of an open world is refused (WorldBusy), in the same process, and touches nothing", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+          put ev n = Ev.withEventsLock ev (Ev.record ev [Create (Tmp 1) "a" (Lit (VInt n))] >>= \rc -> Ev.commit ev rc)
+      ev <- Ev.openEvents cfg dir
+      put ev 1
+      -- a chunk directory the manifest does not list: the owner may be in the middle of a seal.  A second opener that
+      -- recovered would sweep it.
+      let making = dir </> "chunks" </> "c-in-the-making"
+      createDirectoryIfMissing True making
+      B.writeFile (making </> "chunk.hosi") "half"
+      before <- listAll dir
+      r <- try (Ev.openEvents cfg dir)
+      check "refused: WorldBusy" (isWorldBusy r)
+      case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+      checkEq "nothing was touched (not the tail, not the unlisted chunk directory)" before =<< listAll dir
+      put ev 2                                                  -- the owner goes on
+      Ev.closeEvents ev
+      -- let go: the next one opens, and finds both writes of the owner
+      ev2 <- Ev.openEvents cfg dir
+      checkEq "both writes are there" 2 . length =<< Ev.tailBatches ev2
+      Ev.closeEvents ev2)
+
+  , ("world lock: another process holds the world, so it is refused; the process dies without closing, so it is free", withTmp $ \dir -> do
+      exe <- getExecutablePath
+      (Just hin, Just hout, _, ph) <- createProcess (proc exe ["--hold-world", dir]) { std_in = CreatePipe, std_out = CreatePipe }
+      (do said <- hGetLine hout
+          checkEq "the other process has it" "held" said
+          r <- try (Ev.openEvents Ev.defaultEventsConfig dir)
+          check "refused: WorldBusy" (isWorldBusy r)
+          case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+          terminateProcess ph                                   -- SIGTERM: it has no time to close anything
+          _ <- waitForProcess ph
+          ev <- Ev.openEvents Ev.defaultEventsConfig dir        -- the lock file is still there, and means nothing
+          Ev.closeEvents ev) `finally` (hClose hin >> terminateProcess ph >> void (waitForProcess ph)))
+
+  , ("world lock: closing lets go, and a world that failed to open does not keep the lock", withTmp $ \dir -> do
+      let cfg = Ev.defaultEventsConfig
+      ev <- Ev.openEvents cfg dir
+      Ev.closeEvents ev
+      ev2 <- Ev.openEvents cfg dir
+      Ev.closeEvents ev2
+      -- a manifest that cannot be read: the open fails after the lock was taken
+      B.writeFile (dir </> manifestFile) "this is not a manifest"
+      r <- try (Ev.openEvents cfg dir) :: IO (Either SomeException Ev.Events)
+      check "the damaged world does not open" (either (const True) (const False) r)
+      check "...but it is not WorldBusy either" (case r of Left e | Just (WorldBusy _) <- fromException e -> False; _ -> True)
+      removeFile (dir </> manifestFile)
+      ev3 <- Ev.openEvents cfg dir
+      Ev.closeEvents ev3)
+
+  , ("open: a khana program that is not there is BackendMissing, found before the world is touched", withTmp $ \dir -> do
+      r <- try (openHosiWith defaultConfig { hcKhanaBackend = KhanaDtlv "/no/such/dtlv" } (dir </> "w") schema) :: IO (Either HosiError Hosi)
+      check "BackendMissing" (case r of Left (BackendMissing _) -> True; _ -> False)
+      checkEq "...and no directory was made" False =<< doesDirectoryExist (dir </> "w"))
+  ]
+
+-- ---------------------------------------------------------------------------
+-- The shape on disk is a promise
+--
+-- @test/fixtures/world-0.1.0/@ is a world that 0.1.0 wrote (made by @--make-fixture@ below, and kept).  Every later build
+-- must open it, show the events it holds, and (with each khana) answer as it was written: that is what "what 0.1.0 wrote,
+-- any 0.1.x reads" means.  If a change makes these tests fail, it is a change of the format, and the format is the promise.
+-- Do not make the fixture again to make them pass.
+
+fixtureDir :: FilePath
+fixtureDir = "test" </> "fixtures" </> "world-0.1.0"
+
+renderValue :: Value -> String
+renderValue v = case v of
+  VInt n          -> "i:" ++ show n
+  VDouble d       -> "d:" ++ show d
+  VStr t          -> "s:" ++ show (T.unpack t)
+  VBool b         -> "b:" ++ (if b then "t" else "f")
+  VKw (Keyword k) -> "k:" ++ T.unpack k
+
+renderEvent :: E.Event -> String
+renderEvent e = unwords [ show (E.evSeq e), E.kindName (E.evKind e), show (E.evId e), attrName, renderValue (E.evVal e) ]
+  where attrName = case E.evAttr e of Keyword a -> T.unpack a
+
+-- | Every event the world shows, in order: the sealed ones (the erased are not among them), then the tail.
+dumpWorld :: Ev.Events -> IO [String]
+dumpWorld ev = do
+  sealed <- Ev.withEventsLock ev (Ev.eventsAfter ev 0)
+  tl     <- Ev.tailBatches ev
+  pure (map renderEvent sealed ++ [ "tail " ++ renderEvent e | b <- tl, e <- b ])
+
+-- | An entity as "now" shows it, one line: attributes in order, the values of each in order.
+renderEntity :: HosiId -> M.Map Keyword [Value] -> String
+renderEntity i m = unwords ("entity" : show i : [ T.unpack k ++ "=" ++ intercalate "," (sort (map renderValue vs)) | (Keyword k, vs) <- M.toList m ])
+
+-- | Make the fixture world: @root/events/@ and @root/expected.txt@.  It is made at the events layer, so no khana program is needed.
+-- The world has: chunks of both versions (October was written as version 1, the way 0.0.1.0 did), a cold chunk (November),
+-- an erase record (on the version 1 chunk), and a tail that is not sealed.  The @entity@ lines of @expected.txt@ are written by hand here
+-- (what each person should be), not read back from the world.
+makeFixture :: FilePath -> IO ()
+makeFixture root = do
+  removePathForcibly root
+  let evDir = root </> "events"
+  (clk, clock) <- newClock oct18
+  let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+      put ev ops = Ev.withEventsLock ev (do rc <- Ev.record ev ops; Ev.commit ev rc; pure (Ev.rcTemps rc))
+      str = Lit . VStr
+  -- October: three people.  Then the chunks are written again as version 1.
+  ev1 <- Ev.openEvents cfg evDir
+  t1 <- put ev1 [ Create (Tmp 1) "person/name" (str "Ada"), Create (Tmp 1) "person/age" (Lit (VInt 36))
+                , Create (Tmp 2) "person/name" (str "Bo"), Create (Tmp 2) "person/score" (Lit (VDouble 1.5))
+                , Create (Tmp 2) "person/friend" (RefTo (Tmp 1)), Create (Tmp 2) "person/tag" (str "x"), Create (Tmp 2) "person/tag" (str "y")
+                , Create (Tmp 3) "person/name" (str "Cy") ]
+  _ <- Ev.seal ev1
+  Ev.closeEvents ev1
+  toVersion1 evDir (2026, 10)
+  -- November: Dan; Ada is a year older (a newer Create wins); Bo loses a tag
+  writeIORef clk nov11
+  ev2 <- Ev.openEvents cfg evDir
+  let (ada, bo, cy) = (t1 M.! 1, t1 M.! 2, t1 M.! 3)
+  t2 <- put ev2 [ Create (Tmp 1) "person/name" (str "Dan"), Create (Tmp 1) "person/friend" (RefTo (Id ada))
+                , Create (Id ada) "person/age" (Lit (VInt 37)), Delete (Id bo) "person/tag" (str "y") ]
+  _ <- Ev.seal ev2
+  -- December: Eve; November goes cold; Cy is erased; and a last batch stays in the tail
+  writeIORef clk dec05
+  t3 <- put ev2 [ Create (Tmp 1) "person/name" (str "Eve") ]
+  _ <- Ev.seal ev2
+  _ <- Ev.freezeUnit ev2 (KCreate, (2026, 11))
+  _ <- Ev.withEventsLock ev2 (Ev.eraseNow ev2 (Erase.fromIds [cy]))
+  t4 <- put ev2 [ Create (Tmp 1) "person/name" (str "Fay"), Create (Id bo) "person/tag" (str "z"), Delete (Id bo) "person/score" (Lit (VDouble 1.5)) ]
+  Ev.closeEvents ev2
+  ev3 <- Ev.openEvents cfg evDir
+  events <- dumpWorld ev3
+  Ev.closeEvents ev3
+  let (dan, eve, fay) = (t2 M.! 1, t3 M.! 1, t4 M.! 1)
+      entity i rows = unwords ("entity" : show i : rows)
+  writeFile (root </> "expected.txt") $ unlines $
+    [ "# What world-0.1.0 shows.  `event` lines: the events, in order (made by --make-fixture, read back).  `entity` lines: what \"now\" must say (written by hand there)." ]
+    ++ [ "event " ++ l | l <- events ]
+    ++ [ entity ada ["person/age=i:37", "person/name=s:\"Ada\""]
+       , entity bo  ["person/friend=i:" ++ show ada, "person/name=s:\"Bo\"", "person/tag=s:\"x\",s:\"z\""]
+       , entity cy  []
+       , entity dan ["person/friend=i:" ++ show ada, "person/name=s:\"Dan\""]
+       , entity eve ["person/name=s:\"Eve\""]
+       , entity fay ["person/name=s:\"Fay\""] ]
+
+-- | Write the Create chunks of one month again as version 1 (what 0.0.1.0 wrote), and let the manifest say so.
+toVersion1 :: FilePath -> Month -> IO ()
+toVersion1 evDir month = do
+  mf <- readManifest evDir
+  chunks <- forM (mfChunks mf) $ \c ->
+    if ceKind c /= KCreate || ceMonth c /= month then pure c else do
+      let old = evDir </> "chunks" </> ceName c
+          new = old ++ ".v1"
+      evs   <- openChunkReader old >>= readChunkEvents
+      ci    <- writeChunkVersion 1 new 4 (ceKind c) (ceMonth c) evs
+      files <- hashChunkFiles new
+      removePathForcibly old
+      renameDirectory new old
+      pure (entryFromInfo (ceName c) ci [ FileEntry n b h | (n, b, h) <- files ])
+  writeManifest evDir mf { mfChunks = chunks }
+
+-- | The fixture, copied to a place of its own (opening a world writes to it).
+withFixture :: (FilePath -> IO a) -> IO a
+withFixture act = withTmp $ \tmp -> do
+  there <- doesDirectoryExist fixtureDir
+  unless there $ throwIO (userError (fixtureDir ++ " is not here: run the tests from the package directory"))
+  copyDir fixtureDir (tmp </> "w")
+  act (tmp </> "w")
+
+expectedLines :: FilePath -> IO [String]
+expectedLines dir = filter (\l -> not (null l) && take 1 l /= "#") . lines <$> readFile (dir </> "expected.txt")
+
+formatTests :: [Test]
+formatTests =
+  [ ("format: the world 0.1.0 wrote is read as it was written: every event in order, the sealed ones then the tail, the erased person gone; and it verifies", withFixture $ \dir -> do
+      expected <- expectedLines dir
+      ev <- Ev.openEvents Ev.defaultEventsConfig (dir </> "events")
+      got <- dumpWorld ev
+      checkEq "the events" [ drop 6 l | l <- expected, take 6 l == "event " ] got
+      (readable, problems) <- Ev.withEventsLock ev (Ev.verifyEvents ev)
+      checkEq "verify: no problems" (True, []) (readable, problems)
+      Ev.closeEvents ev)
+
+  , ("format: the fixture holds what it says: chunks of both versions, a cold chunk, an erase record, a tail that is not sealed", withFixture $ \dir -> do
+      let evDir = dir </> "events"
+      raw <- B.readFile (evDir </> manifestFile)
+      check "the manifest is hosi-manifest/2 (it has an erase record)" ("\"hosi-manifest/2\"" `B.isInfixOf` raw)
+      mf <- readManifest evDir
+      versions <- forM (mfChunks mf) $ \c -> do
+        bs <- B.readFile (evDir </> "chunks" </> ceName c </> chunkDataFile)
+        pure (B.take 4 (B.drop 8 bs))                                      -- the version, after the 8 bytes of magic
+      checkEq "chunk versions in the world" [B.pack [0, 0, 0, 1], B.pack [0, 0, 0, 2]] (sort (nub versions))
+      let cold = [ c | c <- mfChunks mf, ceTier c == "cold" ]
+      check "a cold chunk" (not (null cold))
+      forM_ cold $ \c -> checkEq "...has no mphf.idx" False =<< doesFileExist (evDir </> "chunks" </> ceName c </> chunkMphfFile)
+      let records = [ fe | c <- mfChunks mf, Just fe <- [ceErase c] ]
+      check "an erase record" (not (null records))
+      forM_ records $ \fe -> checkEq "...and its file is there" True =<< doesFileExist (evDir </> "erase" </> feName fe)
+      check "a tail that is not sealed" . (> 0) =<< getFileSize (evDir </> tailFile))
+
+  , ("format: a world written under a newer format is refused, and left as it was (a tail that begins with the reserved HOSI; a manifest of another format)", do
+      forM_ [("tail", newerTail), ("manifest", newerManifest)] $ \(what, mutate) -> withFixture $ \dir -> do
+        let evDir = dir </> "events"
+        mutate evDir
+        r1 <- try (Ev.openEvents Ev.defaultEventsConfig evDir)
+        check (what ++ ": refused as Corrupt, not opened and not cut") (case r1 of Left (Corrupt _) -> True; _ -> False)
+        case r1 of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+        before <- filter ((/= "lock") . fst) <$> listAll evDir
+        tailBefore <- B.readFile (evDir </> tailFile)
+        r2 <- try (Ev.openEvents Ev.defaultEventsConfig evDir)
+        check (what ++ ": and again") (case r2 of Left (Corrupt _) -> True; _ -> False)
+        case r2 of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+        checkEq (what ++ ": every file is as it was") before . filter ((/= "lock") . fst) =<< listAll evDir
+        checkEq (what ++ ": the tail is as it was") tailBefore =<< B.readFile (evDir </> tailFile))
+
+  , ("tail: a bad record with a whole one after it is damage in the middle, and is refused (Corrupt) and not cut; a bad last record cannot be told from a torn end, and is cut", withTmp $ \dir -> do
+      let ev n = E.Event n KCreate 10 "a" (VInt (fromIntegral n))
+          (b1, b2) = ([ev 1], [ev 2])
+          path = dir </> tailFile
+      tl <- openTail dir False
+      starts <- appendBatches tl [b1, b2, [ev 3]]                    -- where each of the three begins
+      closeTail tl
+      whole <- B.readFile path
+      let at2 = fromIntegral (starts !! 1) :: Int
+          at3 = fromIntegral (starts !! 2) :: Int
+          flipAt n bs = B.concat [B.take n bs, B.singleton (B.index bs n `xor` 0xff), B.drop (n + 1) bs]
+          readIt = try (readTail dir) :: IO (Either HosiError ([[E.Event]], Integer))
+          kept r = either (const Nothing) Just r
+          damaged what n from = do
+            B.writeFile path (flipAt n whole)
+            r <- readIt
+            check (what ++ ": refused as Corrupt, and it says where the bad record begins")
+              (case r of Left (Corrupt m) -> ("the record at byte " ++ show from ++ " ") `isInfixOf` m; _ -> False)
+            checkEq (what ++ ": the file is as it was") (flipAt n whole) =<< B.readFile path
+      damaged "the payload of the second of three" (at2 + 10) at2
+      damaged "the CRC of the second of three" (at2 + 4) at2
+      damaged "the length of the second of three (it says something huge)" at2 at2
+      damaged "the first of three" 10 (0 :: Int)
+      -- the last one: nothing follows it, so a flipped byte looks like a crash that left half a record
+      B.writeFile path (flipAt (at3 + 10) whole)
+      checkEq "the last of three damaged: the first two are kept, the good part ends where it begins" (Just ([b1, b2], fromIntegral at3)) . kept =<< readIt
+      B.writeFile path (B.take (B.length whole - 3) whole)
+      checkEq "the last of three torn: the same" (Just ([b1, b2], fromIntegral at3)) . kept =<< readIt
+      -- through the open: refused, nothing cut, and the lock is let go (the second try is Corrupt too, not WorldBusy)
+      B.writeFile path (flipAt (at2 + 10) whole)
+      forM_ [1, 2 :: Int] $ \_ -> do
+        r <- try (Ev.openEvents Ev.defaultEventsConfig dir)
+        check "openEvents: refused as Corrupt" (case r of Left (Corrupt _) -> True; _ -> False)
+        case r of Right ev' -> Ev.closeEvents ev'; Left _ -> pure ()
+      checkEq "...and the tail is as it was" (flipAt (at2 + 10) whole) =<< B.readFile path)
+  ]
+  where
+    -- a log of a later format: a mark that begins with HOSI, then whatever it likes
+    newerTail evDir = do
+      t <- B.readFile (evDir </> tailFile)
+      B.writeFile (evDir </> tailFile) (B.concat ["HOSITAIL", B.pack [0, 2], t])
+    -- the same manifest, said to be of format 9, and signed again so that only the format is wrong
+    newerManifest evDir = do
+      raw <- B.readFile (evDir </> manifestFile)
+      let body  = fst (BC.break (== '\n') raw)
+          body' = BC.pack (replaceOnce "hosi-manifest/2" "hosi-manifest/9" (BC.unpack body))
+      B.writeFile (evDir </> manifestFile) (B.concat [body', "\nsha256:", BC.pack (sha256Hex body'), "\n"])
+    replaceOnce from to s = case [ (a, b) | n <- [0 .. length s], let (a, b) = splitAt n s, from `isPrefixOf` b ] of
+      ((a, b) : _) -> a ++ to ++ drop (length from) b
+      []           -> error ("replaceOnce: no " ++ from)
+
+-- | The same, with a khana: Hosi opens what 0.1.0 wrote, makes the khana from the events, and answers as written;
+-- and new writes go on top of the old world.
+formatHosiTests :: KhanaBackend -> [Test]
+formatHosiTests be =
+  [ ("format: Hosi opens the world 0.1.0 wrote, says what is written for each person, takes new writes on top, and says the same after a reopen", withFixture $ \dir -> do
+      expected <- expectedLines dir
+      let people = [ (read (words l !! 1) :: HosiId, l) | l <- expected, take 7 l == "entity " ]
+          sayAll h = forM_ people $ \(i, l) -> do m <- getEntity h i; checkEq ("entity " ++ show i) l (renderEntity i m)
+      h <- openHosiWith (backendCfg be) dir schema
+      sayAll h
+      checkEq "verify: no problems" [] =<< verify h
+      gus <- person h "Gus" 30
+      _ <- seal h
+      sayAll h
+      check "the new one is there" . M.member "person/name" =<< getEntity h gus
+      closeHosi h
+      h2 <- openHosiWith (backendCfg be) dir schema
+      sayAll h2
+      m <- getEntity h2 gus
+      check "...and Gus is still there after the reopen" (M.member "person/name" m)
+      closeHosi h2)
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Fixtures
@@ -126,7 +456,8 @@ withTmp act = do
 day :: Integer -> Integer
 day n = epochMs + n * 86400000
 
-nov11, dec05 :: Integer
+oct18, nov11, dec05 :: Integer
+oct18 = day 290
 nov11 = day 314
 dec05 = day 338
 
@@ -289,6 +620,43 @@ pad6 :: Int -> String
 pad6 n = let s = show n in replicate (6 - length s) '0' ++ s
 
 -- | Tests that need no khana at all.
+-- | Folding forward, as the khana does: a Create puts a value in (and, for cardinality one, takes the old one out);
+-- a Delete takes out that very value, if it is there.  In the backfill tests "t/many" is the one attribute of
+-- cardinality many; "t/one" and "t/loose" (which the schema does not know) are cardinality one.
+forwardFacts :: [Event] -> S.Set Fact
+forwardFacts = foldl' step S.empty
+  where
+    step s e = case evKind e of
+      KCreate | a == "t/many" -> S.insert f s
+              | otherwise     -> S.insert f (S.filter (\(i', a', _) -> (i', a') /= (i, a)) s)
+      KDelete                 -> S.delete f s
+      where f@(i, a, _) = (evId e, evAttr e, evVal e)
+
+backfillSchema :: Schema
+backfillSchema = M.fromList [("t/one", attr TLong), ("t/many", many (attr TLong))]
+
+-- | The events newest first, in steps; what each step gives to put in.
+backSteps :: [[Event]] -> [[Fact]]
+backSteps = go emptyBack
+  where go _ []         = []
+        go b (st : sts) = let (fs, b') = backStep backfillSchema b st in fs : go b' sts
+
+-- | Cut a list into pieces of the given sizes (the rest is one more piece).
+splitBy :: [Int] -> [a] -> [[a]]
+splitBy _ [] = []
+splitBy [] xs = [xs]
+splitBy (n : ns) xs = let (a, b) = splitAt (max 1 n) xs in a : splitBy ns b
+
+genBackEvents :: Gen [Event]
+genBackEvents = do
+  n <- choose (0, 40)
+  forM [1 .. n] $ \s -> do
+    k <- frequency [(3, pure KCreate), (2, pure KDelete)]
+    i <- elements [10, 11, 12]
+    a <- elements ["t/one", "t/many", "t/loose"]
+    v <- VInt <$> choose (0, 2)             -- three values only, so that the same fact comes round again and again
+    pure (Event (fromIntegral (s :: Int)) k i a v)
+
 pureTests :: [Test]
 pureTests =
   [ ("sha256: known vectors", do
@@ -298,6 +666,30 @@ pureTests =
         (sha256Hex "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
       checkEq "10000 patterned bytes" "c3d5cea5e36f10537bb7aeb14e6740a973a9dd5b55c22347d465693f1ded4ced" (sha256Hex (B.pack [ fromIntegral (i * 7 `mod` 251 :: Int) | i <- [0 .. 9999] ])))
   , ("crc32: standard check value", checkEq "crc32 123456789" 0xCBF43926 (crc32 "123456789"))
+
+  , ("backfill: reading newest first, in any steps, gives what folding oldest first gives, and no fact comes twice (QuickCheck)", prop 3000 $
+      forAll genBackEvents $ \evs -> forAll (listOf (choose (1, 6))) $ \sizes ->
+        let flat = concat (backSteps (splitBy sizes (reverse evs)))
+        in conjoin [ length flat === S.size (S.fromList flat)       -- a fact is put in once, and never taken out: what a step gives is final
+                   , S.fromList flat === forwardFacts evs ])
+
+  , ("backfill: an older event does not override a newer one; a Delete holds back the older Create; one that takes out nothing does nothing", do
+      let e s k a v = Event s k 10 a (VInt v)
+          one = "t/one"
+          many' = "t/many"
+      -- an update before its Create: the update is held, the Create adds nothing for that attribute
+      checkEq "update first" [[(10, one, VInt 2)], [(10, "t/loose", VInt 7)]]
+        (backSteps [[e 3 KCreate one 2], [e 2 KCreate one 1, e 1 KCreate "t/loose" 7]])
+      -- Delete first (the newest word): the Create that comes later is settled as taken out
+      checkEq "delete first" [[], []] (backSteps [[e 2 KDelete one 1], [e 1 KCreate one 1]])
+      -- a Delete of a value that is not there: the Create still counts
+      checkEq "delete of another value" [[], [(10, one, VInt 1)]] (backSteps [[e 2 KDelete one 2], [e 1 KCreate one 1]])
+      -- a value put in again after a Delete: the newest word wins
+      checkEq "create, delete, create" [[(10, one, VInt 1)], [], []]
+        (backSteps [[e 3 KCreate one 1], [e 2 KDelete one 1], [e 1 KCreate one 1]])
+      -- cardinality many: each value goes by its own newest word
+      checkEq "many" [[(10, many', VInt 2)], [(10, many', VInt 1)]]
+        (backSteps [[e 4 KCreate many' 2, e 3 KDelete many' 3], [e 2 KCreate many' 1, e 1 KCreate many' 3]]))
 
   , ("mphf: any set of distinct keys maps onto [0,n) exactly once (QuickCheck)", prop 300 $
       forAll (resize 400 (listOf arbitrary)) $ \(ks0 :: [Word64]) ->
@@ -1390,6 +1782,23 @@ hosiTests be =
       checkEq "last seq" 2 =<< Ev.lastSeq ev2
       Ev.closeEvents ev2)
 
+  , ("one opener at a time: a second open of an open world is WorldBusy and touches nothing, khana included; the first goes on; it opens again after close", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+      h <- openHosiWith cfg dir schema
+      _ <- person h "Frege" 70
+      before <- listAll dir
+      r <- try (openHosiWith cfg dir schema) :: IO (Either HosiError Hosi)
+      check "the second open is WorldBusy" (isWorldBusy r)
+      case r of Right h2 -> closeHosi h2; Left _ -> pure ()
+      checkEq "nothing under the world was touched (events, khana)" before =<< listAll dir
+      _ <- person h "Peirce" 80                                    -- the first goes on
+      closeHosi h
+      h3 <- openHosiWith cfg dir schema                            -- closed: free again, and nothing was lost
+      rows <- query h3 "[:find ?n :where [?e :person/name ?n]]" []
+      checkEq "both people are there" 2 (length rows)
+      closeHosi h3)
+
   , ("events alone: the chunk reader cache keeps within its limit and still answers", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       -- three seals = three chunks, each with one entity
@@ -1680,6 +2089,93 @@ hosiTests be =
       b <- person h2 "Peirce" 75                                      -- and the seq number is reused cleanly
       checkEq "seqs continue" (stNextSeq s + 2) . stNextSeq =<< stats h2
       _ <- pure b
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a changed schema is noticed at open: the khana is made again under it, and the old answers do not linger", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaMany = M.insert "person/age" (many (attr TLong)) schema
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 71))]       -- cardinality one: 71 replaces 70
+      checkEq "as cardinality one" (Just [VInt 71]) =<< ageOf h a
+      closeHosi h
+      markKhana dir
+      h1 <- openHosiWith (cfgWith clock) dir schema
+      check "the same schema: the khana is kept" =<< isOldKhana dir
+      closeHosi h1
+      h2 <- openHosiWith (cfgWith clock) dir schemaMany
+      check "a different schema: the khana was made again" . not =<< isOldKhana dir
+      checkEq "as cardinality many" (Just [VInt 70, VInt 71]) . fmap sort =<< ageOf h2 a
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2
+      markKhana dir
+      h2b <- openHosiWith (cfgWith clock) dir schemaMany               -- the khana that was made says which schema it was made under
+      check "the same schema again: the khana that was made is kept" =<< isOldKhana dir
+      closeHosi h2b
+      h3 <- openHosiWith (cfgWith clock) dir schema                    -- and back again
+      checkEq "as cardinality one again" (Just [VInt 71]) =<< ageOf h3 a
+      checkEq "verify clean" [] =<< verify h3
+      closeHosi h3)
+
+  , ("a schema the sealed events cannot be folded under is refused at open; the khana and the log are as they were", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- seal h
+      s1 <- stats h
+      closeHosi h
+      markKhana dir
+      msg <- openRefused (cfgWith clock) dir schemaLong
+      check "the message says what to do" ("open it again with the schema" `isInfixOf` msg)
+      check "the old khana was not replaced" =<< isOldKhana dir
+      check "no half-made khana is left" . not =<< doesDirectoryExist (dir </> (kd ++ ".new"))
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      check "still not replaced after the old schema is back" =<< isOldKhana dir
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      s2 <- stats h2
+      checkEq "the log is as it was" (stSealedSeq s1, stTailBytes s1) (stSealedSeq s2, stTailBytes s2)
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a schema the unsealed log cannot be folded under is refused at open: nothing acknowledged is cut from the log", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong   = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+          schemaUnique = M.insert "person/age" (uniqueValue (attr TLong)) schema     -- and two people are 70
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 70
+      s1 <- stats h
+      closeHosi h
+      checkEq "both batches are in the log, none sealed" (4, 0) (stTailEvents s1, stSealedSeq s1)
+      forM_ [("a string for a number", schemaLong), ("a unique age taken twice", schemaUnique)] $ \(what, sch) -> do
+        _ <- openRefused (cfgWith clock) dir sch
+        checkEq ("the log is as it was: " ++ what) (stTailBytes s1) =<< getFileSize (dir </> "events" </> tailFile)
+      -- the khana is lost as well: nobody can tell which schema it was made with, and still nothing is cut
+      removePathForcibly (dir </> kd)
+      _ <- openRefused (cfgWith clock) dir schemaUnique
+      checkEq "the log is as it was, with the khana lost" (stTailBytes s1) =<< getFileSize (dir </> "events" </> tailFile)
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      checkEq "Peirce" (Just [VInt 70]) =<< ageOf h2 b
+      checkEq "both batches are still in the log" (stTailEvents s1) . stTailEvents =<< stats h2
+      checkEq "verify clean" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a khana that cannot be opened is made again beside the old one; if that fails the old one is not deleted", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let schemaLong = M.insert "person/name" (attr TLong) schema       -- the names are strings: a number it cannot be
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      _ <- seal h
+      closeHosi h
+      B.writeFile (dir </> kd </> "data.mdb") (BC.pack "this is not a database")
+      _ <- openRefused (cfgWith clock) dir schemaLong
+      check "the khana's directory is still there" =<< doesDirectoryExist (dir </> kd)
+      check "and so is the file in it" =<< doesFileExist (dir </> kd </> "data.mdb")
+      h2 <- openHosiWith (cfgWith clock) dir schema                    -- the right schema: made again, whole
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
       checkEq "verify clean" [] =<< verify h2
       closeHosi h2)
 
@@ -2226,10 +2722,225 @@ hosiTests be =
         checkEq "no unit is cold, however long it has been" ([] :: [(Kind, Month)], [] :: [(Kind, Month)]) (map fst (frFrozen r5), frSkipped r5)
         checkEq "no access.json" False =<< doesFileExist (dir2 </> "events" </> "access.json")
         closeHosi h3)
+
+  , ("backfill: reading newest first, a step holds only what the full khana holds, and the last holds all of it", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids@[a, _, c, _, _, f] <- backfillWorld h clk
+        full <- entitiesOf h ids
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 10) ids
+        backfillChecks (2026, 10) full stages final cov
+        -- the first step is the unsealed log: an update of an entity whose Create nobody has read is held as it is
+        let (st0, snap0) = head stages
+        checkEq "step 0 is the log, and every month still has chunks to read"
+          (Coverage (2026, 10) [] [(2026, 10), (2026, 11), (2026, 12)]) (bfCoverage st0)
+        checkEq "a is held with the update alone (its Create is not read, so no name)" (M.fromList [("person/age", [VInt 11])]) (snap0 M.! a)
+        checkEq "f was created in the log: whole" (full M.! f) (snap0 M.! f)
+        checkEq "c is not seen yet" M.empty (snap0 M.! c))
+
+  , ("backfill since a later month reads only the chunks of entities created then", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids <- backfillWorld h clk
+        full <- entitiesOf h ids
+        forM_ [((2026, 11), 13, 9), ((2026, 12), 5, 4)] $ \(since, nEv, nFacts) -> do
+          (stages, final, cov) <- backfillSteps h (dir </> ("bf-" ++ showMonth since)) since ids
+          backfillChecks since full stages final cov
+          checkEq (showMonth since ++ ": events read") nEv (bfEventsRead (fst (last stages)))
+          checkEq (showMonth since ++ ": facts held") nFacts (bfFactsHeld (fst (last stages)))
+          checkEq (showMonth since ++ ": complete months") [ m | m <- [(2026, 10), (2026, 11), (2026, 12)], m >= since ] (cvComplete cov))
+
+  , ("backfill leaves out what erase took, as the full khana does", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        ids@[_, _, _, d, _, _] <- backfillWorld h clk
+        _ <- erase h [EraseIds [d]]
+        full <- entitiesOf h ids
+        checkEq "d is gone from now" M.empty (full M.! d)
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 10) ids
+        backfillChecks (2026, 10) full stages final cov)
+
+  , ("backfill of a world that is all log: one step, and its month is complete", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        a <- person h "A" 1
+        _ <- write h [Create (Id a) "person/age" (Lit (VInt 2))]
+        (stages, final, cov) <- backfillSteps h (dir </> "bf") (2026, 11) [a]
+        checkEq "one step: the log" [(0, 1)] [ (bfIndex st, bfCount st) | (st, _) <- stages ]
+        checkEq "its month is complete at once" (Coverage (2026, 11) [(2026, 11)] []) cov
+        checkEq "and the later update is the one held" (M.fromList [(a, M.fromList [("person/age", [VInt 2]), ("person/name", [VStr "A"])])]) final)
+
+  , ("backfill refuses a directory that exists, and removes its own when a step fails", withTmp $ \dir -> do
+      (clk, clock) <- newClock oct18
+      withHosiCfg (cfgWith clock) dir $ \h -> do
+        _ <- backfillWorld h clk
+        createDirectory (dir </> "taken")
+        r <- try (backfillSince h (dir </> "taken") (2026, 10) (\_ _ -> pure ()))
+        case r of
+          Left (BadArgument _) -> pure ()
+          Left e               -> throwIO e
+          Right (k, _)         -> closeKhana k >> throwIO (userError "an existing directory should be refused")
+        r2 <- try (backfillSince h (dir </> "bf") (2026, 10) (\st _ -> when (bfIndex st == 1) (throwIO (userError "stop"))))
+        case r2 of
+          Left (_ :: SomeException) -> pure ()
+          Right (k, _)              -> closeKhana k >> throwIO (userError "the failing step should have stopped it")
+        checkEq "the half-built khana is gone" False =<< doesPathExist (dir </> "bf")
+        checkEq "the world is as it was" [] =<< verify h)
+
+  , ("two khanas are compared page by page: the differences are exact, whatever the page", withTmp $ \dir -> do
+      rt <- newKhanaRuntime be
+      let ent i = fromIntegral (1000 + 10 * i) :: HosiId
+          one i = [ (ent i, "person/name", VStr (T.pack ("n" ++ show i))), (ent i, "person/age", VInt (fromIntegral i))
+                  , (ent i, "person/score", VDouble (fromIntegral i / 4)) ]
+          full  = concatMap one [0 .. 11 :: Int] ++ [ (ent 5, "person/tag", VStr (T.pack ("t" ++ show j))) | j <- [0 .. 8 :: Int] ]
+          minus xs = filter (`notElem` xs)
+          entity i = filter (\(e, _, _) -> e == ent i)
+          pairs =
+            [ ("the same",                          full, full)
+            , ("the first entity's age is missing", full, minus [(ent 0, "person/age", VInt 0)] full)
+            , ("a score in the middle is missing",  full, minus [(ent 6, "person/score", VDouble 1.5)] full)
+            , ("the last entity's name is missing", full, minus [(ent 11, "person/name", VStr "n11")] full)
+            , ("a whole entity in the middle is missing", full, minus (entity 7 full) full)
+            , ("the big entity is missing",         full, minus (entity 5 full) full)
+            , ("an entity after the last one",      full ++ one 20, full)
+            , ("an entity before the first one",    full, full ++ [(5, "person/name", VStr "early")])
+            , ("a value changed",                   full, minus [(ent 3, "person/age", VInt 3)] full ++ [(ent 3, "person/age", VInt 99)])
+            , ("one is empty",                      full, [])
+            , ("the other is empty",                [], full)
+            ]
+      forM_ pairs $ \(what, fa, fb) -> do
+        let sa = S.fromList fa
+            sb = S.fromList fb
+            want = (S.size (sa `S.difference` sb), S.size (sb `S.difference` sa))
+        a <- openKhana rt be (dir </> "a") schema
+        b <- openKhana rt be (dir </> "b") schema
+        applyFacts 7 a fa
+        applyFacts 7 b fb
+        checkEq (what ++ ": pages of about 4") want =<< endsIn what (compareKhanas 4 a b)
+        checkEq (what ++ ": one page, the other way round") (snd want, fst want) =<< compareKhanas 1000 b a
+        closeKhana a
+        closeKhana b
+        removePathForcibly (dir </> "a")
+        removePathForcibly (dir </> "b")
+      closeKhanaRuntime rt)
+
+  , ("a page of facts never splits an entity, and the pages together are every fact", withTmp $ \dir -> do
+      rt <- newKhanaRuntime be
+      let ent i = fromIntegral (1000 + 10 * i) :: HosiId
+          one i = [ (ent i, "person/name", VStr (T.pack ("n" ++ show i))), (ent i, "person/age", VInt (fromIntegral i)) ]
+          facts = concatMap one [0 .. 9 :: Int] ++ [ (ent 4, "person/tag", VStr (T.pack ("t" ++ show j))) | j <- [0 .. 8 :: Int] ]
+      k <- openKhana rt be (dir </> "k") schema
+      applyFacts 7 k facts
+      everything <- khanaDatoms k
+      let pages lo = do (p, next) <- khanaDatomPage k lo 4
+                        rest <- maybe (pure []) (pages . Just) next
+                        pure (p : rest)
+      ps <- endsIn "walking the pages" (pages Nothing)
+      checkEq "together, every fact" (S.fromList everything) (S.fromList (concat ps))
+      checkEq "and no fact twice" (length everything) (length (concat ps))
+      let entitiesOf = map (S.fromList . map dE) ps
+      checkEq "no entity is in two pages" (S.size (S.unions entitiesOf)) (sum (map S.size entitiesOf))
+      -- a page holds 4 facts at most; when its first entity needs more, the page is asked for again at twice the size, until it fits
+      let firstEntity p = case p of (d : _) -> length (takeWhile ((== dE d) . dE) p); [] -> 0
+      check "a page stays small: 4 facts, or less than twice what its first entity needs" (all (\p -> length p <= max 4 (2 * firstEntity p - 1)) ps)
+      check "and the big entity is in a page of its own size" (any (\p -> firstEntity p == 11) ps)
+      check "there is more than one page" (length ps > 1)
+      closeKhana k
+      closeKhanaRuntime rt)
+
+  , ("verify finds a khana that differs from the events, and says by how many", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 75
+      checkEq "to begin with, nothing" [] =<< verify h
+      closeHosi h
+      -- two facts the events do not have (one of them replaces Peirce's age), as a hand in the khana would leave them
+      rt <- newKhanaRuntime be
+      k <- openKhana rt be (dir </> khanaDirName be) schema
+      applyFacts 10 k [(a, "person/tag", VStr "extra"), (b, "person/age", VInt 76)]
+      closeKhana k
+      closeKhanaRuntime rt
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      checkEq "the difference, counted" ["khana differs from a fresh fold: 2 extra, 1 missing"] =<< verify h2
+      rebuildKhana h2
+      checkEq "made again from the events, nothing" [] =<< verify h2
+      closeHosi h2)
   ]
   where
     cfgWith c = (backendCfg be) { hcClock = c }
+    -- Three months of people: October a b, November c d, December e; then December edits to a b c d (sealed);
+    -- then one more edit of a and a new f (edited once more), in the log (unsealed).
+    backfillWorld h clk = do
+      writeIORef clk oct18
+      a <- person h "A" 1
+      b <- person h "B" 2
+      _ <- write h [Create (Id a) "person/tag" (Lit (VStr "x"))]
+      writeIORef clk nov11
+      c <- person h "C" 3
+      d <- person h "D" 4
+      _ <- seal h
+      writeIORef clk dec05
+      e <- person h "E" 5
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 10))]
+      _ <- write h [Delete (Id b) "person/age" (Lit (VInt 2))]
+      _ <- write h [Create (Id c) "person/tag" (Lit (VStr "t"))]
+      _ <- write h [Create (Id c) "person/age" (Lit (VInt 30))]
+      _ <- write h [Create (Id c) "person/age" (Lit (VInt 31))]    -- twice in one chunk: only the later one is c's age
+      _ <- write h [Create (Id d) "person/name" (Lit (VStr "D2"))]
+      _ <- write h [Delete (Id a) "person/tag" (Lit (VStr "x"))]
+      _ <- seal h
+      _ <- write h [Create (Id a) "person/age" (Lit (VInt 11))]
+      f <- person h "F" 6
+      _ <- write h [Create (Id f) "person/age" (Lit (VInt 7))]       -- twice in the log: only the later one is f's age
+      pure [a, b, c, d, e, f]
+    -- What "now" holds about each of these.
+    entitiesOf h ids = M.fromList <$> mapM (\i -> (,) i <$> getEntity h i) ids
+    -- Backfill into @path@, keeping what the khana held about @ids@ after every step.
+    backfillSteps h path since ids = do
+      seen <- newIORef []
+      (k, cov) <- backfillSince h path since $ \st kh -> do
+        snap <- M.fromList <$> mapM (\i -> (,) i <$> khanaEntity kh i) ids
+        modifyIORef seen ((st, snap) :)
+      stages <- reverse <$> readIORef seen
+      final <- M.fromList <$> mapM (\i -> (,) i <$> khanaEntity k i) ids
+      closeKhana k
+      pure (stages, final, cov)
+    -- What a backfill since @since@ promises, given what the full khana holds (@full@): entities created before @since@
+    -- are not there; at every step nothing is held that the full khana does not hold, and an entity of a complete month
+    -- is whole; the steps only add; the last one holds it all and has nothing pending.
+    backfillChecks since full stages final cov = do
+      let expected = M.mapWithKey (\i m -> if idMonth i >= since then m else M.empty) full
+          n = length stages
+          covs = map (bfCoverage . fst) stages
+          grows xs = and (zipWith (<=) xs (drop 1 xs))
+          held snap = and [ v `elem` M.findWithDefault [] at (expected M.! i) | (i, es) <- M.toList snap, (at, vs) <- M.toList es, v <- vs ]
+      checkEq "the steps are numbered 0 .. n-1" [0 .. n - 1] (map (bfIndex . fst) stages)
+      checkEq "every step knows how many there are" [n] (nub (map (bfCount . fst) stages))
+      forM_ stages $ \(st, snap) -> do
+        let at = "step " ++ show (bfIndex st) ++ ": "
+        check (at ++ "nothing is held that the full khana does not hold") (held snap)
+        forM_ [ i | i <- M.keys snap, idMonth i `elem` cvComplete (bfCoverage st) ] $ \i ->
+          checkEq (at ++ "an entity of a complete month is whole") (expected M.! i) (snap M.! i)
+      check "events read only grow" (grows (map (bfEventsRead . fst) stages))
+      check "facts held only grow" (grows (map (bfFactsHeld . fst) stages))
+      check "complete months only grow" (and (zipWith (\x y -> S.fromList (cvComplete x) `S.isSubsetOf` S.fromList (cvComplete y)) covs (drop 1 covs)))
+      checkEq "the last step holds all of it" expected final
+      checkEq "the facts held at the end are the facts of those entities" (sum (length <$> concatMap M.elems (M.elems expected))) (bfFactsHeld (fst (last stages)))
+      checkEq "nothing is pending at the end" [] (cvPending cov)
+      check "so it can be queried" (cvQueryable cov)
+      checkEq "the report that comes back is the last step's" (last covs) cov
     kd = khanaDirName be
+    -- A file in the khana's directory: it is still there only if that directory was not replaced.
+    markKhana dir = writeFile (dir </> kd </> "the-old-khana") "x"
+    isOldKhana dir = doesFileExist (dir </> kd </> "the-old-khana")
+    -- Open and be refused: the message of the 'SchemaRefused'.
+    openRefused cfg dir sch = do
+      r <- try (openHosiWith cfg dir sch)
+      case r of
+        Left (SchemaRefused m) -> pure m
+        Left e               -> throwIO e
+        Right h              -> closeHosi h >> throwIO (userError "the open should have been refused")
     -- A khana that only knows Frege, while the log holds more: Peirce and Boole as two unsealed
     -- batches, and (if @bad@) a batch the khana would refuse between them and a good batch after it.
     tailCatchUp bad = withTmp $ \dir -> do
@@ -2319,10 +3030,54 @@ dtlvTests be =
 -- | Only the native `dtlv`.
 nativeTests :: FilePath -> [Test]
 nativeTests exe =
-  [ ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
+  [ ("a khana from before the schema mark was kept is trusted by nobody: it is made again once at open, and then kept", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
+          kdir = dir </> khanaDirName (KhanaDtlv exe)
+      h <- openHosiWith cfg dir schema
+      a <- person h "Frege" 70
+      closeHosi h
+      -- as if a build that kept no mark had made this khana: take the mark out, and leave a file to see whether the khana is replaced
+      d <- openDtlv (Native exe) kdir (khanaSchema schema)
+      dtlvTransact d [DRetract metaEntity schemaMarkAttr (VStr (schemaMark schema))]
+      closeDtlv d
+      writeFile (kdir </> "the-old-khana") "x"
+      h2 <- openHosiWith cfg dir schema
+      check "no mark: the khana was made again" . not =<< doesFileExist (kdir </> "the-old-khana")
+      checkEq "Frege" (Just [VInt 70]) =<< ageOf h2 a
+      closeHosi h2
+      writeFile (kdir </> "the-old-khana") "x"
+      h3 <- openHosiWith cfg dir schema
+      check "and with the mark it made, it is kept" =<< doesFileExist (kdir </> "the-old-khana")
+      checkEq "verify clean" [] =<< verify h3
+      closeHosi h3)
+
+  , ("a schema that is refused at open is not written into the old khana: it holds what it held, types and datoms", withTmp $ \dir0 -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
+          schemaLong = M.insert "person/name" (attr TLong) schema      -- the names are strings: a number it cannot be
+      -- once with the events sealed (the sealed fold refuses), once with them in the log (the log's fold refuses)
+      forM_ [True, False] $ \sealed -> do
+        let dir  = dir0 </> show sealed
+            kdir = dir </> khanaDirName (KhanaDtlv exe)
+            -- everything the khana holds (its catalog of types, and its datoms), as `dtlv dump` writes it
+            catalog = do out <- readProcess exe ["-d", kdir, "dump", "-g"] ""
+                         pure (sort (lines out))
+            what s = (if sealed then "sealed: " else "in the log: ") ++ s
+        h <- openHosiWith cfg dir schema
+        _ <- person h "Frege" 70
+        when sealed (void (seal h))
+        closeHosi h
+        before <- catalog
+        check (what "the dump has the names in it") (any (":person/name" `isInfixOf`) before)
+        r <- try (openHosiWith cfg dir schemaLong) :: IO (Either HosiError Hosi)
+        check (what "the open was refused") (either (\e -> case e of SchemaRefused _ -> True; _ -> False) (const False) r)
+        checkEq (what "the khana is as it was") before =<< catalog)
+
+  , ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       r <- try (openHosiWith ((backendCfg (KhanaDtlv "/no/such/dtlv")) { hcClock = clock }) dir schema) :: IO (Either HosiError Hosi)
-      check "a missing dtlv is a BadArgument" (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+      check "a missing dtlv is BackendMissing" (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
       checkEq "...and no database directory was made" False =<< doesDirectoryExist (dir </> "events"))
 
   , ("a batch costs one dtlv process, however many items are in it", withTmp $ \dir -> do
@@ -2359,7 +3114,7 @@ nativeTests exe =
       m0 <- calls
       h2 <- openHosiWith cfg (dir </> "db") schema
       m1 <- calls
-      checkEq "open and catch up on five batches: start, read the seq, one transaction" 3 (m1 - m0)
+      checkEq "open and catch up on five batches: look at the bookkeeping, start, one transaction" 3 (m1 - m0)
       checkEq "verify" [] =<< verify h2
       closeHosi h2)
 
@@ -2421,7 +3176,7 @@ jvmTests java jar =
   , ("a missing java, or a missing jar, is found before anything is touched", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let bad be d = do r <- try (openHosiWith ((backendCfg be) { hcClock = clock }) d schema) :: IO (Either HosiError Hosi)
-                        pure (either (\e -> case e of BadArgument _ -> True; _ -> False) (const False) r)
+                        pure (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
       checkEq "no java" True =<< bad (KhanaDatalevinJvm "/no/such/java" jar) (dir </> "a")
       checkEq "no jar" True =<< bad (KhanaDatalevinJvm java "/no/such/datalevin.jar") (dir </> "b")
       checkEq "...and nothing was made" [False, False] =<< mapM (doesDirectoryExist . (dir </>)) ["a", "b"])

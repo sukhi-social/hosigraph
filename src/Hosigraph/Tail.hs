@@ -9,12 +9,21 @@
 -- One record is one batch (one 'Hosigraph.write' call): all of it or none of it.  A crash in
 -- the middle of an append leaves a short or corrupt record at the end; 'readTail' notices
 -- (length or CRC does not fit) and reports where the good part ends, so the caller can
--- cut the file there.
+-- cut the file there.  If a whole record follows the bad one it was not a crash but damage in the
+-- middle of the log, and 'readTail' refuses ('Corrupt') instead of reporting a place to cut.
+--
+-- /The format has no header, and its first four bytes are reserved./  A file that begins with the
+-- four bytes @HOSI@ is not a log of this format: read as a length it would be 1.1 GiB (a record is a
+-- batch, and none is that big), so no record of this format starts that way.  A later format would
+-- begin with a mark that starts with these four bytes, and this code refuses such a file ('Corrupt',
+-- and it is not touched).  Without the refusal, an unreadable first record looks like a torn end, and
+-- the caller cuts the file there: the unsealed writes of a newer world would be thrown away.
 module Hosigraph.Tail
   ( TailLog, openTail, tailPath, tailSize, appendBatch, appendBatches, truncateTail, resetTail, closeTail
   , readTail, tailFile
   ) where
 
+import           Control.Exception (throwIO)
 import           Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
@@ -29,6 +38,10 @@ import           Hosigraph.Sync
 
 tailFile :: FilePath
 tailFile = "tail.log"
+
+-- | The first four bytes that a newer format may begin with (see the module header).
+reservedMark :: B.ByteString
+reservedMark = "HOSI"
 
 data TailLog = TailLog
   { tlPath   :: FilePath
@@ -109,28 +122,47 @@ resetTail tl batches = do
 
 -- | Parse a tail file: the good batches, and the byte offset where the good part ends
 -- (which is smaller than the file size if the end was torn).
+--
+-- The first record that cannot be read ends the good part, and what follows it is cut by the caller
+-- /only if nothing whole follows/.  If a whole record is found after it (at any offset), the bad
+-- record is in the middle of the log, not at its end: that is damage, not a crash, and the batches
+-- after it were written and may have been told to the caller as kept.  Then this is 'Corrupt' and
+-- the file is not touched.  (A damaged /last/ record cannot be told from a torn one, and is cut.)
 readTail :: FilePath -> IO ([[Event]], Integer)
 readTail dir = do
   let path = dir </> tailFile
   exists <- doesFileExist path
   if not exists then pure ([], 0) else do
     bs <- B.readFile path
-    pure (go bs 0 [])
+    when (reservedMark `B.isPrefixOf` bs) $
+      throwIO (Corrupt (path ++ ": starts with " ++ show reservedMark ++ ", which is not a record of this format "
+                        ++ "(a log written by a newer hosigraph?); not read, and not cut"))
+    let (batches, good) = go bs 0 []
+    case [ p | p <- [good + 1 .. B.length bs - 8], wholeAt bs p ] of
+      (p : _) -> throwIO (Corrupt (path ++ ": the record at byte " ++ show good ++ " is damaged, and a whole record follows it (at byte " ++ show p
+                                   ++ "), so this is not a torn end.  Not read, and not cut: the file is as it was.  Everything before byte " ++ show good
+                                   ++ " is fine.  To open the world anyway, keep a copy of the file and cut it at byte " ++ show good
+                                   ++ " (what follows is lost)"))
+      [] -> pure (batches, fromIntegral good)
   where
-    go bs off acc
-      | B.length bs - off < 8 = (reverse acc, fromIntegral off)
-      | otherwise =
-          let hdr = runGet ((,) <$> getU32 <*> getU32) bs off
-          in case hdr of
-               Left _ -> (reverse acc, fromIntegral off)
-               Right (len, crc) ->
-                 let len' = fromIntegral len
-                     payload = B.take len' (B.drop (off + 8) bs)
-                 in if B.length payload /= len' || crc32 payload /= crc
-                      then (reverse acc, fromIntegral off)
-                      else case runGet parseBatch payload 0 of
-                             Left _    -> (reverse acc, fromIntegral off)
-                             Right evs -> go bs (off + 8 + len') (evs : acc)
+    go bs off acc = case recordAt bs off of
+      Just (evs, end) -> go bs end (evs : acc)
+      Nothing         -> (reverse acc, off)
+    wholeAt bs p = maybe False (not . null . fst) (recordAt bs p)
+
+-- | The whole record that starts at this offset (its events, and where it ends): length and CRC fit, and the payload parses.
+recordAt :: B.ByteString -> Int -> Maybe ([Event], Int)
+recordAt bs off
+  | B.length bs - off < 8 = Nothing
+  | otherwise = case runGet ((,) <$> getU32 <*> getU32) bs off of
+      Left _ -> Nothing
+      Right (len, crc) ->
+        let len' = fromIntegral len
+            payload = B.take len' (B.drop (off + 8) bs)
+        in if B.length payload /= len' || crc32 payload /= crc
+             then Nothing
+             else either (const Nothing) (\evs -> Just (evs, off + 8 + len')) (runGet parseBatch payload 0)
+  where
     parseBatch = do
       _first <- getU64
       n <- getU32

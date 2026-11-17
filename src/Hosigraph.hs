@@ -2,7 +2,7 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- |
 -- Module      : Hosigraph
--- Description : hosigraph, Phase 1 prototype: events (tail, chunks, manifest) + khana (now: Datalevin, or an in-process engine).
+-- Description : hosigraph: an embedded database that keeps the past as events (tail, chunks, manifest) and "now" as a khana (Datalevin).
 --
 -- > import Hosigraph
 -- >
@@ -23,6 +23,26 @@
 -- > write ──► events/tail.log ──seal──► events/chunks/<name>/{chunk.hosi, mphf.idx, filter.bin}
 -- >                 │                              │          (events/manifest lists the chunks)
 -- >                 └──────────── fold ────────────┴───────► khana/  ("now", Datalog)
+--
+-- == What 0.1 promises
+--
+-- hosigraph is for /one process on one machine, on a local disk/ (a world has one opener: a second one is refused,
+-- 'WorldBusy', even if it only wants to read; a shared lock for readers is not in 0.1), and it brings Datalevin along
+-- (the @dtlv@ program, or a JVM and the standalone jar).
+--
+-- * /What it wrote, it reads./  A world that 0.1.0 wrote is read by every 0.1.x (the files, not the khana: that is derived,
+--   and is simply made again).  A test opens such a world, kept in the repository.  A format that this code does not know
+--   is refused ('Corrupt') and not touched.
+-- * /Stable/ are the names under the headings of the export list /before/ "Experimental".  Within 0.1.x they are not
+--   removed, and what they mean does not change.  New names, new fields of 'HosiConfig' and the reports, and new constructors
+--   of 'HosiError' may come (build a config with @defaultConfig { .. }@; keep a catch-all case when you match an error).
+-- * /Experimental/ (the last headings) may change, or go, in a 0.1.x; the changelog says so when it happens.
+--   They are the ones whose meaning is not settled yet: cold storage ('freeze'), how a question was answered ('historyTrace'),
+--   the numbers ('stats'), and reading the past into a khana ('backfillSince').
+-- * /Not promised/: any module other than this one, except the part of "Hosigraph.Events" that the guide lists
+--   (use the events alone, without a khana).  The others are exposed so that the tests and tools can reach them.
+-- * /Not in 0.1/: S3, live serving of a backfill, sync, metrics, JSON-LD import, thaw and compression of cold chunks,
+--   Windows, a network file system.
 module Hosigraph
   ( -- * Opening
     Hosi, HosiConfig(..), defaultConfig, openHosi, openHosiWith, closeHosi, withHosi
@@ -36,24 +56,33 @@ module Hosigraph
   , Erasure(..), EraseReport(..), erase
     -- * Letting erased things go from the disk
   , CleanOptions(..), defaultCleanOptions, CleanReport(..), clean
-  , FreezeOptions(..), defaultFreezeOptions, FreezeReport(..), freeze
     -- * Reading "now" (the khana)
   , getEntity, query, queryCells
     -- * Reading many at once (one snapshot; one round trip with Datalevin)
   , getEntities, queryMany, queryCellsMany
     -- * Reading the past (events: chunks + tail, point lookup by id)
-  , history, historyTrace, LookupTrace(..), Probe(..), probeSays
+  , history
     -- * Keeping it honest
-  , rebuildKhana, verify, Stats(..), stats
+  , rebuildKhana, verify
     -- * Ids
   , HosiId, describeId, idMonth, showMonth, Month, Clock, systemClock
     -- * Re-exported (the words of the khana)
   , Value(..), Keyword(..), Schema, Input(..), Cell(..), attr, ref, many, identity, uniqueValue, ValueType(..)
   , Event(..), Kind(..), HosiError(..)
+    -- * Experimental (may change, or go, in a 0.1.x)
+    -- ** Cold storage: a quiet month goes cold
+  , FreezeOptions(..), defaultFreezeOptions, FreezeReport(..), freeze
+    -- ** How a question about the past was answered
+  , historyTrace, LookupTrace(..), Probe(..), probeSays
+    -- ** The numbers
+  , Stats(..), stats
+    -- ** Reading the past into a khana, newest first
+  , Coverage(..), cvQueryable, BackfillStage(..), backfillSince
   ) where
 
 import           Control.Exception
 import           Control.Monad
+import           Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import           Data.IORef
@@ -63,6 +92,7 @@ import           Data.Word
 import           System.Directory
 import           System.FilePath ((</>))
 
+import           Hosigraph.Backfill
 import qualified Hosigraph.Erase as Erase
 import           Hosigraph.Event
 import           Hosigraph.Events (Events, EventsConfig(..), EventsStats(..), LookupTrace(..), Recorded(..), SealReport(..))
@@ -124,12 +154,12 @@ verifyDir h = hDir h </> ("verify-" ++ khanaDirName (hcKhanaBackend (hCfg h)))
 checkBackend :: KhanaBackend -> IO ()
 checkBackend (KhanaDtlv exe) = do
   found <- runnable exe
-  unless found $ throwIO (BadArgument ("KhanaDtlv: no executable dtlv at " ++ show exe))
+  unless found $ throwIO (BackendMissing ("KhanaDtlv: no executable dtlv at " ++ show exe))
 checkBackend (KhanaDatalevinJvm java jar) = do
   okJava <- runnable java
-  unless okJava $ throwIO (BadArgument ("KhanaDatalevinJvm: no java at " ++ show java))
+  unless okJava $ throwIO (BackendMissing ("KhanaDatalevinJvm: no java at " ++ show java))
   okJar <- doesFileExist jar
-  unless okJar $ throwIO (BadArgument ("KhanaDatalevinJvm: no Datalevin jar at " ++ show jar))
+  unless okJar $ throwIO (BackendMissing ("KhanaDatalevinJvm: no Datalevin jar at " ++ show jar))
 
 -- | A path to an executable file, or a command name found on the PATH.
 runnable :: FilePath -> IO Bool
@@ -153,43 +183,75 @@ openHosiWith :: HosiConfig -> FilePath -> Schema -> IO Hosi
 openHosiWith cfg dir schema = do
   checkBackend (hcKhanaBackend cfg)
   createDirectoryIfMissing True dir
-  rt <- newKhanaRuntime (hcKhanaBackend cfg)
-  ev <- E.openEvents (eventsConfig cfg) (dir </> "events") `onException` closeKhanaRuntime rt
+  -- the world first: an opener that comes second is refused here ('WorldBusy'), before it starts a JVM or touches a khana
+  ev <- E.openEvents (eventsConfig cfg) (dir </> "events")
+  rt <- newKhanaRuntime (hcKhanaBackend cfg) `onException` E.closeEvents ev
   (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
       ref0 <- newIORef (error "khana not opened yet")
       let h = Hosi dir cfg schema ev ref0 rt
       lastS <- E.lastSeq ev
       conn <- recoverKhana h lastS
       writeIORef ref0 conn
-      pure h) `onException` (E.closeEvents ev >> closeKhanaRuntime rt)
+      pure h) `onException` (closeKhanaRuntime rt `finally` E.closeEvents ev)
 
 closeHosi :: Hosi -> IO ()
-closeHosi h = do
-  E.closeEvents (hEvents h)
-  readIORef (hKhana h) >>= closeKhana
-  closeKhanaRuntime (hRuntime h)
+closeHosi h =
+  -- the khana and its runtime first, the events last: closing them lets go of the world, and nobody may open it on top of a khana that is still open
+  (readIORef (hKhana h) >>= closeKhana) `finally` closeKhanaRuntime (hRuntime h) `finally` E.closeEvents (hEvents h)
 
 withHosi :: FilePath -> Schema -> (Hosi -> IO a) -> IO a
 withHosi dir schema = bracket (openHosi dir schema) closeHosi
 
 -- | Get a khana that agrees with the events.
+--
+-- A khana that is healthy, was folded under this very schema (it keeps a mark of it, see 'schemaMark') and is
+-- only behind, catches up in place.  Every other khana is made again from the events, /beside/ the old one, and takes
+-- its place only when it is whole (so a schema that cannot be applied leaves the old khana and the log as they were).
 recoverKhana :: Hosi -> Word64 -> IO Khana
 recoverKhana h lastS = do
-  r <- try (openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h))
+  -- Look at the old khana first, with only its own bookkeeping declared (see 'peekKhana'): the schema may still be refused.
+  r <- try (peekKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h))
   case r of
-    Left (_ :: SomeException) -> rebuildFresh
-    Right conn -> do
-      (fs, gen) <- foldedState conn
+    Left (_ :: SomeException) -> rebuildBeside False      -- it cannot be opened: which schema it was made under is not known
+    Right (fs, gen, mark) -> do
       mgen <- E.eraseGeneration ev
-      if fs > lastS || gen /= mgen
-        then closeKhana conn >> rebuildFresh              -- the khana saw a write the events never kept, or has not followed an erase (or is ahead of one)
-        else catchUp conn fs >> pure conn
+      let same = mark == Just (schemaMark (hSchema h))
+          mustRebuild =
+               fs > lastS || gen /= mgen    -- the khana saw a write the events never kept, or has not followed an erase (or is ahead of one)
+            || fs == 0 && lastS > 0         -- it holds nothing, and there are events (it was lost)
+            || fs > 0 && not same           -- it was made under another schema, or from before the mark was kept
+      if mustRebuild
+        then rebuildBeside same
+        else do
+          conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+          unless same (setSchemaMark conn (hSchema h))   -- only an empty khana with no events behind it gets here unmarked
+          catchUp conn fs
+          pure conn
   where
     ev = hEvents h
-    rebuildFresh = do
-      removePathForcibly (khanaDir h)
-      (conn, _) <- buildKhana h (khanaDir h)
-      pure conn
+    -- Fold a new khana from the events beside the old one, and put it in the old one's place when it is whole.
+    -- @same@: the old khana says it was made under this very schema.  Then a logged batch the new khana refuses is one
+    -- nobody was told was written (a crash between the log and the fold), and it is cut.  Otherwise the /schema/ may be what
+    -- refuses it, and a batch that was acknowledged is not ours to cut: the open stops, and nothing is touched.
+    rebuildBeside same = do
+      let fresh = freshDir h
+      removePathForcibly fresh
+      (conn, refused) <- buildKhana h fresh `catch` \(ex :: SomeException) -> do
+        removePathForcibly fresh
+        case fromException ex of
+          Just (Corrupt m) | not same, foldRefused `isPrefixOf` m -> throwIO (SchemaRefused (schemaRefused m))
+          _                                                       -> throwIO ex
+      closeKhana conn
+      unless (null refused) $
+        if same
+          then do batches <- E.tailBatches ev
+                  E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
+          else do removePathForcibly fresh
+                  throwIO (SchemaRefused (schemaRefused (show (length refused) ++ " logged batch(es) that the khana refuses (none was cut)")))
+      placeFreshKhana h fresh
+      openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+    schemaRefused why = "the schema cannot be applied to this world: " ++ why
+      ++ ".  The khana and the log were left as they were; open it again with the schema the khana was made with"
     catchUp conn fs = do
       top <- newIORef fs
       E.eventsAfterEach ev fs (foldGroup top conn)
@@ -232,14 +294,15 @@ buildKhana :: Hosi -> FilePath -> IO (Khana, [[Event]])
 buildKhana h target = do
   let ev = hEvents h
   conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) target (hSchema h)
-  top <- newIORef 0
-  E.eventsAfterEach ev 0 (foldGroup top conn)
-  mgen <- E.eraseGeneration ev                         -- the events left the erased ids out, so this khana is up to date with them
-  when (mgen > 0) (setEraseGen conn mgen)
-  batches <- E.tailBatches ev
-  top' <- readIORef top
-  refused <- foldTail conn top' batches
-  pure (conn, refused)
+  (do top <- newIORef 0
+      E.eventsAfterEach ev 0 (foldGroup top conn)
+      mgen <- E.eraseGeneration ev                     -- the events left the erased ids out, so this khana is up to date with them
+      when (mgen > 0) (setEraseGen conn mgen)
+      batches <- E.tailBatches ev
+      top' <- readIORef top
+      refused <- foldTail conn top' batches
+      setSchemaMark conn (hSchema h)                   -- whole: say which schema it was folded under
+      pure (conn, refused)) `onException` closeKhana conn
 
 -- ---------------------------------------------------------------------------
 -- Writing
@@ -600,12 +663,14 @@ rebuildKhanaLocked h = do
   removePathForcibly fresh
   (newConn, refused) <- buildKhana h fresh
   closeKhana newConn
-  installFreshKhana h fresh
-  unless (null refused) $ do
-    -- same rule as at open: a logged batch the khana refuses is not part of the world
-    batches <- E.tailBatches ev
-    E.resetTailTo ev [ b | b <- batches, b `notElem` refused ]
-  where ev = hEvents h
+  if null refused
+    then installFreshKhana h fresh
+    else do
+      -- The schema is the one this khana has been folded under since open, so a batch it takes now is one it took
+      -- when it was written.  If it refuses one anyway, something is wrong, and an acknowledged write is not ours to cut.
+      removePathForcibly fresh
+      throwIO (Corrupt ("the khana refuses " ++ show (length refused) ++ " logged batch(es) that were acknowledged; "
+                        ++ "the log was not cut and the khana is as it was"))
 
 -- | Make the khana a compacted copy of itself, stamped as clean at erase number @gen@.  For a caller that holds the events
 -- lock (so nothing is written to the khana meanwhile).  The copy is made in the 'freshDir', opened to be stamped and to be
@@ -631,11 +696,74 @@ installFreshKhana :: Hosi -> FilePath -> IO ()
 installFreshKhana h fresh = do
   old <- readIORef (hKhana h)
   closeKhana old
+  placeFreshKhana h fresh
+  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
+  writeIORef (hKhana h) conn
+
+-- | Move the khana built in @fresh@ to the live place, over whatever is there.  Nothing may have the old one open.  (A crash
+-- between the removal and the move leaves no khana, and the next open makes one from the events.)
+placeFreshKhana :: Hosi -> FilePath -> IO ()
+placeFreshKhana h fresh = do
   removePathForcibly (khanaDir h)
   renameDirectory fresh (khanaDir h)
   syncDir (hDir h)
-  conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) (khanaDir h) (hSchema h)
-  writeIORef (hKhana h) conn
+
+-- ---------------------------------------------------------------------------
+-- Backfill: read the events newest first, up to a month
+
+-- | What a backfill can say at one step.  A chunk is made for one /creation/ month, and the updates and deletes of an
+-- entity go to the chunks of the month it was created in.  So when every chunk of a month has been read, every entity
+-- created in that month is whole, and a question about those entities is answered as the finished khana would.
+data Coverage = Coverage
+  { cvSince    :: Month
+  , cvComplete :: [Month]   -- ^ months with every chunk read (and the log): their entities are whole
+  , cvPending  :: [Month]   -- ^ months with chunks still unread: an entity there may be missing, or be held with only its newer facts
+  } deriving (Eq, Show)
+
+-- | Nothing is pending: every entity created since 'cvSince' is whole, and the khana answers about them as a full one would
+-- (a reference to an entity created before 'cvSince' points at nothing).
+cvQueryable :: Coverage -> Bool
+cvQueryable = null . cvPending
+
+-- | One step of 'backfillSince', as the callback sees it.
+data BackfillStage = BackfillStage
+  { bfIndex      :: Int        -- ^ from 0: the unsealed log comes first, then the sealed events from the newest to the oldest
+  , bfCount      :: Int        -- ^ how many steps there are
+  , bfEventsRead :: Int        -- ^ events read so far
+  , bfFactsHeld  :: Int        -- ^ facts in the khana (an update whose Create is not read yet is one of them)
+  , bfCoverage   :: Coverage
+  } deriving Show
+
+-- | Read the events newest first, only those of entities created in @since@ or after, into a new khana in @dir@
+-- (which must not exist), and tell after every step what can be asked.  The callback gets the khana as it is then
+-- (read it with 'khanaEntity' or 'khanaQuery' from "Hosigraph.Khana"): an update whose Create has not been read is
+-- held as it is, so the entity shows with the facts known so far.  When the last step is done, the khana holds what
+-- a full one holds for those entities (a test checks this, for any step sizes).  The open khana and the last
+-- 'Coverage' are returned; the caller closes it.
+--
+-- This khana is on its own: it is not the one 'getEntity' reads, and it carries neither the folded seq nor the schema
+-- mark, so an open never takes it for a whole one.  The events lock is held for the whole reading, so the callback must
+-- not write to this 'Hosi', and writes wait.  If anything fails, the khana is closed and @dir@ is removed.
+backfillSince :: Hosi -> FilePath -> Month -> (BackfillStage -> Khana -> IO ()) -> IO (Khana, Coverage)
+backfillSince h dir since each = do
+  exists <- doesPathExist dir
+  when (exists || dir `elem` [khanaDir h, freshDir h]) $
+    throwIO (BadArgument "backfillSince: give it a directory that does not exist yet (a backfilled khana is not the live one)")
+  E.withEventsLock (hEvents h) $ do
+    conn <- openKhana (hRuntime h) (hcKhanaBackend (hCfg h)) dir (hSchema h)
+    (do st <- newIORef (emptyBack, 0 :: Int, 0 :: Int, Coverage since [] [])
+        E.eventsBackEach (hEvents h) since $ \bs -> do
+          (b, nEv, nFacts, _) <- readIORef st
+          let (facts, b') = backStep (hSchema h) b (E.bsEvents bs)
+              cov = Coverage since [ m | (m, 0) <- M.toAscList (E.bsLeft bs) ] [ m | (m, n) <- M.toAscList (E.bsLeft bs), n > 0 ]
+              nEv' = nEv + length (E.bsEvents bs)
+              nFacts' = nFacts + length facts
+          applyFacts 2000 conn facts
+          writeIORef st (b', nEv', nFacts', cov)
+          each (BackfillStage (E.bsIndex bs) (E.bsCount bs) nEv' nFacts' cov) conn
+        (_, _, _, cov) <- readIORef st
+        pure (conn, cov))
+      `onException` (closeKhana conn >> removePathForcibly dir)
 
 -- | Check everything checkable: the manifest's signature, every chunk file's hash and
 -- footer, every MPHF (each id finds exactly its own events), and that the live khana
@@ -653,12 +781,16 @@ verify h = E.withEventsLock (hEvents h) $ do
         Left (e :: SomeException) -> removePathForcibly fresh >> pure ["khana: cannot rebuild: " ++ show e]
         Right (c2, _) -> do
           live <- readIORef (hKhana h)
-          a <- S.fromList <$> khanaDatoms live
-          b <- S.fromList <$> khanaDatoms c2
+          -- page by page: what is held is a page of each khana, not the khanas (527,971 facts took 4.3GB held whole)
+          r2 <- try (compareKhanas verifyPage live c2)
           closeKhana c2
           removePathForcibly fresh
-          pure [ "khana differs from a fresh fold: " ++ show (S.size (a `S.difference` b)) ++ " extra, "
-                   ++ show (S.size (b `S.difference` a)) ++ " missing" | a /= b ]
+          case r2 of
+            Left (e :: SomeException) -> pure ["khana: cannot compare: " ++ show e]
+            Right (extra, missing) ->
+              pure [ "khana differs from a fresh fold: " ++ show extra ++ " extra, " ++ show missing ++ " missing" | extra + missing > 0 ]
+    -- facts per page.  Real data, 527,971 facts, dtlv: 10,000 -> hosigraph 157MB, 65 s; a page of 50,000 held 605MB.  The smaller one: this is rare work, and a box may be small.
+    verifyPage = 10000 :: Int
 
 data Stats = Stats
   { stGeneration  :: Int

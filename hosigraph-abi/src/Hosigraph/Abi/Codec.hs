@@ -247,6 +247,9 @@ errorKind e = case e of
   WriteRejected m -> ("write-rejected", m)
   Corrupt m       -> ("corrupt", m)
   BadArgument m   -> ("bad-argument", m)
+  WorldBusy m     -> ("world-busy", m)
+  BackendMissing m -> ("backend-missing", m)
+  SchemaRefused m -> ("schema-refused", m)
 
 -- | @{:events [...] :trace {...}}@
 encTrace :: ([Event], LookupTrace) -> Edn

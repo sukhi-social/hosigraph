@@ -40,7 +40,7 @@ module Hosigraph.Events
     -- * Finding them again
   , history, historyTrace, historyTraceAfter, LookupTrace(..), Probe(..)
     -- * For whoever folds the events into "now"
-  , lastSeq, eventsAfter, eventsAfterEach, tailBatches, resetTailTo
+  , lastSeq, eventsAfter, eventsAfterEach, BackStage(..), eventsBackEach, tailBatches, resetTailTo
     -- * Checking
   , verifyEvents, EventsStats(..), eventsStats
   ) where
@@ -56,6 +56,7 @@ import           Data.IORef
 import           Data.List (nub, partition, sortOn)
 import qualified Data.Map.Strict as M
 import           Data.Maybe (catMaybes, isJust)
+import           Data.Ord (Down(..))
 import qualified Data.Set as S
 import           Data.Word
 import           System.Directory
@@ -71,6 +72,7 @@ import           Hosigraph.Sha256 (sha256Hex)
 import           Takka.Types (Keyword, Value(..))
 import           Hosigraph.Sync
 import           Hosigraph.Tail
+import           Hosigraph.WorldLock
 
 -- ---------------------------------------------------------------------------
 -- Configuration and state
@@ -154,6 +156,7 @@ data Events = Events
   , xErased   :: IORef Erased                  -- ^ the erase records of the world in 'xManifest', loaded (whoever swaps one swaps the other, under the lock)
   , xRewrite  :: MVar ()                       -- ^ one 'rewriteErased' (or 'freezeUnit') at a time (it works outside 'xLock', and two would write the same scratch directory)
   , xStamps   :: IORef (M.Map (Kind, Month) Stamp)   -- ^ when each unit was last read and written; empty, and never touched, unless 'ecColdAfterMs' is set
+  , xWorldLock :: WorldLock                    -- ^ held from the open to 'closeEvents': nobody else may open this directory meanwhile
   }
 
 chunksDir :: Events -> FilePath
@@ -208,6 +211,19 @@ lastReservedId = 1
 openEvents :: EventsConfig -> FilePath -> IO Events
 openEvents cfg dir = do
   createDirectoryIfMissing True (dir </> "chunks")
+  held <- tryWorldLock (dir </> lockFile) >>= maybe (throwIO (WorldBusy (busyMessage dir))) pure
+  openHeld held cfg dir `onException` releaseWorldLock held
+
+-- | The lock file of a world: one opener at a time ("Hosigraph.WorldLock").
+lockFile :: FilePath
+lockFile = "lock"
+
+busyMessage :: FilePath -> String
+busyMessage dir = "the world at " ++ show dir ++ " is open already, in this process or in another; close that one first.  Nothing was touched"
+
+-- | 'openEvents' once the world is ours.
+openHeld :: WorldLock -> EventsConfig -> FilePath -> IO Events
+openHeld held cfg dir = do
   mf <- readManifest dir
   sweepOrphans dir mf
   erased <- loadErased dir mf                                  -- before anything is opened: a refusal leaves nothing behind
@@ -225,10 +241,12 @@ openEvents cfg dir = do
   stamps <- loadStamps cfg dir mf
   Events dir cfg <$> newMVar () <*> newIORef mf <*> pure tl <*> newIORef (fromBatches now batches)
                 <*> newIORef (lastS + 1) <*> pure gen <*> newIORef emptyReaderCache <*> newIORef M.empty
-                <*> newIORef erased <*> newMVar () <*> newIORef stamps
+                <*> newIORef erased <*> newMVar () <*> newIORef stamps <*> pure held
 
+-- | Close, and let go of the world: it is the last thing a closer does (a khana that is still open, and that
+-- the caller closes, must be closed before this, or another opener could start on top of it).
 closeEvents :: Events -> IO ()
-closeEvents k = flushAccess k >> closeTail (xTail k)
+closeEvents k = (flushAccess k >> closeTail (xTail k)) `finally` releaseWorldLock (xWorldLock k)
 
 withEventsLock :: Events -> IO a -> IO a
 withEventsLock k act = withMVar (xLock k) (const act)
@@ -891,20 +909,61 @@ eventsAfterEach :: Events -> Word64 -> ([Event] -> IO ()) -> IO ()
 eventsAfterEach k after each = do
   mf <- readIORef (xManifest k)
   erased <- readIORef (xErased k)
-  let live = sortOn ceMinSeq [ c | c <- mfChunks mf, ceMaxSeq c > after ]
-      groups = map reverse (reverse (foldl step [] live))
-      step [] c = [[c]]
-      step (g : gs) c
-        | ceMinSeq c <= maximum (map ceMaxSeq g) = (c : g) : gs
-        | otherwise                              = [c] : g : gs
-  forM_ groups $ \g -> do
-    evs <- forM g $ \c -> do
-      cr <- readerFor k c
-      let goneHere = case M.lookup (ceName c) (erByChunk erased) of
-            Nothing -> const False
-            Just s  -> (`Erase.member` s)
-      filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr
-    each (sortOn evSeq (concat evs))
+  forM_ (seqGroups after (mfChunks mf)) $ \g -> readGroup k erased after g >>= each
+
+-- | The chunks that hold an event above @after@, in groups (see 'eventsAfterEach'), the oldest group first.
+seqGroups :: Word64 -> [ChunkEntry] -> [[ChunkEntry]]
+seqGroups after cs = map reverse (reverse (foldl step [] live))
+  where
+    live = sortOn ceMinSeq [ c | c <- cs, ceMaxSeq c > after ]
+    step [] c = [[c]]
+    step (g : gs) c
+      | ceMinSeq c <= maximum (map ceMaxSeq g) = (c : g) : gs
+      | otherwise                              = [c] : g : gs
+
+-- | The events of one group above @after@, sorted by seq, without the erased ones.
+readGroup :: Events -> Erased -> Word64 -> [ChunkEntry] -> IO [Event]
+readGroup k erased after g = do
+  evs <- forM g $ \c -> do
+    cr <- readerFor k c
+    let goneHere = case M.lookup (ceName c) (erByChunk erased) of
+          Nothing -> const False
+          Just s  -> (`Erase.member` s)
+    filter (\e -> evSeq e > after && not (goneHere (evId e))) <$> readChunkEvents cr
+  pure (sortOn evSeq (concat evs))
+
+-- | One step of 'eventsBackEach'.
+data BackStage = BackStage
+  { bsIndex  :: Int              -- ^ which step this is, from 0 (the tail)
+  , bsCount  :: Int              -- ^ how many steps there are in all
+  , bsEvents :: [Event]          -- ^ newest first (descending seq); older than every event of the steps before
+  , bsLeft   :: M.Map Month Int  -- ^ for each month the reading looks at: how many of its chunks are still unread
+                                 --   (0: all of it has been read, and so every entity created in that month is whole)
+  }
+
+-- | Read the events newest first, up to a month, one step at a time: the unsealed tail first (one step), then the
+-- sealed groups of 'eventsAfterEach' from the newest to the oldest.  Only the events of entities created in
+-- @since@ or after are read: a chunk is made for one creation month, so the chunks of earlier months are never
+-- opened.  The erased ids are left out, as in 'eventsAfterEach'.  The same rules for the lock: hold it for the
+-- whole reading (a chunk that goes away halfway would be a 'Corrupt').
+eventsBackEach :: Events -> Month -> (BackStage -> IO ()) -> IO ()
+eventsBackEach k since each = do
+  mf <- readIORef (xManifest k)
+  erased <- readIORef (xErased k)
+  batches <- tailBatches k
+  let inScope = [ c | c <- mfChunks mf, ceMonth c >= since ]
+      tailEvs = sortOn (Down . evSeq) [ e | b <- batches, e <- b, idMonth (evId e) >= since ]
+      left0   = M.unionWith (+) (M.fromListWith (+) [ (ceMonth c, 1) | c <- inScope ])
+                                (M.fromListWith (+) [ (idMonth (evId e), 0) | e <- tailEvs ])
+      groups  = reverse (seqGroups 0 inScope)
+      total   = 1 + length groups
+  each (BackStage 0 total tailEvs left0)
+  foldM_ (\left (n, g) -> do
+            evs <- readGroup k erased 0 g
+            let left' = foldl (\m c -> M.adjust (subtract 1) (ceMonth c) m) left g
+            each (BackStage n total (reverse evs) left')
+            pure left')
+         left0 (zip [1 ..] groups)
 
 -- | The unsealed batches, oldest first.  One batch = one 'record' = all or nothing.
 tailBatches :: Events -> IO [[Event]]
@@ -1005,5 +1064,8 @@ checkChunk k c = do
             other -> [tag ("MPHF lookup of " ++ show i ++ " failed: " ++ show other)]
         -- the filter may be wrong about strangers, never about an id that is there
         let filterProblems = [ tag ("the filter says no to " ++ show i ++ ", which is in the chunk") | i <- M.keys byId, not (filterMayHave filt i) ]
-        pure (hashProblem ++ footerProblems ++ mphfProblems ++ filterProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ])
+        let problems = hashProblem ++ footerProblems ++ mphfProblems ++ filterProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ]
+        -- looked at now, not later: a list left as a thunk holds this chunk's events until the end (about 900MB on real data)
+        _ <- evaluate (sum (map length problems))
+        pure problems
     pure $ either (\(e :: SomeException) -> [tag ("unreadable: " ++ show e)]) id r
