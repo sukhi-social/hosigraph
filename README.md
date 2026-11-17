@@ -100,6 +100,7 @@ Tested with GHC 9.10.3 on macOS arm64.
 - [x] Phase 1: events, chunks, the khana, restart-safe
 - [x] Phase 2, first half: the filter, and reading a chunk by ranges
 - [x] A C interface, `libhosi`, written by [setu](docs/guide.md#from-other-languages-setu-hosigraph-abi) (seen working on macOS only)
+- [x] `hosigraph stdio`: the same operations over stdin and stdout, one line each, EDN or (`--json`) JSON ([guide](docs/guide.md#hosigraph-stdio))
 - [x] Phase 3, the local part: `erase` (ids, a span of ids or time, or what an account owns), `clean`, `freeze` (cold chunks), also through the C door
 - [x] 0.2: an order and a cut (`:order-by`, `:limit`), pairs (`tuple`), words (`fulltext`), and the newest *n* (`highest`, `highestIn`), also through the C door and in Elixir
 - [ ] S3 ([plan](TODO.md), for 0.3)

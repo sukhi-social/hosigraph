@@ -32,15 +32,29 @@ library
     Hosigraph.Abi.Codec
     Hosigraph.Abi.Files
     Hosigraph.Abi.Handlers
+    Hosigraph.Abi.Json
     Hosigraph.Abi.Library
+    Hosigraph.Abi.Stdio
   build-depends:
       base        >=4.20 && <5
+    , aeson       >=2.0  && <2.3
+    , bytestring  >=0.10 && <0.13
+    , scientific  >=0.3  && <0.4
+    , vector      >=0.12 && <0.14
     , hosigraph
     , setu
     , takka
     , containers  >=0.6  && <0.8
     , text        >=1.2  && <2.2
     , time        >=1.9  && <1.14
+
+-- hosigraph: the door for a process that talks over a pipe (hosigraph stdio).
+executable hosigraph
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:    base, hosigraph-abi, bytestring, text
+  ghc-options:      -threaded -rtsopts
 
 -- Writes gen/ (--out) or checks that it is as it should be (--check).
 executable hosigraph-abi-gen

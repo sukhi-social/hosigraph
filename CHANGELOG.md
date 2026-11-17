@@ -15,6 +15,7 @@
   not the number of notes those keys have. Also an operation of the C door (`highest-in`) and `Hosi.highest_in` in Elixir. What it costs, measured, and what it does not do: [the guide](docs/guide.md#highestin-the-newest-n-of-some-keys).
 * **`highest` and `highestIn` are experimental** in 0.2 (under that heading in `Hosigraph`): what they answer now is not meant to change, but their form may, in a 0.2.x, when an order that is not a long or the other direction is added.
 * **A tuple crosses the C door:** a vector, with `nil` for a missing part. It is read, and asked for in an input or a condition; it is never written.
+* **`hosigraph stdio`**: the operations of the C door over stdin and stdout, one line each, EDN or (`--json`) JSON; `--ids-as-strings` writes integers past 2^53 as strings. `{"type":"double","value":1}` says the type of a value. An executable of `hosigraph-abi`: [the guide](docs/guide.md#hosigraph-stdio).
 * The query parser reads a function's binding in every form (`[(f ?x) [?a ?b]]`, `[?x ...]`, `[[?e ?a ?v]]`), `$` and an option map as arguments, and a vector of values as a tuple.
 
 ### Changed (visible to a host)

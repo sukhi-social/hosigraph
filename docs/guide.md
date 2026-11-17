@@ -799,6 +799,48 @@ through a callback, with a status (`HOSI_OK`, `HOSI_ERR_APP`, ...) and a body. B
 `open` takes EDN too (`{:dir ".." :schema {..} :config {..}}`) and returns a handle at once; the database starts on a thread of its own, and a failure to start
 is the answer of every request. A callback never runs on the thread that called `submit`, `cancel` or `close`, and `close` returns after all callbacks have returned.
 
+### `hosigraph stdio`
+
+The same operations for a process that talks over a pipe. `hosigraph stdio [--json] [OPEN]` reads requests on stdin and answers on stdout, **one EDN line each**,
+the same bodies as the C door (`{:op :write :args {...}}` in, `{:ok ...}` or `{:error :kind :message "..."}` out). `OPEN` is what `open` takes
+(`'{:dir ".." :schema {..} :config {..}}'`), or `@FILE` to read it from a file; without it nothing is opened and only `:ping` and `:abi` answer.
+
+* Answers come one at a time, in the order of the requests (use `write-many`, `query-many` to ask for several at once). A blank line is skipped, `\r\n` is a line end.
+* A request that is not the contract is answered with an `{:error ...}` line and the process goes on. End of input closes the database and exits 0.
+* If it cannot open, the one line of stdout is that error, stderr says it in words, and the exit code is 1. stdout holds answers and nothing else.
+* The database can take a while to open (a big one needs its khana read first); the first answer comes after that.
+
+```bash
+cabal build hosigraph-abi:exe:hosigraph
+printf '{:op :abi}\n' | $(cabal list-bin hosigraph-abi:exe:hosigraph) stdio
+```
+
+**JSON.** `hosigraph stdio --json [--ids-as-strings] [OPEN]` speaks the same contract with JSON lines, for a client that has no EDN reader. It is
+a way of writing the same requests and answers at the door; nothing else changes. The shape of each operation (`Hosigraph.Abi.Api`) decides how a line is read:
+
+```
+{"op":"write","args":{"ops":[["create",["tmp",1],"person/name","Frege"],["create",["tmp",1],"person/score",3]]}}
+{"ok":{"temps":[[1,58047583928451072]],"first-seq":1,"last-seq":2,"sealed":false}}
+{"error":"conflict","message":"..."}
+```
+
+* An object is a map, an array is a vector, a tagged vector starts with its tag (`["create", ...]`, `["tmp", 1]`, `["ref", ...]`).
+  A key and a keyword the shape asks for are bare strings (`"person/name"`, `"create"`).
+* Where a *value* may be a string or a keyword, a string that starts with `:` is the keyword (`":active"`), and a string that starts with `:` by itself
+  is written with one more (`"::x"` is the string `":x"`). Answers are written the same way.
+* **1 and 1.0.** If `open` named the attribute, its schema type decides: `:double` makes `3` a double, `:long` and `:ref` accept a string of digits.
+  For an attribute the schema does not name, a number written with a fraction or an exponent is a double and a whole number is an integer.
+  An answer always writes a double with a fraction (`3.0`).
+* **Saying the type yourself.** `{"type":"double","value":1}` is the double 1.0, whatever the schema says and whatever the language can write. The types are the
+  names `open` uses: `double`, `long` (a number or a string of digits), `string` (so `":x"` needs no escape) and `keyword`. It is read wherever a value or a number
+  may stand, and not where an object is a map of its own, so a map with a `"type"` and a `"value"` key is still a map there. What you wrote is not changed by the schema:
+  a `long` given to a `:double` attribute is a `long`, and hosigraph's own check says so.
+* **Big ids.** An integer is a number. JavaScript rounds a number past 2^53, and ids are past it (an id holds its creation time), so `--ids-as-strings` writes every
+  integer past ±2^53 in an answer as a string of digits. A request may always give an integer as a string of digits where an integer is asked for
+  (`{"ids":["58047583928451072"]}`), and for a `:long` or `:ref` attribute. The one thing it cannot tell: an integer past 2^53 in an attribute of type `:any`
+  comes back as a string, like a string of digits that was written there; give such an attribute a type.
+* The text of a query (`:q`) is still Datalog, a string.
+
 ```bash
 cabal run hosigraph-abi-gen -- --out   hosigraph-abi/gen    # write the generated files
 cabal run hosigraph-abi-gen -- --check hosigraph-abi/gen    # fail if they are out of date
