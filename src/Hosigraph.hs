@@ -781,12 +781,16 @@ verify h = E.withEventsLock (hEvents h) $ do
         Left (e :: SomeException) -> removePathForcibly fresh >> pure ["khana: cannot rebuild: " ++ show e]
         Right (c2, _) -> do
           live <- readIORef (hKhana h)
-          a <- S.fromList <$> khanaDatoms live
-          b <- S.fromList <$> khanaDatoms c2
+          -- page by page: what is held is a page of each khana, not the khanas (527,971 facts took 4.3GB held whole)
+          r2 <- try (compareKhanas verifyPage live c2)
           closeKhana c2
           removePathForcibly fresh
-          pure [ "khana differs from a fresh fold: " ++ show (S.size (a `S.difference` b)) ++ " extra, "
-                   ++ show (S.size (b `S.difference` a)) ++ " missing" | a /= b ]
+          case r2 of
+            Left (e :: SomeException) -> pure ["khana: cannot compare: " ++ show e]
+            Right (extra, missing) ->
+              pure [ "khana differs from a fresh fold: " ++ show extra ++ " extra, " ++ show missing ++ " missing" | extra + missing > 0 ]
+    -- facts per page.  Real data, 527,971 facts, dtlv: 10,000 -> hosigraph 157MB, 65 s; a page of 50,000 held 605MB.  The smaller one: this is rare work, and a box may be small.
+    verifyPage = 10000 :: Int
 
 data Stats = Stats
   { stGeneration  :: Int

@@ -61,7 +61,8 @@ It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar)
    * *Calls* (replaces the old table, whose machine was not written down): `write` 1.05 ms (JVM) / 24 ms (dtlv); `writeMany` 0.06 / 0.14 ms for each item; `getEntity` 0.66 / 24 ms; `getEntities` of 200: 2.7 / 26 ms; 6 queries 2.0 → 1.0 / 160 → 30 ms.
      The old table's "the same items in one batch" row is gone: the new row is `writeMany` of separate batches (what a caller does).
    * *A world* (made up: 100,000 events): written in 3.1 / 2.6 s; open 1.5 / 0.1 s (1.4 s of the JVM's is the JVM starting); made again 2.8 / 2.3 s; the JVM's memory 260 MB after an open, 400 MB at most; dtlv 89 MB at most; hosigraph about 50 MB; events 1.4 MB, khana 8 to 22 MB.
-   * *The worst open* is the real data's: 527,971 events (a copy of a real server): about **70 s** with dtlv (0.13 ms for each event; 0.02 ms for the made-up one). Plan it as events × 0.15 ms. With the JVM, on real data: **not measured**.
+   * *The worst open* is the real data's: 527,971 events (a copy of a real server). The khana made again: dtlv **34 s** on the internal disk (71 to 111 s on an external SSD, on 2026-11-16; 0.13 ms for each event, 0.02 ms for the made-up one), the JVM **7 s** (an open that does it: 10 s). Plan it as events × 0.15 ms (dtlv) and events × 0.02 ms (JVM).
+   * *`verify`* on the same data: dtlv **65 s**, 165 MB for the largest process; the JVM **22 s**, and it passes with a 256 MB heap (2026-11-17). Before it was held whole: 4.3 GB (dtlv).
    * *Found while measuring:* the first run of the six queries was 41 ms in the JVM (the second 2 ms): a first use pays for parsing and warming up. The table says each query was asked once before. And the 25 ms sampling of memory sees nothing of a `dtlv` that lives for 25 ms (0 MB, then 41 MB, where `time -l` saw 89 MB); the guide says which was used.
    * *Not measured:* anything above 530,000 events; two threads; a disk that waits for `fsync` (on macOS it does not); Linux.
 
@@ -71,6 +72,7 @@ It brings Datalevin along (the `dtlv` program, or JDK 21 and the standalone jar)
   Open: a reader would see a world whose owner may seal or erase underneath it (a chunk directory swapped, a file gone), so it needs a read that survives that, or a promise that its answers are for one manifest. Not decided; waits for a user who needs it.
 * **A backup call.** The khana is derived, so `events/` alone is a backup. Open: may it be copied while writes go on (seal first, under the lock?), or only when the `Hosi` is closed?
 * **Many threads.** The guide lists as not tested: `clean` from two threads at once, many readers while `seal` or `erase` runs, and "the world changed between the read and the lock" in a rewrite.
+* **A `verify` that walks both khanas in one `dtlv` process.** Today it asks for a page at a time, and each page is a `dtlv` process (about 110 of them on real data; the 65 s is 34 s of rebuild and about 30 s of this walk, not measured call by call). The JVM keeps one process and takes 22 s. Not needed for 0.1: `verify` is rare work.
 * **Linux, for real.** CI runs on ubuntu with the JVM khana only; the native `dtlv` is not run there, and the `abi` job has been seen to pass on macOS only. Windows has no `System.Posix`; say it.
 
 ### Not in 0.1.0

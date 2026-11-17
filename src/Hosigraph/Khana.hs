@@ -36,7 +36,7 @@ module Hosigraph.Khana
   ( KhanaBackend(..), khanaDirName, Khana
   , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
   , metaEntity, foldedSeqAttr, eraseGenAttr, schemaMarkAttr, schemaMark, khanaSchema
-  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, applyFacts, foldRefused, khanaDatoms, khanaDatomCount
+  , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, applyFacts, foldRefused, khanaDatoms, khanaDatomPage, compareKhanas, khanaDatomCount
   , khanaFoldedAndCount
     -- * Erasing
   , peekKhana, setEraseGen, setSchemaMark, cleanGenOf, setCleanGen, khanaCompactTo, eraseRanges
@@ -46,6 +46,7 @@ module Hosigraph.Khana
 import           Control.Exception (SomeException, try, throwIO, finally)
 import           Control.Monad
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -271,6 +272,37 @@ applyFacts n k fs = do
 khanaDatoms :: Khana -> IO [Datom]
 khanaDatoms k = filter ((/= metaEntity) . dE) <$> case k of
   DtlvKhana d     -> dtlvDatoms d
+
+-- | A page of the facts, as 'dtlvDatomPage' gives it: whole entities, at most @n@ facts (more if one entity has more), from
+-- the entity @lo@ (the first there is, for 'Nothing'), and where the next page starts ('Nothing': the end).
+khanaDatomPage :: Khana -> Maybe EntityId -> Int -> IO ([Datom], Maybe EntityId)
+khanaDatomPage k lo n = case k of
+  DtlvKhana d -> do
+    (ds, next) <- dtlvDatomPage d lo n
+    pure (filter ((/= metaEntity) . dE) ds, next)
+
+-- | How the facts of two khanas differ: how many only the first has, and how many only the second has.
+-- Neither is ever held whole: the two are read in pages of about @n@ facts, each page up to the first entity where
+-- either of them stops, and compared there.  What it holds at a time is a page of each, however large the khanas are.
+compareKhanas :: Int -> Khana -> Khana -> IO (Int, Int)
+compareKhanas n a b = go Nothing 0 0
+  where
+    go lo extra missing = do
+      (pa, na) <- khanaDatomPage a lo n
+      (pb, nb) <- khanaDatomPage b lo n
+      let hi = case (na, nb) of                      -- the first entity where one of the pages stops short of the end
+            (Just x, Just y) -> Just (min x y)
+            (Just x, Nothing) -> Just x
+            (Nothing, y)      -> y
+          within ds = maybe ds (\h -> takeWhile ((< h) . dE) ds) hi
+          sa = S.fromList (within pa)
+          sb = S.fromList (within pb)
+          -- counted now, not later: a count left as a thunk holds the page's two sets until the end (4GB on real data)
+          !extra'   = extra   + S.size (sa `S.difference` sb)
+          !missing' = missing + S.size (sb `S.difference` sa)
+      case hi of
+        Nothing -> pure (extra', missing')
+        Just h  -> h `seq` go (Just h) extra' missing'
 
 khanaDatomCount :: Khana -> IO Word64
 khanaDatomCount k = case k of

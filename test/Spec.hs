@@ -27,6 +27,7 @@ import           System.Exit
 import           System.FilePath ((</>))
 import           System.IO
 import           System.Process (CreateProcess(..), StdStream(..), callProcess, createProcess, proc, readProcess, terminateProcess, waitForProcess)
+import           System.Timeout (timeout)
 import           Test.QuickCheck
 import           Test.QuickCheck.Monadic (assert, monadicIO, run)
 
@@ -39,7 +40,8 @@ import qualified Hosigraph.Erase as Erase
 import           Takka.Edn (Edn(..), readEdn, renderEdn)
 import           Takka.Syntax (Pulled(..))
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
-import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana)
+import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana, newKhanaRuntime, closeKhanaRuntime, openKhana, applyFacts, khanaDatoms, khanaDatomPage, compareKhanas)
+import           Takka.Types (Datom(..))
 import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
@@ -61,6 +63,10 @@ checkEq :: (Eq a, Show a) => String -> a -> a -> IO ()
 checkEq msg expected actual =
   unless (expected == actual) $
     throwIO (userError (msg ++ "\n      expected: " ++ show expected ++ "\n      actual:   " ++ show actual))
+
+-- | A walk that never ends is a failure, not a hang (a pager that stands still would loop for ever).
+endsIn :: String -> IO a -> IO a
+endsIn what act = timeout 20000000 act >>= maybe (throwIO (userError (what ++ ": did not end in 20 s"))) pure
 
 prop :: Testable p => Int -> p -> IO ()
 prop n p = do
@@ -2780,6 +2786,86 @@ hosiTests be =
           Right (k, _)              -> closeKhana k >> throwIO (userError "the failing step should have stopped it")
         checkEq "the half-built khana is gone" False =<< doesPathExist (dir </> "bf")
         checkEq "the world is as it was" [] =<< verify h)
+
+  , ("two khanas are compared page by page: the differences are exact, whatever the page", withTmp $ \dir -> do
+      rt <- newKhanaRuntime be
+      let ent i = fromIntegral (1000 + 10 * i) :: HosiId
+          one i = [ (ent i, "person/name", VStr (T.pack ("n" ++ show i))), (ent i, "person/age", VInt (fromIntegral i))
+                  , (ent i, "person/score", VDouble (fromIntegral i / 4)) ]
+          full  = concatMap one [0 .. 11 :: Int] ++ [ (ent 5, "person/tag", VStr (T.pack ("t" ++ show j))) | j <- [0 .. 8 :: Int] ]
+          minus xs = filter (`notElem` xs)
+          entity i = filter (\(e, _, _) -> e == ent i)
+          pairs =
+            [ ("the same",                          full, full)
+            , ("the first entity's age is missing", full, minus [(ent 0, "person/age", VInt 0)] full)
+            , ("a score in the middle is missing",  full, minus [(ent 6, "person/score", VDouble 1.5)] full)
+            , ("the last entity's name is missing", full, minus [(ent 11, "person/name", VStr "n11")] full)
+            , ("a whole entity in the middle is missing", full, minus (entity 7 full) full)
+            , ("the big entity is missing",         full, minus (entity 5 full) full)
+            , ("an entity after the last one",      full ++ one 20, full)
+            , ("an entity before the first one",    full, full ++ [(5, "person/name", VStr "early")])
+            , ("a value changed",                   full, minus [(ent 3, "person/age", VInt 3)] full ++ [(ent 3, "person/age", VInt 99)])
+            , ("one is empty",                      full, [])
+            , ("the other is empty",                [], full)
+            ]
+      forM_ pairs $ \(what, fa, fb) -> do
+        let sa = S.fromList fa
+            sb = S.fromList fb
+            want = (S.size (sa `S.difference` sb), S.size (sb `S.difference` sa))
+        a <- openKhana rt be (dir </> "a") schema
+        b <- openKhana rt be (dir </> "b") schema
+        applyFacts 7 a fa
+        applyFacts 7 b fb
+        checkEq (what ++ ": pages of about 4") want =<< endsIn what (compareKhanas 4 a b)
+        checkEq (what ++ ": one page, the other way round") (snd want, fst want) =<< compareKhanas 1000 b a
+        closeKhana a
+        closeKhana b
+        removePathForcibly (dir </> "a")
+        removePathForcibly (dir </> "b")
+      closeKhanaRuntime rt)
+
+  , ("a page of facts never splits an entity, and the pages together are every fact", withTmp $ \dir -> do
+      rt <- newKhanaRuntime be
+      let ent i = fromIntegral (1000 + 10 * i) :: HosiId
+          one i = [ (ent i, "person/name", VStr (T.pack ("n" ++ show i))), (ent i, "person/age", VInt (fromIntegral i)) ]
+          facts = concatMap one [0 .. 9 :: Int] ++ [ (ent 4, "person/tag", VStr (T.pack ("t" ++ show j))) | j <- [0 .. 8 :: Int] ]
+      k <- openKhana rt be (dir </> "k") schema
+      applyFacts 7 k facts
+      everything <- khanaDatoms k
+      let pages lo = do (p, next) <- khanaDatomPage k lo 4
+                        rest <- maybe (pure []) (pages . Just) next
+                        pure (p : rest)
+      ps <- endsIn "walking the pages" (pages Nothing)
+      checkEq "together, every fact" (S.fromList everything) (S.fromList (concat ps))
+      checkEq "and no fact twice" (length everything) (length (concat ps))
+      let entitiesOf = map (S.fromList . map dE) ps
+      checkEq "no entity is in two pages" (S.size (S.unions entitiesOf)) (sum (map S.size entitiesOf))
+      -- a page holds 4 facts at most; when its first entity needs more, the page is asked for again at twice the size, until it fits
+      let firstEntity p = case p of (d : _) -> length (takeWhile ((== dE d) . dE) p); [] -> 0
+      check "a page stays small: 4 facts, or less than twice what its first entity needs" (all (\p -> length p <= max 4 (2 * firstEntity p - 1)) ps)
+      check "and the big entity is in a page of its own size" (any (\p -> firstEntity p == 11) ps)
+      check "there is more than one page" (length ps > 1)
+      closeKhana k
+      closeKhanaRuntime rt)
+
+  , ("verify finds a khana that differs from the events, and says by how many", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith (cfgWith clock) dir schema
+      a <- person h "Frege" 70
+      b <- person h "Peirce" 75
+      checkEq "to begin with, nothing" [] =<< verify h
+      closeHosi h
+      -- two facts the events do not have (one of them replaces Peirce's age), as a hand in the khana would leave them
+      rt <- newKhanaRuntime be
+      k <- openKhana rt be (dir </> khanaDirName be) schema
+      applyFacts 10 k [(a, "person/tag", VStr "extra"), (b, "person/age", VInt 76)]
+      closeKhana k
+      closeKhanaRuntime rt
+      h2 <- openHosiWith (cfgWith clock) dir schema
+      checkEq "the difference, counted" ["khana differs from a fresh fold: 2 extra, 1 missing"] =<< verify h2
+      rebuildKhana h2
+      checkEq "made again from the events, nothing" [] =<< verify h2
+      closeHosi h2)
   ]
   where
     cfgWith c = (backendCfg be) { hcClock = c }

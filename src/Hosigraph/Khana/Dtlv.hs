@@ -27,7 +27,7 @@
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
   ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..)
-  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomCount, dtlvQueryCells
+  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
     -- * Taking out whole entities
@@ -227,6 +227,29 @@ dtlvDatoms d = do
   forM rows $ \r -> case r of
     [EInt e, EKw a, v] -> Datom (fromInteger e) (Keyword a) <$> value v
     _                  -> bad ("a datom row: " ++ show r)
+
+-- | A page of the facts: whole entities only, at most @n@ facts (more, if a single entity has more), in the order of
+-- the index.  It starts at entity @lo@ (the first entity there is, for 'Nothing') and returns where the next page starts
+-- ('Nothing': this one reached the end).  A seek in the index that is given its count: Datalevin reads only that many
+-- (without the count, @datoms@ and @seek-datoms@ make every fact after the start before @take@ sees one: 4GB of heap, on real data).
+-- Two pages from different databases that start at the same entity and stop at the same entity hold the same facts
+-- if the databases agree; that is what lets "Hosigraph.verify" compare two khanas without holding either of them.
+dtlvDatomPage :: Dtlv -> Maybe EntityId -> Int -> IO ([Datom], Maybe EntityId)
+dtlvDatomPage d lo n0 = go (max 1 n0)
+  where
+    from = "(seek-datoms @c :eav " <> maybe "nil" (T.pack . show) lo <> " nil nil "
+    go n = do
+      rows <- asRows =<< readReply d ("(mapv (fn [x] [(:e x) (:a x) (:v x)]) " <> from <> T.pack (show (n + 1)) <> "))")
+      ds <- forM rows $ \r -> case r of
+        [EInt e, EKw a, v] -> Datom (fromInteger e) (Keyword a) <$> value v
+        _                  -> bad ("a datom row: " ++ show r)
+      case drop n ds of
+        []      -> pure (ds, Nothing)                       -- fewer than n + 1: that was all of it
+        (x : _) ->
+          -- the (n + 1)th fact opens an entity that may have begun before it: that entity goes to the next page
+          case takeWhile ((< dE x) . dE) ds of
+            []   -> go (n * 2)                              -- one entity with more than n facts: ask for a bigger page
+            page -> pure (page, Just (dE x))
 
 dtlvDatomCount :: Dtlv -> IO Integer
 dtlvDatomCount d = do

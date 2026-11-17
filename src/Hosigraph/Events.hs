@@ -1064,5 +1064,8 @@ checkChunk k c = do
             other -> [tag ("MPHF lookup of " ++ show i ++ " failed: " ++ show other)]
         -- the filter may be wrong about strangers, never about an id that is there
         let filterProblems = [ tag ("the filter says no to " ++ show i ++ ", which is in the chunk") | i <- M.keys byId, not (filterMayHave filt i) ]
-        pure (hashProblem ++ footerProblems ++ mphfProblems ++ filterProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ])
+        let problems = hashProblem ++ footerProblems ++ mphfProblems ++ filterProblems ++ [ tag "event count differs from the manifest" | length evs /= ceEvents c ]
+        -- looked at now, not later: a list left as a thunk holds this chunk's events until the end (about 900MB on real data)
+        _ <- evaluate (sum (map length problems))
+        pure problems
     pure $ either (\(e :: SomeException) -> [tag ("unreadable: " ++ show e)]) id r

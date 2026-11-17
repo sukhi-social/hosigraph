@@ -129,7 +129,7 @@ main = bracket (openHosiWith cfg "/tmp/hosi" schema) closeHosi $ \h -> do
 | `getEntities`, `queryMany`, `queryCellsMany` | Read **now**, many questions at once. |
 | `history`, `historyTrace` | Read **the past**: every event of one ID, from the chunks and the tail log. `historyTrace` also shows which chunks it skipped (by the zone map, and by the filter) and what each probe answered. |
 | `seal` | Turn the tail log into chunks. `HosiConfig` can also seal by itself, by size or by age. |
-| `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events.** An empty list means all good. |
+| `verify` | Check the manifest signature, the chunk hashes, the footers, and the MPHF lookup of every ID. It also checks that **the khana equals a khana built again from the events** (a second khana is made in a temporary directory beside the first, and the two are compared 10,000 facts at a time). An empty list means all good. It takes about as long as a rebuild, and then some; see Measurements. |
 | `rebuildKhana` | Throw the khana away and fold the events again. |
 | `erase` | Make entities gone, from the events and from "now": some ids, a range of ids, a span of creation time, or what an account owns. See "Phase 3 so far". |
 | `clean` | Let what `erase` took out go from the disk: write the chunks again without it, and make the khana a new file. |
@@ -278,9 +278,15 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 | on disk | events 1.4 MB, khana 11 to 22 MB | events 1.4 MB, khana 8 MB |
 
 * Opening with the JVM takes about 1.4 s even when nothing is to be done: that is the JVM starting.
-* **Real data is much slower to make again than this.** A copy of a real server's data (527,971 events, 54,402 entities, 288 attributes, 53 chunks, 96 MB, 2026-11-07) took
-  **about 70 s** with `KhanaDtlv` (71 to 111 s over runs; about 0.13 ms for each event, against 0.02 ms above), and the same again when the schema changes.
-  With the JVM it was not measured for this data (the first guess, from the old table, was about 26 s). Plan the worst open as **events × 0.15 ms**, and use that, not the made-up number.
+* **Real data is much slower to make again than this.** A copy of a real server's data (527,971 events, 54,402 entities, 288 attributes, 53 chunks, 96 MB, 2026-11-07), one run each:
+  with `KhanaDtlv` the khana was made again in **34 s** with the world on the Mac's internal disk (an earlier run, with the world on an external SSD: 71 to 111 s, about 0.13 ms for each event, against 0.02 ms above),
+  and with the JVM in **7 s** (an open that has to do it: 10 s). The same again when the schema changes.
+  Plan the worst open for `KhanaDtlv` as **events × 0.15 ms** (the slower disk) and for the JVM as **events × 0.02 ms**; use these, not the made-up number.
+* **`verify` makes a second khana and compares the two a page at a time** (10,000 facts, whole entities), so it costs a rebuild and a walk through both, and what it holds is a page, not the khanas.
+  On the same real data: `KhanaDtlv` **65 s**, and 165 MB for the largest process (`time -l`; hosigraph is 157 MB of it); the JVM **22 s**, and it passes with `-Xmx256m` (23 s).
+  A JVM given no limit takes up to a quarter of the RAM: 870 MB of it was resident here, and that is the JVM's choice, not what `verify` needs.
+  Each page is asked from Datalevin with a count (`seek-datoms` with `n`). Without the count, Datalevin makes every fact after the start before anything is cut (read in its source), and the JVM ran out of 2 GB.
+  A page of 50,000 facts held 605 MB in hosigraph, which is why the page is 10,000.
 * The memory of `KhanaDtlv` is the largest of its processes, from `time -l` over the whole run; sampling every 25 ms misses a process that lives for 25 ms (the sampling saw 40 MB, and `time -l` saw 89 MB).
   An earlier measure (2026-11-13, a made-up world of 100,000 *people*) saw about 260 MB for one `dtlv` and about 300 MB resident for the JVM that a smaller heap did not remove. The memory depends on the data.
   The JVM is started with no heap setting.

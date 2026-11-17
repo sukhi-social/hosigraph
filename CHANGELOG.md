@@ -19,6 +19,9 @@ What is promised and what is not: [the guide](docs/guide.md#what-01-promises).
 * **A tail log that is damaged in the middle is refused, not cut.** Before, a record that could not be read ended the log, and everything after it was cut at the open, even when whole records followed it
   (batches that had been told to their writers as kept). Now, if a whole record follows the bad one, the open stops with `Corrupt` (the byte where the bad record begins is in the message) and the file is left as it is.
   A torn end, and a damaged last record (which looks the same), are cut as before.
+* **`verify` no longer holds both khanas, nor the chunks.** The two khanas are compared a page at a time (10,000 facts, whole entities), and each chunk's problems are looked at when the chunk is done.
+  On a real world of 527,971 facts: `KhanaDtlv` takes 165 MB for the largest process (it was 4.3 GB) and 65 s (it was 55 s); with the JVM it takes 22 s (24 to 26 s before) and passes with a 256 MB heap.
+  A khana that cannot be read for the comparison is a problem in the list (`khana: cannot compare: …`), and the second khana is closed and removed; before, it was an exception that left both behind.
 * A khana program that is missing is `BackendMissing`; it was `BadArgument` (`bad-argument` at the C door).
 * A schema that the khana refuses is `SchemaRefused`; it was `BadArgument`.
 * `HosiError` has three more constructors. Keep a catch-all case when you match on it.
