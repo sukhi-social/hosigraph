@@ -59,6 +59,10 @@ foreign-library hosi
   include-dirs:     gen/include
   default-language: GHC2021
   ghc-options:      -threaded -Wall
+  -- Cabal builds only standalone foreign libraries on Windows (Cabal-4574): the DLL carries the
+  -- Haskell runtime and what it needs inside itself.
+  if os(windows)
+    options:        standalone
 
 test-suite spec
   import:           shared

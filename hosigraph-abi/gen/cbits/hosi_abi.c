@@ -5,9 +5,17 @@
 #include <HsFFI.h>
 #include <Rts.h>      /* hs_init_with_rtsopts is declared here, not in HsFFI.h */
 #include <errno.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#ifdef _WIN32
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0600   /* SRWLOCK and condition variables: Vista */
+#  endif
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <pthread.h>
+#endif
 #include "hosi.h"
 
 /* The Haskell half. The types are those of the Haskell signatures. */
@@ -21,31 +29,46 @@ extern void     hosi_hs_close_all(void);
 
 enum { NOT_STARTED, RUNNING, STOPPING, ENDED };
 
-static int             g_state  = NOT_STARTED;
-static unsigned        g_inside = 0;          /* calls into Haskell in progress */
-static pthread_mutex_t g_mu     = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_idle   = PTHREAD_COND_INITIALIZER;
+static int      g_state  = NOT_STARTED;
+static unsigned g_inside = 0;          /* calls into Haskell in progress */
+
+/* One lock and one condition ("nobody is inside"), whatever the system calls them. */
+#ifdef _WIN32
+static SRWLOCK            g_mu   = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_idle = CONDITION_VARIABLE_INIT;
+static void gate_lock(void)   { AcquireSRWLockExclusive(&g_mu); }
+static void gate_unlock(void) { ReleaseSRWLockExclusive(&g_mu); }
+static void gate_wake(void)   { WakeAllConditionVariable(&g_idle); }
+static void gate_wait(void)   { SleepConditionVariableSRW(&g_idle, &g_mu, INFINITE, 0); }   /* with the lock held */
+#else
+static pthread_mutex_t g_mu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_idle = PTHREAD_COND_INITIALIZER;
+static void gate_lock(void)   { pthread_mutex_lock(&g_mu); }
+static void gate_unlock(void) { pthread_mutex_unlock(&g_mu); }
+static void gate_wake(void)   { pthread_cond_broadcast(&g_idle); }
+static void gate_wait(void)   { pthread_cond_wait(&g_idle, &g_mu); }   /* with the lock held */
+#endif
 
 static int enter(void) {
   int ok;
-  pthread_mutex_lock(&g_mu);
+  gate_lock();
   ok = (g_state == RUNNING);
   if (ok) g_inside++;
-  pthread_mutex_unlock(&g_mu);
+  gate_unlock();
   return ok;
 }
 
 static void leave(void) {
-  pthread_mutex_lock(&g_mu);
-  if (--g_inside == 0) pthread_cond_broadcast(&g_idle);
-  pthread_mutex_unlock(&g_mu);
+  gate_lock();
+  if (--g_inside == 0) gate_wake();
+  gate_unlock();
 }
 
 /* ---- the runtime ------------------------------------------------------------- */
 
 int hosi_runtime_init(void) {
   int rc = 0;
-  pthread_mutex_lock(&g_mu);
+  gate_lock();
   if (g_state == STOPPING || g_state == ENDED) {
     rc = -EPERM;            /* not hs_init: the RTS would abort the whole host process */
   } else if (g_state == NOT_STARTED) {
@@ -55,28 +78,28 @@ int hosi_runtime_init(void) {
     hs_init_with_rtsopts(&argc, &argv);
     g_state = RUNNING;
   }
-  pthread_mutex_unlock(&g_mu);
+  gate_unlock();
   return rc;
 }
 
 void hosi_runtime_shutdown(void) {
-  pthread_mutex_lock(&g_mu);
-  if (g_state != RUNNING) { pthread_mutex_unlock(&g_mu); return; }
+  gate_lock();
+  if (g_state != RUNNING) { gate_unlock(); return; }
   g_state = STOPPING;                       /* no new call gets in ... */
-  while (g_inside > 0) pthread_cond_wait(&g_idle, &g_mu);   /* ... and those inside are waited for */
-  pthread_mutex_unlock(&g_mu);
+  while (g_inside > 0) gate_wait();         /* ... and those inside are waited for */
+  gate_unlock();
   hosi_hs_close_all();                    /* every connection: what is waiting is answered CLOSED */
   hs_exit();
-  pthread_mutex_lock(&g_mu);
+  gate_lock();
   g_state = ENDED;
-  pthread_mutex_unlock(&g_mu);
+  gate_unlock();
 }
 
 void hosi_thread_done(void) {
   int running;
-  pthread_mutex_lock(&g_mu);
+  gate_lock();
   running = (g_state == RUNNING);
-  pthread_mutex_unlock(&g_mu);
+  gate_unlock();
   if (running) hs_thread_done();
 }
 

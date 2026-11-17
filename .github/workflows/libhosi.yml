@@ -1,0 +1,135 @@
+# libhosi, the shared library (the "cdylib"), built for the machines we ship to.
+#
+# One tarball per machine, kept as a workflow artifact (libhosi-<target>):
+#
+#   libhosi.{so,dylib}   with every library it needs but the system's, all looking for each
+#                        other next to themselves only (hosigraph-ex/scripts/bundle-libhosi.sh)
+#   hosi.h               its header
+#
+# Each bundle is tried before it is kept: it is unpacked where the source tree cannot help,
+# and the ctypes conformance (T-01 to T-14) runs on it.  Nothing is released from here; the
+# tarballs and their .sha256 are for downloading from the run page.
+#
+# Windows is here but has not been seen working.  Sync.hs, WorldLock.hs and the C that setu
+# writes each have a Windows half now, written without a Windows machine (checked on macOS as far
+# as that goes), so the first run is what tells; that leg is allowed to fail without turning the
+# run red.  Take `experimental` out when it has been green once.
+# It does not bundle yet: it lists what hosi.dll gives and which DLLs it asks for, so that the next
+# step can be seen, and it does not run the conformance (that script is for Linux and macOS).
+#
+# macos-14 is not here: GitHub retired it on 2026-11-02 ("The configuration
+# 'macos-14-arm64-us-default' is not supported").
+name: libhosi
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/libhosi.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libhosi-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GHC_VERSION: "9.10.3"
+  CABAL_VERSION: "3.14.2.0"
+
+jobs:
+  libhosi:
+    name: libhosi (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15,         target: aarch64-darwin }
+          - { os: ubuntu-24.04,     target: x86_64-linux }
+          - { os: ubuntu-24.04-arm, target: aarch64-linux }
+          - { os: windows-2022,     target: x86_64-windows, experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash   # Git Bash on Windows
+    env:
+      ASSET: libhosi-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: libhosi-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
+          restore-keys: |
+            libhosi-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-
+
+      - name: patchelf
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Build libhosi
+        run: |
+          cabal update
+          cabal build hosigraph-abi:flib:hosi
+
+      - name: Gather libhosi and what it needs
+        run: |
+          case "$RUNNER_OS" in
+            macOS)   pattern='libhosi.dylib' ;;
+            Linux)   pattern='libhosi.so*' ;;
+            Windows) pattern='*hosi.dll' ;;
+          esac
+          lib=$(find dist-newstyle -type f -name "$pattern" | head -n 1)
+          if [ -z "$lib" ]; then
+            echo "no library named $pattern was built; what is there:" >&2
+            find dist-newstyle -iname '*hosi*' >&2
+            exit 1
+          fi
+          echo "library: $lib"
+          mkdir out
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$lib" out/
+            # not bundled yet: what it gives (hosi_*) and what it asks for (DLL Name)
+            objdump -p "$lib" | grep -E 'hosi_|DLL Name' || true
+          else
+            hosigraph-ex/scripts/bundle-libhosi.sh "$lib" "$PWD/out"
+          fi
+          cp hosigraph-abi/gen/include/hosi.h out/
+          tar -czf "$ASSET" -C out .
+          tar -tzf "$ASSET"
+
+      # Where the build cannot help: the bundle is unpacked on its own and tried there.
+      - name: Try the bundle (T-01 to T-14, through ctypes)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir "$RUNNER_TEMP/try"
+          tar -xzf "$ASSET" -C "$RUNNER_TEMP/try"
+          lib=$(find "$RUNNER_TEMP/try" -maxdepth 1 -type f \( -name 'libhosi.so*' -o -name 'libhosi.dylib' \) | head -n 1)
+          echo "library: $lib"
+          python3 -I hosigraph-abi/test/abi_conformance.py "$lib"
+
+      - name: Checksum
+        run: |
+          if command -v sha256sum >/dev/null; then sum=$(sha256sum "$ASSET"); else sum=$(shasum -a 256 "$ASSET"); fi
+          echo "${sum%% *}  $ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libhosi-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
