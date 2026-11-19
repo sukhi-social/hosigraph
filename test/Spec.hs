@@ -24,6 +24,7 @@ import           Data.Time.Clock.POSIX (getPOSIXTime)
 import           Data.Word
 import           System.Directory
 import           System.Environment (getArgs, getExecutablePath, lookupEnv)
+import qualified System.IO as SysIO
 import           System.Exit
 import           System.FilePath ((</>))
 import           System.IO
@@ -596,8 +597,17 @@ markerCount marker root = do
     let p = root </> n
     isDir <- doesDirectoryExist p
     if isDir then markerCount marker p else do
-      countIn 0 <$> B.readFile p
+      countFile p
   where
+    -- read in blocks of 4 MB: on Linux Datalevin's data.mdb is a sparse file of 1 GB, and B.readFile took it whole
+    countFile p = SysIO.withBinaryFile p SysIO.ReadMode (\hd -> blocks hd 0 B.empty)
+    keep = B.length marker - 1
+    blocks hd n carry = do
+      blk <- B.hGet hd (4 * 1024 * 1024)
+      if B.null blk then pure n else do
+        let hay = carry <> blk
+        let n' = n + countIn 0 hay
+        n' `seq` blocks hd n' (B.copy (B.drop (B.length hay - keep) hay))   -- strict, and a copy: the next round must not hold this block
     countIn n hay =
       let rest = snd (B.breakSubstring marker hay)
       in if B.null rest then n else countIn (n + 1 :: Int) (B.drop (B.length marker) rest)
