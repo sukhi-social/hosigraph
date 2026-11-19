@@ -47,7 +47,8 @@
 --   Windows, a network file system.
 module Hosigraph
   ( -- * Opening
-    Hosi, HosiConfig(..), defaultConfig, openHosi, openHosiWith, closeHosi, withHosi
+    Hosi, HosiConfig(..), defaultConfig, openHosi, openHosiWith, openHosiShared, closeHosi, withHosi
+  , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
     -- * Where "now" lives
   , KhanaBackend(..), khanaDirName
     -- * Writing
@@ -141,6 +142,7 @@ data Hosi = Hosi
   , hEvents :: Events                 -- ^ the truth
   , hKhana  :: IORef Khana            -- ^ the instant (swapped when it is rebuilt)
   , hRuntime :: KhanaRuntime          -- ^ what every khana of this Hosi shares (the resident JVM, if any)
+  , hOwnsRuntime :: Bool              -- ^ False when the runtime was lent ('openHosiShared'): closing this Hosi leaves it running
   }
 
 khanaDir :: Hosi -> FilePath
@@ -184,24 +186,37 @@ openHosi = openHosiWith defaultConfig
 -- 2. then the khana is made to agree with them: if it is missing, broken, or ahead of the
 --    events, rebuild it; otherwise fold in whatever it has not seen yet.
 openHosiWith :: HosiConfig -> FilePath -> Schema -> IO Hosi
-openHosiWith cfg dir schema = do
+openHosiWith cfg dir schema = openHosiWithRuntime Nothing cfg dir schema
+
+-- | 'openHosiWith' on a runtime (the resident JVM) that somebody else made with 'newKhanaRuntime' and keeps: this
+-- Hosi uses it and 'closeHosi' does /not/ stop it, so many databases (a Hosi for each region, say) can live in one
+-- JVM, which costs the memory and the start-up of one.  Whoever made the runtime closes it with 'closeKhanaRuntime',
+-- after the last Hosi on it is closed.  A runtime is one pipe: the questions of all the Hosi on it to their khanas are
+-- asked one at a time.
+openHosiShared :: KhanaRuntime -> HosiConfig -> FilePath -> Schema -> IO Hosi
+openHosiShared rt = openHosiWithRuntime (Just rt)
+
+openHosiWithRuntime :: Maybe KhanaRuntime -> HosiConfig -> FilePath -> Schema -> IO Hosi
+openHosiWithRuntime lent cfg dir schema = do
   checkBackend (hcKhanaBackend cfg)
   createDirectoryIfMissing True dir
   -- the world first: an opener that comes second is refused here ('WorldBusy'), before it starts a JVM or touches a khana
   ev <- E.openEvents (eventsConfig cfg) (dir </> "events")
-  rt <- newKhanaRuntime (hcKhanaBackend cfg) `onException` E.closeEvents ev
+  rt <- maybe (newKhanaRuntime (hcKhanaBackend cfg)) pure lent `onException` E.closeEvents ev
+  let owns = case lent of Nothing -> True; Just _ -> False
+      letGo = if owns then closeKhanaRuntime rt else pure ()
   (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
       ref0 <- newIORef (error "khana not opened yet")
-      let h = Hosi dir cfg schema ev ref0 rt
+      let h = Hosi dir cfg schema ev ref0 rt owns
       lastS <- E.lastSeq ev
       conn <- recoverKhana h lastS
       writeIORef ref0 conn
-      pure h) `onException` (closeKhanaRuntime rt `finally` E.closeEvents ev)
+      pure h) `onException` (letGo `finally` E.closeEvents ev)
 
 closeHosi :: Hosi -> IO ()
 closeHosi h =
   -- the khana and its runtime first, the events last: closing them lets go of the world, and nobody may open it on top of a khana that is still open
-  (readIORef (hKhana h) >>= closeKhana) `finally` closeKhanaRuntime (hRuntime h) `finally` E.closeEvents (hEvents h)
+  (readIORef (hKhana h) >>= closeKhana) `finally` (if hOwnsRuntime h then closeKhanaRuntime (hRuntime h) else pure ()) `finally` E.closeEvents (hEvents h)
 
 withHosi :: FilePath -> Schema -> (Hosi -> IO a) -> IO a
 withHosi dir schema = bracket (openHosi dir schema) closeHosi

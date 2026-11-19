@@ -48,6 +48,13 @@ import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTr
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
 import           Hosigraph.Probe (confirmSlot)
+import           Hosigraph.WriteQueue
+import           Hosigraph.ReadCache
+import           Hosigraph.Regions
+import qualified System.Directory as SD
+import           Control.Concurrent (threadDelay)
+import           Control.Exception (try, throwIO, ErrorCall(..), SomeException)
+import qualified Data.List as L
 import qualified Hosigraph.Events as Ev
 import           Hosigraph.Sha256
 import           Hosigraph.Tail
@@ -119,7 +126,7 @@ runTests = do
   -- HOSIGRAPH_TEST_ONLY=text runs only the tests whose name has that text in it (for trying one thing; a full run is the one that counts)
   only <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_TEST_ONLY"
   let wanted (name, _) = maybe True (`isInfixOf` name) only
-  results <- forM (filter wanted (pureTests ++ worldLockTests ++ formatTests ++ dtlvRun)) $ \(name, act) -> do
+  results <- forM (filter wanted (pureTests ++ readCacheTests ++ worldLockTests ++ formatTests ++ dtlvRun)) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -671,6 +678,127 @@ genBackEvents = do
     a <- elements ["t/one", "t/many", "t/loose"]
     v <- VInt <$> choose (0, 2)             -- three values only, so that the same fact comes round again and again
     pure (Event (fromIntegral (s :: Int)) k i a v)
+
+readCacheTests :: [Test]
+readCacheTests =
+  [ ("read cache: the same question is asked of the source once while the answer is fresh; another scope or key is another question", do
+      rc <- newReadCache defaultReadCacheConfig
+      calls <- newIORef (0 :: Int)
+      let ask sc k = cached rc sc k (modifyIORef' calls (+ 1) >> readIORef calls)
+      a <- ask "room:1" "newest"
+      b <- ask "room:1" "newest"
+      c <- ask "room:2" "newest"
+      d <- ask "room:1" "count"
+      checkEq "the second is the first's answer" a b
+      checkEq "two scopes, two questions" 3 =<< readIORef calls
+      check "...with different answers" (c /= a && d /= a && c /= d)
+      st <- cacheStats rc
+      checkEq "one hit" 1 (csHits st)
+      checkEq "three misses" 3 (csMisses st)
+      checkEq "three kept" 3 (csSize st))
+  , ("read cache: invalidate forgets one scope and leaves the others; the next ask goes to the source", do
+      rc <- newReadCache defaultReadCacheConfig
+      calls <- newIORef (0 :: Int)
+      let ask sc = cached rc sc "newest" (modifyIORef' calls (+ 1) >> readIORef calls)
+      _ <- ask "room:1"; _ <- ask "room:2"
+      invalidate rc "room:1"
+      a <- ask "room:1"; b <- ask "room:2"
+      checkEq "room 1 was asked again" 3 a
+      checkEq "room 2 still has its first answer" 2 b
+      st <- cacheStats rc
+      checkEq "one forgotten" 1 (csForgotten st)
+      invalidateAll rc
+      _ <- ask "room:2"
+      checkEq "everything was forgotten" 4 =<< readIORef calls)
+  , ("read cache: many ask at the same moment and the source is asked once; they all get that answer", do
+      rc <- newReadCache defaultReadCacheConfig
+      calls <- newIORef (0 :: Int)
+      gate <- newEmptyMVar
+      let slow = do modifyIORef' calls (+ 1); readMVar gate; pure (42 :: Int)
+      vs <- forM [1 .. 20 :: Int] $ \_ -> do
+        v <- newEmptyMVar
+        _ <- forkIO (cached rc "room:1" "newest" slow >>= putMVar v)
+        pure v
+      threadDelay 100000                         -- they are all waiting for the one that went
+      putMVar gate ()
+      rs <- mapM takeMVar vs
+      checkEq "all got the answer" (replicate 20 42) rs
+      checkEq "the source was asked once" 1 =<< readIORef calls
+      st <- cacheStats rc
+      checkEq "one miss" 1 (csMisses st)
+      checkEq "nineteen shared it" 19 (csShared st))
+  , ("read cache: an answer fetched while a write invalidated its scope is not kept (it may predate the write)", do
+      rc <- newReadCache defaultReadCacheConfig
+      started <- newEmptyMVar
+      release <- newEmptyMVar
+      out <- newEmptyMVar
+      _ <- forkIO (cached rc "room:1" "newest" (putMVar started () >> readMVar release >> pure (1 :: Int)) >>= putMVar out)
+      takeMVar started
+      invalidate rc "room:1"                     -- the write comes while the answer is on its way
+      putMVar release ()
+      checkEq "the asker still gets what it fetched" 1 =<< takeMVar out
+      st <- cacheStats rc
+      checkEq "...but it was not kept" 0 (csSize st)
+      checkEq "...and it is counted" 1 (csStaleDropped st)
+      r <- cached rc "room:1" "newest" (pure (2 :: Int))
+      checkEq "the next ask fetches again" 2 r)
+  , ("read cache: the time limit makes an old answer be fetched again; with no limit it stays until invalidated", do
+      rc <- newReadCache defaultReadCacheConfig { rcTtlMs = Just 30 }
+      calls <- newIORef (0 :: Int)
+      let ask = cached rc "r" "k" (modifyIORef' calls (+ 1) >> readIORef calls)
+      _ <- ask; _ <- ask
+      checkEq "fresh: once" 1 =<< readIORef calls
+      threadDelay 80000
+      _ <- ask
+      checkEq "old: fetched again" 2 =<< readIORef calls
+      checkEq "counted as expired" 1 . csExpired =<< cacheStats rc
+      rc2 <- newReadCache defaultReadCacheConfig { rcTtlMs = Nothing }
+      calls2 <- newIORef (0 :: Int)
+      let ask2 = cached rc2 "r" "k" (modifyIORef' calls2 (+ 1) >> readIORef calls2)
+      _ <- ask2; threadDelay 60000; _ <- ask2
+      checkEq "no limit: still once" 1 =<< readIORef calls2)
+  , ("read cache: it is bounded (the oldest answers go first), and the newest stay", do
+      rc <- newReadCache defaultReadCacheConfig { rcMaxEntries = 20 }
+      forM_ [1 .. 60 :: Int] $ \i -> do
+        _ <- cached rc "s" (T.pack (show i)) (pure i)
+        threadDelay 1000
+      st <- cacheStats rc
+      check "never more than the limit" (csSize st <= 20)
+      check "some were dropped for room" (csEvictions st > 0)
+      calls <- newIORef (0 :: Int)
+      _ <- cached rc "s" "60" (modifyIORef' calls (+ 1) >> pure (0 :: Int))
+      checkEq "the newest is still there" 0 =<< readIORef calls)
+  , ("read cache: a question that fails fails for everyone who asked it, is not kept, and the next ask tries again", do
+      rc <- newReadCache defaultReadCacheConfig
+      gate <- newEmptyMVar
+      let boom = readMVar gate >> throwIO (ErrorCall "khana is away") :: IO Int
+      vs <- forM [1 .. 5 :: Int] $ \_ -> do
+        v <- newEmptyMVar
+        _ <- forkIO (try (cached rc "r" "k" boom) >>= putMVar v)
+        pure v
+      threadDelay 50000
+      putMVar gate ()
+      rs <- mapM takeMVar vs
+      check "every asker got the failure" (all (either (\e -> "khana is away" `L.isInfixOf` show (e :: SomeException)) (const False)) rs)
+      checkEq "nothing was kept" 0 . csSize =<< cacheStats rc
+      v <- cached rc "r" "k" (pure (7 :: Int))
+      checkEq "the next ask is answered" 7 v)
+  , ("read cache: the advice says what the counts suggest, and nothing when all is well", do
+      let cfg = defaultReadCacheConfig { rcMaxEntries = 10 }
+      rc <- newReadCache cfg
+      forM_ [1 .. 40 :: Int] $ \i -> cached rc "s" (T.pack (show i)) (pure i)
+      st <- cacheStats rc
+      let adv = cacheAdvice cfg st
+      check "it tells of the dropped answers" (any ("dropped for room" `L.isInfixOf`) adv)
+      rc2 <- newReadCache defaultReadCacheConfig
+      forM_ [1 .. 300 :: Int] $ \_ -> cached rc2 "s" "k" (pure (1 :: Int))
+      st2 <- cacheStats rc2
+      checkEq "nothing to say when it works" [] (cacheAdvice defaultReadCacheConfig st2)
+      rc3 <- newReadCache defaultReadCacheConfig
+      forM_ [1 .. 300 :: Int] $ \i -> cached rc3 "s" (T.pack (show i)) (pure i)
+      st3 <- cacheStats rc3
+      check "it tells that nothing repeats" (any ("caching gains little" `L.isInfixOf`) (cacheAdvice defaultReadCacheConfig st3)))
+  ]
 
 pureTests :: [Test]
 pureTests =
@@ -3474,8 +3602,170 @@ nativeTests exe =
   ]
 
 -- | Only the resident JVM.
+regionsTests :: FilePath -> FilePath -> [Test]
+regionsTests java jar =
+  [ ("regions: each name is its own world; what is written in one is not in another, it is all there after a restart, and the names on disk are known", withTmp $ \dir -> do
+      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+          names = ["alpha", "beta", "gamma", "delta", "eps.1_x-2"] :: [T.Text]
+      rg <- newRegions cfg
+      forM_ (zip [1 ..] names) $ \(n, nm) -> do
+        r <- withRegion rg nm (\h -> write h (note n) >> pure ())
+        check ("written in " ++ T.unpack nm) (either (const False) (const True) r)
+      forM_ (zip [1 ..] names) $ \(n, nm) -> do
+        r <- withRegion rg nm (\h -> query h "[:find ?n :where [?e :note/n ?n]]" [])
+        checkEq ("only its own in " ++ T.unpack nm) (Right [[VInt n]]) (either (Left . show) Right r)
+      closeRegions rg
+      rg2 <- newRegions cfg
+      r <- withRegion rg2 "gamma" (\h -> query h "[:find ?n :where [?e :note/n ?n]]" [])
+      checkEq "after a restart it is all there" (Right [[VInt 3]]) (either (Left . show) Right r)
+      ks <- knownRegions rg2
+      checkEq "the names on disk" (sort names) (sort ks)
+      st <- regionStats rg2
+      checkEq "one opened after the restart" 1 (rsOpened st)
+      closeRegions rg2)
+  , ("regions: a name that cannot be a directory is refused, and nothing on disk is touched", withTmp $ \dir -> do
+      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+      rg <- newRegions cfg
+      forM_ ["", "..", ".", "a/b", ".hidden", "a b", "x\\y", T.replicate 65 "a"] $ \nm -> do
+        r <- withRegion rg nm (\_ -> pure ())
+        check ("refused: " ++ show nm) (case r of Left (BadRegionName _) -> True; _ -> False)
+      checkEq "nothing was made" [] =<< SD.listDirectory dir
+      closeRegions rg)
+  , ("regions: at the limit the one used longest ago is closed and comes back with its data; when every open region is in use the answer is TooManyBusy and nothing is closed", withTmp $ \dir -> do
+      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgMaxOpen = 2 }
+      rg <- newRegions cfg
+      forM_ (zip [1 ..] ["a", "b", "c"] :: [(Int64, T.Text)]) $ \(n, nm) -> withRegion rg nm (\h -> write h (note n))
+      checkEq "a was closed to make room" ["b", "c"] . sort =<< openRegionNames rg
+      r <- withRegion rg "a" (\h -> query h "[:find ?n :where [?e :note/n ?n]]" [])
+      checkEq "a comes back with its data" (Right [[VInt 1]]) (either (Left . show) Right r)
+      st <- regionStats rg
+      checkEq "two were closed to make room" 2 (rsEvicted st)
+      r2 <- withRegion rg "a" (\_ -> withRegion rg "x" (\_ -> withRegion rg "y" (\_ -> pure ())))
+      check "all in use: TooManyBusy" (case r2 of Right (Right (Left (TooManyBusy 2))) -> True; _ -> False)
+      checkEq "nothing was closed under anyone" 2 . length =<< openRegionNames rg
+      st2 <- regionStats rg
+      checkEq "counted" 1 (rsBusy st2)
+      check "the advice tells of it" (any ("TooManyBusy" `L.isInfixOf`) (regionsAdvice cfg st2))
+      closeRegions rg)
+  , ("regions: a region that cannot be opened is answered OpenFailed and the others go on", withTmp $ \dir -> do
+      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+      writeFile (dir </> "bad") "a file where the directory of the region should be"
+      rg <- newRegions cfg
+      r <- withRegion rg "bad" (\_ -> pure ())
+      check "OpenFailed with a reason" (case r of Left (OpenFailed why) -> not (null why); _ -> False)
+      r2 <- withRegion rg "good" (\h -> write h (note 7) >> query h "[:find ?n :where [?e :note/n ?n]]" [])
+      checkEq "the other works" (Right [[VInt 7]]) (either (Left . show) Right r2)
+      st <- regionStats rg
+      checkEq "counted" 1 (rsOpenFailed st)
+      check "the advice tells of it" (any ("failed to open" `L.isInfixOf`) (regionsAdvice cfg st))
+      closeRegions rg)
+  , ("regions: pinned, a region is not closed to make room; let go, it can be", withTmp $ \dir -> do
+      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgMaxOpen = 1 }
+      rg <- newRegions cfg
+      Right (_, unpin) <- pinRegion rg "a"
+      r <- withRegion rg "b" (\_ -> pure ())
+      check "b has no place while a is pinned" (case r of Left (TooManyBusy 1) -> True; _ -> False)
+      unpin
+      r2 <- withRegion rg "b" (\_ -> pure ())
+      check "b has it once a is let go" (either (const False) (const True) r2)
+      checkEq "a was closed" ["b"] =<< openRegionNames rg
+      closeRegions rg
+      r3 <- withRegion rg "a" (\_ -> pure ())
+      check "closed: RegionsClosed" (case r3 of Left RegionsClosed -> True; _ -> False))
+  , ("regions: spread over two JVMs, each region is still its own world", withTmp $ \dir -> do
+      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgJvms = 2 }
+          names = ["r1", "r2", "r3", "r4"] :: [T.Text]
+      rg <- newRegions cfg
+      forM_ (zip [1 ..] names) $ \(n, nm) -> withRegion rg nm (\h -> write h (note n))
+      forM_ (zip [1 ..] names) $ \(n, nm) -> do
+        r <- withRegion rg nm (\h -> query h "[:find ?n :where [?e :note/n ?n]]" [])
+        checkEq ("only its own in " ++ T.unpack nm) (Right [[VInt n]]) (either (Left . show) Right r)
+      closeRegions rg)
+  ]
+  where
+    sch = M.fromList [ ("note/n", attr TLong) ]
+    note n = [Create (Tmp 1) "note/n" (Lit (VInt n))]
+
+writeQueueTests :: FilePath -> FilePath -> [Test]
+writeQueueTests java jar =
+  [ ("write queue: many writers at once; each gets its own answer and its own id, every write is in the events and in the khana, and the trips are fewer than the writes", withTmp $ \dir -> do
+      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+          sch = M.fromList [ ("note/n", attr TLong), ("note/by", attr TString) ]
+          note n = [Create (Tmp 1) "note/n" (Lit (VInt (fromIntegral (n :: Int)))), Create (Tmp 1) "note/by" (Lit (VStr "x"))]
+          writers = 16; per = 10
+      h <- openHosiWith cfg dir sch
+      q <- newWriteQueue h defaultQueueConfig
+      outs <- forM [0 .. writers - 1] $ \t -> do
+        v <- newEmptyMVar
+        _ <- forkIO $ do
+          rs <- forM [0 .. per - 1] $ \k -> do
+            let n = t * per + k
+            r <- submit q (note n)
+            pure (n, r)
+          putMVar v rs
+        pure v
+      got <- concat <$> mapM takeMVar outs
+      let idOf (n, Written wr) = Just (n, wrTemps wr M.! 1)
+          idOf _               = Nothing
+          ok = [ p | Just p <- map idOf got ]
+      checkEq "every write was Written" (writers * per) (length ok)
+      checkEq "each write has an id of its own" (writers * per) (M.size (M.fromList [ (i, ()) | (_, i) <- ok ]))
+      rows <- query h "[:find ?e ?n :where [?e :note/n ?n]]" []
+      checkEq "the khana holds exactly these, each id with its own number"
+              (sort [ [VInt (fromIntegral i), VInt (fromIntegral n)] | (n, i) <- ok ]) (sort rows)
+      st <- queueStats q
+      checkEq "all were taken in" (writers * per) (qsSubmitted st)
+      checkEq "none turned away" 0 (qsBusy st)
+      checkEq "none crashed" 0 (qsCrashedTrips st)
+      check "never more trips than writes" (qsBatches st >= 1 && qsBatches st <= writers * per)
+      closeWriteQueue q
+      r <- submit q (note 0)
+      check "a closed room answers Closed" (case r of Closed -> True; _ -> False)
+      closeHosi h)
+  , ("write queue: a room that is full answers Busy and takes nothing; the advice says so, and says nothing when all is well", withTmp $ \dir -> do
+      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+          sch = M.fromList [ ("note/n", attr TLong) ]
+          note = [Create (Tmp 1) "note/n" (Lit (VInt 1))]
+      h <- openHosiWith cfg dir sch
+      let tiny = defaultQueueConfig { qcMaxPending = 0 }
+      qFull <- newWriteQueue h tiny
+      r <- submit qFull note
+      check "Busy" (case r of Busy -> True; _ -> False)
+      checkEq "nothing was written" [] =<< query h "[:find (count ?e) :where [?e :note/n]]" []
+      st <- queueStats qFull
+      checkEq "one turned away" 1 (qsBusy st)
+      check "the advice tells of it" (any ("turned away" `L.isInfixOf`) (queueAdvice tiny st))
+      closeWriteQueue qFull
+      q <- newWriteQueue h defaultQueueConfig
+      r2 <- submit q note
+      check "a write goes through" (case r2 of Written _ -> True; _ -> False)
+      st2 <- queueStats q
+      checkEq "nothing to say when all is well" [] (queueAdvice defaultQueueConfig st2)
+      closeWriteQueue q
+      closeHosi h)
+  , ("write queue: a trip that fails is answered Crashed with a reason, the caller is not left waiting, and the advice tells of it", withTmp $ \dir -> do
+      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+          sch = M.fromList [ ("note/n", attr TLong) ]
+          note = [Create (Tmp 1) "note/n" (Lit (VInt 1))]
+      h <- openHosiWith cfg dir sch
+      q <- newWriteQueue h defaultQueueConfig
+      r1 <- submit q note
+      check "the first write goes through" (case r1 of Written _ -> True; _ -> False)
+      closeHosi h                                   -- from here every trip fails
+      r2 <- submit q note
+      check "Crashed, with a reason" (case r2 of Crashed why -> not (null why); _ -> False)
+      r3 <- submit q note
+      check "...and the room still answers the next" (case r3 of Crashed _ -> True; _ -> False)
+      st <- queueStats q
+      check "the trips that failed are counted" (qsCrashedTrips st >= 2)
+      check "the advice tells of them" (any ("trips failed" `L.isInfixOf`) (queueAdvice defaultQueueConfig st))
+      closeWriteQueue q)
+  ]
+
 jvmTests :: FilePath -> FilePath -> [Test]
 jvmTests java jar =
+  writeQueueTests java jar ++
+  regionsTests java jar ++
   [ ("fulltext: words are found (letters and digits, lower-cased; Han, kana and hangul by pairs); an erased note is found no more, and clean leaves its words in no file", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let cfg = (backendCfg (KhanaDatalevinJvm java jar)) { hcClock = clock }

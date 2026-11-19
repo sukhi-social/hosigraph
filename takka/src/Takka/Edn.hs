@@ -41,52 +41,58 @@ data Edn
   deriving (Eq, Show)
 
 -- | Read exactly one form (trailing whitespace/comments allowed).
+--
+-- The reader works on 'Text' directly (no 'String' in between): a string without escapes is a slice of the
+-- input, a plain integer is added up digit by digit, and a token is cut with 'T.break'.  What it accepts and
+-- the messages it gives are those of the 'String' reader it replaced.
 readEdn :: Text -> Either String Edn
 readEdn t = do
-  (e, rest) <- form (skipWs (T.unpack t))
-  case skipWs rest of
-    [] -> Right e
-    r  -> Left ("unexpected trailing input: " ++ take 20 r)
+  (e, rest) <- form (skipWs t)
+  let r = skipWs rest
+  if T.null r then Right e else Left ("unexpected trailing input: " ++ T.unpack (T.take 20 r))
 
 -- | Read zero or more forms.
 readEdnMany :: Text -> Either String [Edn]
-readEdnMany t = go (skipWs (T.unpack t))
-  where go [] = Right []
-        go s  = do (e, rest) <- form s
-                   (e :) <$> go (skipWs rest)
+readEdnMany t = go (skipWs t)
+  where go s | T.null s  = Right []
+             | otherwise = do (e, rest) <- form s
+                              (e :) <$> go (skipWs rest)
 
-type Parser a = String -> Either String (a, String)
+type Parser a = Text -> Either String (a, Text)
 
-skipWs :: String -> String
-skipWs s = case s of
-  (c : cs) | isSpace c || c == ',' -> skipWs cs
-  (';' : cs)                       -> skipWs (dropWhile (/= '\n') cs)
-  ('#' : '_' : cs) ->
-    case form (skipWs cs) of
-      Right (_, rest) -> skipWs rest
-      Left _          -> s        -- let the real parser report the error
-  _ -> s
+skipWs :: Text -> Text
+skipWs s0 =
+  let s = T.dropWhile (\c -> isSpace c || c == ',') s0
+  in case T.uncons s of
+       Just (';', cs)  -> skipWs (T.dropWhile (/= '\n') cs)
+       Just ('#', cs)
+         | Just ('_', cs') <- T.uncons cs ->
+             case form (skipWs cs') of
+               Right (_, rest) -> skipWs rest
+               Left _          -> s        -- let the real parser report the error
+       _ -> s
 
 isDelim :: Char -> Bool
-isDelim c = isSpace c || c `elem` (",()[]{}\";" :: String)
+isDelim c = isSpace c || c == ',' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '"' || c == ';'
 
 form :: Parser Edn
-form s = case s of
-  []          -> Left "unexpected end of input"
-  ('(' : cs)  -> EList <$$> seqUntil ')' cs
-  ('[' : cs)  -> EVec  <$$> seqUntil ']' cs
-  ('{' : cs)  -> do (xs, rest) <- seqUntil '}' cs
-                    ps <- pairUp xs
-                    Right (EMap ps, rest)
-  ('#' : '{' : cs) -> ESet <$$> seqUntil '}' cs
-  ('#' : cs)  -> Left ("unsupported tagged literal: #" ++ takeWhile (not . isDelim) cs)
-  ('"' : cs)  -> str cs
-  (')' : _)   -> Left "unexpected ')'"
-  (']' : _)   -> Left "unexpected ']'"
-  ('}' : _)   -> Left "unexpected '}'"
-  (':' : cs)  -> let (tok, rest) = break isDelim cs
-                 in if null tok then Left "empty keyword" else Right (EKw (T.pack tok), rest)
-  _           -> let (tok, rest) = break isDelim s in Right (atom tok, rest)
+form s = case T.uncons s of
+  Nothing         -> Left "unexpected end of input"
+  Just (c, cs)    -> case c of
+    '(' -> EList <$$> seqUntil ')' cs
+    '[' -> EVec  <$$> seqUntil ']' cs
+    '{' -> do (xs, rest) <- seqUntil '}' cs
+              ps <- pairUp xs
+              Right (EMap ps, rest)
+    '#' | Just ('{', cs') <- T.uncons cs -> ESet <$$> seqUntil '}' cs'
+        | otherwise -> Left ("unsupported tagged literal: #" ++ T.unpack (T.takeWhile (not . isDelim) cs))
+    '"' -> str cs
+    ')' -> Left "unexpected ')'"
+    ']' -> Left "unexpected ']'"
+    '}' -> Left "unexpected '}'"
+    ':' -> let (tok, rest) = T.break isDelim cs
+           in if T.null tok then Left "empty keyword" else Right (EKw tok, rest)
+    _   -> let (tok, rest) = T.break isDelim s in Right (atom tok, rest)
   where
     f <$$> r = fmap (\(x, rest) -> (f x, rest)) r
     pairUp (a : b : r) = ((a, b) :) <$> pairUp r
@@ -96,24 +102,40 @@ form s = case s of
 seqUntil :: Char -> Parser [Edn]
 seqUntil close = go []
   where
-    go acc s = case skipWs s of
-      []                       -> Left ("missing closing " ++ [close])
-      (c : cs) | c == close    -> Right (reverse acc, cs)
-      s'                       -> do (e, rest) <- form s'
+    go acc s0 = let s = skipWs s0 in case T.uncons s of
+      Nothing                  -> Left ("missing closing " ++ [close])
+      Just (c, cs) | c == close -> Right (reverse acc, cs)
+      _                        -> do (e, rest) <- form s
                                      go (e : acc) rest
 
-atom :: String -> Edn
-atom tok = case tok of
-  "nil"   -> ENil
-  "true"  -> EBool True
-  "false" -> EBool False
-  _ | looksNumeric tok -> maybe (ESym (T.pack tok)) id (number tok)
-    | otherwise        -> ESym (T.pack tok)
+atom :: Text -> Edn
+atom tok
+  | tok == "nil"   = ENil
+  | tok == "true"  = EBool True
+  | tok == "false" = EBool False
+  | looksNumeric tok = case plainInt tok of
+      Just n -> EInt n
+      Nothing -> maybe (ESym tok) id (number (T.unpack tok))
+  | otherwise      = ESym tok
 
-looksNumeric :: String -> Bool
-looksNumeric (c : _)        | isDigit c = True
-looksNumeric (s : c : _)    | s `elem` ("+-" :: String), isDigit c = True
-looksNumeric _              = False
+looksNumeric :: Text -> Bool
+looksNumeric t = case T.uncons t of
+  Just (c, _) | isDigit c -> True
+  Just (s, r) | s == '+' || s == '-', Just (c, _) <- T.uncons r, isDigit c -> True
+  _ -> False
+
+-- | @[+-]?[0-9]+@ and nothing else: added up digit by digit (a 'readMaybe' for each integer costs microseconds).
+-- Anything else (a float, an exponent, a stray letter) goes the old way, through 'number'.
+plainInt :: Text -> Maybe Integer
+plainInt t0 =
+  let (neg, ds) = case T.uncons t0 of
+        Just ('-', r) -> (True, r)
+        Just ('+', r) -> (False, r)
+        _             -> (False, t0)
+  in if T.null ds || not (T.all isDigit ds) then Nothing
+     else let v | T.length ds <= 18 = toInteger (T.foldl' (\a c -> a * 10 + (ord c - 48)) (0 :: Int) ds)
+                | otherwise         = T.foldl' (\a c -> a * 10 + toInteger (ord c - 48)) 0 ds
+          in Just (if neg then negate v else v)
 
 number :: String -> Maybe Edn
 number tok0
@@ -123,22 +145,30 @@ number tok0
     tok = case tok0 of ('+' : r) -> r; _ -> tok0
     fixup t = if '.' `elem` t || last t == '.' then t else t
 
+-- | A string.  The text up to the next @"@ or @\\@ is taken in one piece (the whole string, when it has no escape).
 str :: Parser Edn
 str = go []
   where
-    go acc s = case s of
-      []            -> Left "unterminated string"
-      ('"' : cs)    -> Right (EStr (T.pack (reverse acc)), cs)
-      ('\\' : c : cs) -> case c of
-        'n' -> go ('\n' : acc) cs
-        't' -> go ('\t' : acc) cs
-        'r' -> go ('\r' : acc) cs
-        '"' -> go ('"' : acc) cs
-        '\\' -> go ('\\' : acc) cs
-        'u' | (h, rest) <- splitAt 4 cs, length h == 4, all isHexDigit h
-            -> go (chr (foldl (\a d -> a * 16 + digitToInt d) 0 h) : acc) rest
-        _   -> Left ("bad string escape: \\" ++ [c])
-      (c : cs)      -> go (c : acc) cs
+    go acc s =
+      let (chunk, rest) = T.break (\c -> c == '"' || c == '\\') s
+          acc' = if T.null chunk then acc else chunk : acc
+      in case T.uncons rest of
+           Nothing -> Left "unterminated string"
+           Just ('"', cs) -> Right (EStr (finish acc'), cs)
+           Just (_, cs) ->                                   -- a backslash
+             case T.uncons cs of
+               Nothing -> Left "unterminated string"
+               Just (c, cs') -> case c of
+                 'n'  -> go (T.singleton '\n' : acc') cs'
+                 't'  -> go (T.singleton '\t' : acc') cs'
+                 'r'  -> go (T.singleton '\r' : acc') cs'
+                 '"'  -> go (T.singleton '"'  : acc') cs'
+                 '\\' -> go (T.singleton '\\' : acc') cs'
+                 'u' | (h, rest') <- T.splitAt 4 cs', T.length h == 4, T.all isHexDigit h
+                     -> go (T.singleton (chr (T.foldl' (\a d -> a * 16 + digitToInt d) 0 h)) : acc') rest'
+                 _   -> Left ("bad string escape: \\" ++ [c])
+    finish [x] = x
+    finish xs  = T.concat (reverse xs)
 
 -- | Write EDN text that 'readEdn' reads back to the same value (for diagnostics, and for bodies
 -- that are sent on).

@@ -49,10 +49,13 @@ library
     Hosigraph.Manifest
     Hosigraph.Mphf
     Hosigraph.Probe
+    Hosigraph.ReadCache
+    Hosigraph.Regions
     Hosigraph.Sha256
     Hosigraph.Sync
     Hosigraph.Tail
     Hosigraph.WorldLock
+    Hosigraph.WriteQueue
   build-depends:
       base        >=4.20 && <5
     , takka

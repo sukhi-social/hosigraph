@@ -118,7 +118,7 @@ dtlvTransact :: Dtlv -> [DtlvOp] -> IO ()
 dtlvTransact _ [] = pure ()
 dtlvTransact d ops = do
   forms <- either (throwIO . DtlvError) pure (mapM opEdn ops)
-  void (runWith d (Just ("[" <> T.unwords forms <> "]")) ("(" <> transactFn d <> " c data) nil"))
+  void (runWithC True d (Just ("[" <> T.unwords forms <> "]")) ("(" <> transactFn d <> " c data) nil"))
 
 opEdn :: DtlvOp -> Either String Text
 opEdn op = case op of
@@ -128,14 +128,14 @@ opEdn op = case op of
 
 -- | Every attribute and value of one entity, values in index order.
 dtlvEntity :: Dtlv -> EntityId -> IO (M.Map Keyword [Value])
-dtlvEntity d e = entityOf =<< readReply d ("(mapv (fn [x] [(:a x) (:v x)]) (datoms @c :eav " <> T.pack (show e) <> "))")
+dtlvEntity d e = entityOf =<< readReplyC d (Just (T.pack (show e))) "(mapv (fn [x] [(:a x) (:v x)]) (datoms @c :eav data))"
 
 -- | Many entities in one round trip (the answers are in the order asked; a repeated id is asked once
 -- per place it appears).  The ids travel as data, so a long list is read, not compiled.
 dtlvEntities :: Dtlv -> [EntityId] -> IO [M.Map Keyword [Value]]
 dtlvEntities _ [] = pure []
 dtlvEntities d es = do
-  e <- readReplyWith d ("[" <> T.unwords (map (T.pack . show) es) <> "]")
+  e <- readReplyC d (Just ("[" <> T.unwords (map (T.pack . show) es) <> "]"))
          "(mapv (fn [e] (mapv (fn [x] [(:a x) (:v x)]) (datoms @c :eav e))) data)"
   case e of
     EVec xs | length xs == length es -> mapM entityOf xs
@@ -158,8 +158,8 @@ dtlvRetractRanges d ranges extra = do
     gs -> sum <$> forM (zip [1 :: Int ..] gs) (\(n, g) -> do
       let lastGroup = n == length gs
           dat  = "[" <> T.unwords [ "[" <> T.pack (show lo) <> " " <> T.pack (show hi) <> "]" | (lo, hi) <- g ] <> "]"
-          body = "(let [skip " <> derived <> " ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
-                 <> "(remove (fn [x] (contains? skip (:a x))) (take-while (fn [x] (<= (:e x) hi)) (seek-datoms @c :eav lo))))) data))] "
+          body = "(let [skip " <> derived <> " " <> grabFn <> " ops (vec (mapcat (fn [[lo hi]] (map (fn [x] [:db/retract (:e x) (:a x) (:v x)]) "
+                 <> "(remove (fn [x] (contains? skip (:a x))) (grab lo hi)))) data))] "
                  <> (if lastGroup then "(" <> tx <> " c (conj ops " <> extraForm <> "))" else "(when (seq ops) (" <> tx <> " c ops))")
                  <> " (count ops))"
       r <- readReplyWith d dat body
@@ -168,6 +168,20 @@ dtlvRetractRanges d ranges extra = do
         _      -> bad ("a count of retracted facts: " ++ T.unpack (T.take 200 (renderEdn r))))
   where
     tx = transactFn d
+    -- The facts of the ids lo..hi, a page at a time.  @seek-datoms@ without a count makes every fact after @lo@ before
+    -- @take-while@ sees one (162 ms for one range in 20,000 entities, 0.4 ms with a count, and the heap grows with it:
+    -- the same trap 'dtlvDatomPage' tells of), so the count is given: a page is read, and it stops at the first fact
+    -- past @hi@ or at the end of the data.  A full page may end inside an entity: that entity goes to the next page,
+    -- which starts at it; one entity with more facts than a page makes the page twice as big.  Pages grow as long as the
+    -- range goes on.
+    grabFn = T.unwords
+      [ "grab (fn [lo hi] (loop [from lo n 512 out []]"
+      , "(let [xs (vec (seek-datoms @c :eav from nil nil n))"
+      , "inr (vec (take-while (fn [x] (<= (:e x) hi)) xs))]"
+      , "(if (or (< (count inr) (count xs)) (< (count xs) n))"
+      , "(into out inr)"
+      , "(let [le (:e (peek inr)) whole (vec (take-while (fn [x] (< (:e x) le)) inr))]"
+      , "(if (empty? whole) (recur from (* 2 n) out) (recur le (min 8192 (* 2 n)) (into out whole))))))))" ]
     -- a tuple is made by the khana from its parts: it goes when they go, and Datalevin refuses to take it out by itself
     derived = "#{" <> T.unwords [ ednKw k | (k, a) <- M.toList (dtlvSchema d), not (null (asTuple a)) ] <> "}"
     groupsOf _ [] = []
@@ -265,15 +279,19 @@ dtlvDatomPage d lo n0 = go (max 1 n0)
 -- its bytes); an attribute with no declared type is in no order anyone could use, and the caller refuses it.
 dtlvHighest :: Dtlv -> Keyword -> Maybe (Value, EntityId) -> Int -> IO [Datom]
 dtlvHighest d a cur n0 = do
-  (from, skip, m0) <- case cur of
-    Nothing     -> pure ("nil", "(fn [_] false)", n)
+  (from, skipE, m0) <- case cur of
+    Nothing     -> pure ("nil", "nil", n)
     Just (v, e) -> do
       vt <- either bad pure (ednVal v)
-      pure (vt, "(fn [x] (and (= (:v x) " <> vt <> ") (>= (:e x) " <> T.pack (show e) <> ")))", n + 1)
-  rows <- asRows =<< readReply d (T.unwords
-    [ "(let [db @c skip? " <> skip <> " n " <> T.pack (show n) <> "]"
-    , "(loop [m " <> T.pack (show m0) <> "]"
-    , "(let [rows (vec (rseek-datoms db :ave " <> ednKw a <> " " <> from <> " nil m))"
+      pure (vt, T.pack (show e), n + 1)
+  -- the body is the same text at every call (what changes travels as data), so the resident JVM compiles it once
+  rows <- asRows =<< readReplyC d
+    (Just ("{:a " <> ednKw a <> " :from " <> from <> " :e " <> skipE <> " :n " <> T.pack (show n) <> " :m0 " <> T.pack (show m0) <> "}"))
+    (T.unwords
+    [ "(let [{:keys [a from e n m0]} data db @c"
+    , "skip? (if e (fn [x] (and (= (:v x) from) (>= (:e x) e))) (fn [_] false))]"
+    , "(loop [m m0]"
+    , "(let [rows (vec (rseek-datoms db :ave a from nil m))"
     , "kept (vec (drop-while skip? rows))]"
     , "(if (or (>= (count kept) n) (< (count rows) m))"
     , "(mapv (fn [x] [(:e x) (:a x) (:v x)]) (take n kept))"
@@ -309,8 +327,10 @@ dtlvHighestIn d a keys cur n0 = do
     Just (v, e) -> do
       vt <- either bad pure (ednVal v)
       pure (vt, T.pack (show e))
-  rows <- asRows =<< readReply d (T.unwords
-    [ "(let [db @c a " <> ednKw a <> " n " <> T.pack (show n) <> " hi0 " <> hi <> " skip0 " <> skipE
+  rows <- asRows =<< readReplyC d
+    (Just ("{:a " <> ednKw a <> " :n " <> T.pack (show n) <> " :hi " <> hi <> " :skip " <> skipE <> " :ks [" <> ks <> "]}"))
+    (T.unwords
+    [ "(let [db @c {:keys [a n ks]} data hi0 (:hi data) skip0 (:skip data)"
     , "desc (fn [x y] (compare [(nth y 0) (nth y 1)] [(nth x 0) (nth x 1)]))"
     , "head (fn [k hi skip-e]"
     , "(loop [m 2]"
@@ -320,7 +340,7 @@ dtlvHighestIn d a keys cur n0 = do
     , "x nil"
     , "(< (count rs) m) nil"
     , ":else (recur (* 2 m))))))]"
-    , "(loop [pq (into (sorted-set-by desc) (keep (fn [k] (head k hi0 skip0)) (distinct [" <> ks <> "]))) out []]"
+    , "(loop [pq (into (sorted-set-by desc) (keep (fn [k] (head k hi0 skip0)) (distinct ks))) out []]"
     , "(if (or (= (count out) n) (empty? pq))"
     , "out"
     , "(let [top (first pq) [o e k] top nx (head k o e) pq (disj pq top)]"
@@ -342,8 +362,8 @@ dtlvDatomCount d = do
 -- A map in a cell is a pull result.  'InRules' cannot be sent (see below).
 dtlvQueryCells :: Dtlv -> Text -> [Input] -> IO [[Cell]]
 dtlvQueryCells d txt inputs = do
-  (shape, call) <- prepareQuery "@c" txt inputs
-  e     <- readReply d call
+  (shape, dat, body) <- prepareQueryD txt inputs
+  e     <- readReplyC d (Just dat) body
   rows  <- either (throwIO . DtlvError) pure (shapeRows shape e)
   forM rows (mapM cell)
 
@@ -365,6 +385,17 @@ prepareQuery dbName txt inputs = do
   shape <- either (throwIO . DtlvError . ("query: " ++)) (pure . qShape) (readEdn txt >>= parseQuery)
   args  <- either (throwIO . DtlvError) pure (mapM inputEdn inputs)
   pure (shape, "(q '" <> txt <> " " <> dbName <> T.concat (map (" " <>) args) <> ")")
+
+-- | 'prepareQuery' for one query against @c@: the code is the same for the same query text, and the inputs go as
+-- data, so the resident JVM compiles it once.
+prepareQueryD :: Text -> [Input] -> IO (FindShape, Text, Text)
+prepareQueryD txt inputs = do
+  shape <- either (throwIO . DtlvError . ("query: " ++)) (pure . qShape) (readEdn txt >>= parseQuery)
+  args  <- either (throwIO . DtlvError) pure (mapM inputEdn inputs)
+  -- @q@ stays in the call position, with each input as @(nth data i)@: the native @dtlv exec@ takes @q@ only there
+  -- (@(apply q ...)@ or @(let [f q] ...)@ is "Unable to resolve symbol: q"), and the text is still the same for the
+  -- same query and the same number of inputs.
+  pure (shape, "[" <> T.unwords args <> "]", "(q '" <> txt <> " @c" <> T.concat [ " (nth data " <> T.pack (show i) <> ")" | i <- [0 .. length args - 1] ] <> ")")
 
 cell :: Edn -> IO Cell
 cell x = case x of
@@ -446,9 +477,16 @@ run d = runWith d Nothing
 -- | Like 'run', with some EDN data the body sees as @data@.  (Under the native @dtlv@ it is written
 -- into the code; with the resident JVM it travels as data, so a big one is not compiled.)
 runWith :: Dtlv -> Maybe Text -> Text -> IO Text
-runWith d dat body = case dtlvRunner d of
+runWith = runWithC False
+
+-- | 'runWith' for a body whose text is the same at every call (what changes travels as @data@).  The resident JVM
+-- compiles such a body once and keeps the function; Clojure's @eval@ makes new classes at every call, and that was most
+-- of what a small call cost (1.5 ms against 0.05 ms for the same work in a function compiled before).  The native
+-- @dtlv@ runs a script and has nothing to keep, so it ignores the flag.
+runWithC :: Bool -> Dtlv -> Maybe Text -> Text -> IO Text
+runWithC cached d dat body = case dtlvRunner d of
   Native exe  -> runNative exe d dat body
-  Resident sc -> runResident sc d dat body
+  Resident sc -> runResident cached sc d dat body
 
 runNative :: FilePath -> Dtlv -> Maybe Text -> Text -> IO Text
 runNative exe d dat body = do
@@ -462,8 +500,8 @@ runNative exe d dat body = do
     _ -> throwIO (DtlvError ("an answer we did not expect (" ++ describe code ++ "): " ++ T.unpack (T.take 400 (outT <> errT))))
   where describe code = "exit " ++ show (code :: ExitCode)
 
-runResident :: Sidecar -> Dtlv -> Maybe Text -> Text -> IO Text
-runResident sc d dat body = do
+runResident :: Bool -> Sidecar -> Dtlv -> Maybe Text -> Text -> IO Text
+runResident cached sc d dat body = do
   line <- sidecarRequest sc request `catch` \(SidecarError m) -> throwIO (DtlvError m)
   case readEdn (tameEdn line) of
     Right (EMap kvs)
@@ -476,7 +514,7 @@ runResident sc d dat body = do
       [] -> ""
       ks -> " :search [" <> T.unwords [ ednStr (kwText k) | k <- ks ] <> "]"
     request = "{:dir " <> ednStr (T.pack (dtlvDir d)) <> " :schema " <> ednStr (schemaEdn (dtlvSchema d))
-              <> " :opts " <> walOpts <> search <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> "}"
+              <> " :opts " <> walOpts <> search <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> (if cached then " :cache true" else "") <> "}"
 
 -- | Run a body and read its value as EDN.
 readReply :: Dtlv -> Text -> IO Edn
@@ -489,6 +527,12 @@ readReplyWith d dat = readReplyWith' d (Just dat)
 readReplyWith' :: Dtlv -> Maybe Text -> Text -> IO Edn
 readReplyWith' d dat body = do
   s <- runWith d dat body
+  either (\m -> bad ("cannot read dtlv's answer: " ++ m)) pure (readEdn (tameEdn s))
+
+-- | 'readReplyWith'' for a body that does not change from call to call (see 'runWithC').
+readReplyC :: Dtlv -> Maybe Text -> Text -> IO Edn
+readReplyC d dat body = do
+  s <- runWithC True d dat body
   either (\m -> bad ("cannot read dtlv's answer: " ++ m)) pure (readEdn (tameEdn s))
 
 asRows :: Edn -> IO [[Edn]]
