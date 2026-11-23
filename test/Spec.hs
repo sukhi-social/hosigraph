@@ -11,6 +11,7 @@ import           Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import           Data.Bits (xor)
+import           Data.Char (isAlphaNum, toLower)
 import           Data.IORef
 import           Data.Int (Int64)
 import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate)
@@ -112,15 +113,18 @@ runTests = do
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
       nativeRun = case mexe of
-        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ formatHosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ nativeTests exe)
+        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ formatHosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ wordsTests (KhanaDtlv exe) ++ nativeTests exe)
+        Nothing  -> []
+      replRun = case mexe of
+        Just exe -> tag "[dtlv-repl]" (hosiTests (KhanaDtlvRepl exe) ++ formatHosiTests (KhanaDtlvRepl exe) ++ dtlvTests (KhanaDtlvRepl exe) ++ wordsTests (KhanaDtlvRepl exe) ++ replTests exe)
         Nothing  -> []
       jvmRun = case mjar of
-        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
+        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ wordsTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
         Nothing  -> []
       mixedRun = case (mexe, mjar) of
         (Just exe, Just jar) -> tag "[dtlv+jvm]" (mixedTests exe java jar)
         _                    -> []
-      dtlvRun = nativeRun ++ jvmRun ++ mixedRun
+      dtlvRun = nativeRun ++ replRun ++ jvmRun ++ mixedRun
   when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
   -- HOSIGRAPH_TEST_ONLY=text runs only the tests whose name has that text in it (for trying one thing; a full run is the one that counts)
@@ -3601,11 +3605,148 @@ nativeTests exe =
       check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
   ]
 
+-- | Only the resident native @dtlv repl@ ('KhanaDtlvRepl').
+replTests :: FilePath -> [Test]
+replTests exe =
+  -- what the JVM runs and the one-process dtlv does not (the write queue and the regions), run on the repl as it is
+  writeQueueTests (KhanaDtlvRepl exe) ++
+  regionsTests (KhanaDtlvRepl exe) ++
+  [ ("the repl stays up: a hundred operations cost no more processes than the first few", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let counter = dir </> "calls"
+          wrapper = dir </> "dtlv-counting.sh"
+          cfg = (backendCfg (KhanaDtlvRepl wrapper)) { hcClock = clock }
+      writeFile wrapper ("#!/bin/sh\necho x >> " ++ show counter ++ "\nexec " ++ show exe ++ " \"$@\"\n")
+      callProcess "chmod" ["+x", wrapper]
+      let calls = (do s <- readFile counter; let n = length (lines s) in n `seq` pure n) `catch` \(_ :: IOException) -> pure (0 :: Int)
+      h <- openHosiWith cfg (dir </> "db") schema
+      ids <- forM [1 .. 50 :: Integer] (\i -> person h (T.pack ("p" ++ show i)) (20 + i))
+      n1 <- calls
+      check ("the look at open and the one repl: at most two processes, not " ++ show n1) (n1 <= 2)
+      forM_ ids $ \i -> ageOf h i
+      _ <- getEntities h ids
+      _ <- queryMany h [ (t, []) | t <- diffQueries ]
+      n2 <- calls
+      checkEq "fifty writes and as many reads later: the same processes" n1 n2
+      closeHosi h)
+
+  , ("values that look like the repl's own words: newlines, the prompt, a lone paren, unicode, a thousand characters", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith ((backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }) dir schema
+      let names = [ "a\nuser> b", "user> ", "\nuser> ", ")))", "\"quoted\" ; not a comment", "日本語 한국어 😀", T.replicate 1000 "x\n" ]
+      ids <- forM (zip names [1 ..]) (\(n, i) -> person h n i)
+      es <- getEntities h ids
+      checkEq "every name comes back as it went in" (map (\n -> Just [VStr n]) names) (map (M.lookup "person/name") es)
+      checkEq "verify" [] =<< verify h
+      closeHosi h)
+
+  , ("a big batch goes through the repl's one line: twenty thousand facts in one write", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith ((backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }) dir schema
+      r <- write h (concat [ [ Create (Tmp i) "person/name" (Lit (VStr (T.pack ("big" ++ show i)))), Create (Tmp i) "person/age" (Lit (VInt (fromIntegral i))) ] | i <- [1 .. 10000] ])
+      check "all the temps got ids" (M.size (wrTemps r) == 10000)
+      checkEq "one of them" (Just [VInt 777]) =<< ageOf h (wrTemps r M.! 777)
+      checkEq "verify" [] =<< verify h
+      closeHosi h)
+
+  , ("the repl dies: the call that met it fails, the next one starts a new one and nothing is lost", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let pidFile = dir </> "repl.pid"
+          wrapper = dir </> "dtlv-wrapper.sh"
+      writeFile wrapper ("#!/bin/sh\necho $$ >> " ++ show pidFile ++ "\nexec " ++ show exe ++ " \"$@\"\n")
+      callProcess "chmod" ["+x", wrapper]
+      h <- openHosiWith ((backendCfg (KhanaDtlvRepl wrapper)) { hcClock = clock }) (dir </> "db") schema
+      a <- person h "Frege" 70
+      pids <- lines <$> readFile pidFile
+      callProcess "kill" ["-9", last pids]                                       -- the repl is the last process started
+      r <- try (person h "Peirce" 75) :: IO (Either SomeException HosiId)
+      check "the call that met the dead repl fails" (either (const True) (const False) r)
+      b <- person h "Boole" 49                                                   -- a new repl
+      checkEq "Frege survived" (Just [VInt 70]) =<< ageOf h a
+      checkEq "Boole is in" (Just [VInt 49]) =<< ageOf h b
+      checkEq "verify" [] =<< verify h
+      closeHosi h)
+
+  , ("the khana has a write-ahead log, as under the JVM: an erased value is in txlog/ until clean, and in no file after it", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      h <- openHosiWith ((backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }) dir schema
+      _ <- person h (T.pack (marker 1)) 1
+      b <- person h (T.pack (marker 2)) 2
+      check "the khana's txlog directory is there" =<< doesDirectoryExist (dir </> "khana-dtlv" </> "txlog")
+      _ <- erase h [EraseIds [b]]
+      check "erased, not cleaned: the value is still in the khana's log" . (> 0) =<< markerCount (BC.pack (marker 2)) (dir </> "khana-dtlv" </> "txlog")
+      _ <- clean h defaultCleanOptions
+      checkEq "cleaned: it is in no file" 0 =<< markerCount (BC.pack (marker 2)) dir
+      check "the other one is" . (> 0) =<< markerCount (BC.pack (marker 1)) dir
+      closeHosi h)
+
+  , ("the repl is killed after a run of writes (no close): the next open finds the khana whole, or behind the tail and catches up", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let pidFile = dir </> "repl.pid"
+          wrapper = dir </> "dtlv-wrapper.sh"
+          cfg = (backendCfg (KhanaDtlvRepl wrapper)) { hcClock = clock }
+      writeFile wrapper ("#!/bin/sh\necho $$ >> " ++ show pidFile ++ "\nexec " ++ show exe ++ " \"$@\"\n")
+      callProcess "chmod" ["+x", wrapper]
+      h <- openHosiWith cfg (dir </> "db") schema
+      ids <- forM [1 .. 30 :: Integer] (\i -> person h (T.pack ("p" ++ show i)) (100 + i))
+      pids <- lines <$> readFile pidFile
+      callProcess "kill" ["-9", last pids]
+      closeHosi h `catch` \(_ :: SomeException) -> pure ()
+      h2 <- openHosiWith cfg (dir </> "db") schema
+      checkEq "every one of the thirty is in the khana" (map (\i -> Just [VInt (100 + i)]) [1 .. 30]) =<< mapM (ageOf h2) ids
+      checkEq "verify" [] =<< verify h2
+      closeHosi h2)
+
+  , ("a dtlv that cannot start gives an error with its last words, and does not hang", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let fake = dir </> "not-dtlv.sh"
+      writeFile fake "#!/bin/sh\necho 'no thanks' >&2\nexit 3\n"
+      callProcess "chmod" ["+x", fake]
+      r <- try (openHosiWith ((backendCfg (KhanaDtlvRepl fake)) { hcClock = clock }) (dir </> "db") schema) :: IO (Either SomeException Hosi)
+      case r of
+        Left e  -> check ("the message tells what dtlv said: " ++ show e) ("no thanks" `isInfixOf` show e)
+        Right h -> closeHosi h >> throwIO (userError "it should not have opened"))
+
+  , ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      r <- try (openHosiWith ((backendCfg (KhanaDtlvRepl "/no/such/dtlv")) { hcClock = clock }) dir schema) :: IO (Either HosiError Hosi)
+      check "a missing dtlv is BackendMissing" (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
+      checkEq "...and no database directory was made" False =<< doesDirectoryExist (dir </> "events"))
+
+  , ("fulltext: refused like the one-process dtlv, before anything is made", withTmp $ \dir -> do
+      r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlvRepl exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
+             :: IO (Either HosiError Hosi)
+      check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
+
+  , ("one khana-dtlv/, two ways in: written through the repl, read through dtlv, and back", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let open be = openHosiWith ((backendCfg be) { hcClock = clock }) dir schema
+      h1 <- open (KhanaDtlvRepl exe)
+      a <- person h1 "Frege" 70
+      closeHosi h1
+      h2 <- open (KhanaDtlv exe)
+      checkEq "dtlv reads what the repl wrote" (Just [VInt 70]) =<< ageOf h2 a
+      b <- person h2 "Peirce" 75
+      closeHosi h2
+      h3 <- open (KhanaDtlvRepl exe)
+      checkEq "the repl reads what dtlv wrote" (Just [VInt 75]) =<< ageOf h3 b
+      checkEq "verify" [] =<< verify h3
+      closeHosi h3)
+
+  , ("max and min in :find work through the repl (the 1.2.11 interpreter)", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      withHosiCfg ((backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }) dir $ \h -> do
+        _ <- person h "Frege" 70
+        _ <- person h "Peirce" 75
+        checkEq "max" [[VInt 75]] =<< query h "[:find (max ?a) . :where [?e :person/age ?a]]" []
+        checkEq "min" [[VInt 70]] =<< query h "[:find (min ?a) . :where [?e :person/age ?a]]" [])
+  ]
+
 -- | Only the resident JVM.
-regionsTests :: FilePath -> FilePath -> [Test]
-regionsTests java jar =
+regionsTests :: KhanaBackend -> [Test]
+regionsTests be =
   [ ("regions: each name is its own world; what is written in one is not in another, it is all there after a restart, and the names on disk are known", withTmp $ \dir -> do
-      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+      let cfg = defaultRegionsConfig dir (backendCfg be) sch
           names = ["alpha", "beta", "gamma", "delta", "eps.1_x-2"] :: [T.Text]
       rg <- newRegions cfg
       forM_ (zip [1 ..] names) $ \(n, nm) -> do
@@ -3624,7 +3765,7 @@ regionsTests java jar =
       checkEq "one opened after the restart" 1 (rsOpened st)
       closeRegions rg2)
   , ("regions: a name that cannot be a directory is refused, and nothing on disk is touched", withTmp $ \dir -> do
-      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+      let cfg = defaultRegionsConfig dir (backendCfg be) sch
       rg <- newRegions cfg
       forM_ ["", "..", ".", "a/b", ".hidden", "a b", "x\\y", T.replicate 65 "a"] $ \nm -> do
         r <- withRegion rg nm (\_ -> pure ())
@@ -3632,7 +3773,7 @@ regionsTests java jar =
       checkEq "nothing was made" [] =<< SD.listDirectory dir
       closeRegions rg)
   , ("regions: at the limit the one used longest ago is closed and comes back with its data; when every open region is in use the answer is TooManyBusy and nothing is closed", withTmp $ \dir -> do
-      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgMaxOpen = 2 }
+      let cfg = (defaultRegionsConfig dir (backendCfg be) sch) { rgMaxOpen = 2 }
       rg <- newRegions cfg
       forM_ (zip [1 ..] ["a", "b", "c"] :: [(Int64, T.Text)]) $ \(n, nm) -> withRegion rg nm (\h -> write h (note n))
       checkEq "a was closed to make room" ["b", "c"] . sort =<< openRegionNames rg
@@ -3648,7 +3789,7 @@ regionsTests java jar =
       check "the advice tells of it" (any ("TooManyBusy" `L.isInfixOf`) (regionsAdvice cfg st2))
       closeRegions rg)
   , ("regions: a region that cannot be opened is answered OpenFailed and the others go on", withTmp $ \dir -> do
-      let cfg = defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch
+      let cfg = defaultRegionsConfig dir (backendCfg be) sch
       writeFile (dir </> "bad") "a file where the directory of the region should be"
       rg <- newRegions cfg
       r <- withRegion rg "bad" (\_ -> pure ())
@@ -3660,7 +3801,7 @@ regionsTests java jar =
       check "the advice tells of it" (any ("failed to open" `L.isInfixOf`) (regionsAdvice cfg st))
       closeRegions rg)
   , ("regions: pinned, a region is not closed to make room; let go, it can be", withTmp $ \dir -> do
-      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgMaxOpen = 1 }
+      let cfg = (defaultRegionsConfig dir (backendCfg be) sch) { rgMaxOpen = 1 }
       rg <- newRegions cfg
       Right (_, unpin) <- pinRegion rg "a"
       r <- withRegion rg "b" (\_ -> pure ())
@@ -3672,8 +3813,8 @@ regionsTests java jar =
       closeRegions rg
       r3 <- withRegion rg "a" (\_ -> pure ())
       check "closed: RegionsClosed" (case r3 of Left RegionsClosed -> True; _ -> False))
-  , ("regions: spread over two JVMs, each region is still its own world", withTmp $ \dir -> do
-      let cfg = (defaultRegionsConfig dir (backendCfg (KhanaDatalevinJvm java jar)) sch) { rgJvms = 2 }
+  , ("regions: spread over two resident processes, each region is still its own world", withTmp $ \dir -> do
+      let cfg = (defaultRegionsConfig dir (backendCfg be) sch) { rgJvms = 2 }
           names = ["r1", "r2", "r3", "r4"] :: [T.Text]
       rg <- newRegions cfg
       forM_ (zip [1 ..] names) $ \(n, nm) -> withRegion rg nm (\h -> write h (note n))
@@ -3686,10 +3827,10 @@ regionsTests java jar =
     sch = M.fromList [ ("note/n", attr TLong) ]
     note n = [Create (Tmp 1) "note/n" (Lit (VInt n))]
 
-writeQueueTests :: FilePath -> FilePath -> [Test]
-writeQueueTests java jar =
+writeQueueTests :: KhanaBackend -> [Test]
+writeQueueTests be =
   [ ("write queue: many writers at once; each gets its own answer and its own id, every write is in the events and in the khana, and the trips are fewer than the writes", withTmp $ \dir -> do
-      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+      let cfg = backendCfg be
           sch = M.fromList [ ("note/n", attr TLong), ("note/by", attr TString) ]
           note n = [Create (Tmp 1) "note/n" (Lit (VInt (fromIntegral (n :: Int)))), Create (Tmp 1) "note/by" (Lit (VStr "x"))]
           writers = 16; per = 10
@@ -3723,7 +3864,7 @@ writeQueueTests java jar =
       check "a closed room answers Closed" (case r of Closed -> True; _ -> False)
       closeHosi h)
   , ("write queue: a room that is full answers Busy and takes nothing; the advice says so, and says nothing when all is well", withTmp $ \dir -> do
-      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+      let cfg = backendCfg be
           sch = M.fromList [ ("note/n", attr TLong) ]
           note = [Create (Tmp 1) "note/n" (Lit (VInt 1))]
       h <- openHosiWith cfg dir sch
@@ -3744,7 +3885,7 @@ writeQueueTests java jar =
       closeWriteQueue q
       closeHosi h)
   , ("write queue: a trip that fails is answered Crashed with a reason, the caller is not left waiting, and the advice tells of it", withTmp $ \dir -> do
-      let cfg = backendCfg (KhanaDatalevinJvm java jar)
+      let cfg = backendCfg be
           sch = M.fromList [ ("note/n", attr TLong) ]
           note = [Create (Tmp 1) "note/n" (Lit (VInt 1))]
       h <- openHosiWith cfg dir sch
@@ -3764,8 +3905,8 @@ writeQueueTests java jar =
 
 jvmTests :: FilePath -> FilePath -> [Test]
 jvmTests java jar =
-  writeQueueTests java jar ++
-  regionsTests java jar ++
+  writeQueueTests (KhanaDatalevinJvm java jar) ++
+  regionsTests (KhanaDatalevinJvm java jar) ++
   [ ("fulltext: words are found (letters and digits, lower-cased; Han, kana and hangul by pairs); an erased note is found no more, and clean leaves its words in no file", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let cfg = (backendCfg (KhanaDatalevinJvm java jar)) { hcClock = clock }
@@ -3952,3 +4093,184 @@ copyDir from to = do
   forM_ names $ \n -> do
     isDir <- doesDirectoryExist (from </> n)
     if isDir then copyDir (from </> n) (to </> n) else copyFile (from </> n) (to </> n)
+
+-- ---------------------------------------------------------------------------
+-- Words made by a tokenizer of the host (the tokenizer for Japanese is an example of its own: example/hosi-mikke)
+
+-- | A tokenizer made for the tests, with no program behind it: the words of a text are its runs of letters and digits in lower case,
+-- and, if it is to, a plural "s" is cut off a word of more than three letters ("cats" and "cat" are one word).  A text with "boom" in it
+-- makes it throw.  It gives back how many times it was closed.
+toyTokenizer :: T.Text -> Bool -> IO (Tokenizer, IORef Int)
+toyTokenizer mark cutPlural = do
+  closes <- newIORef 0
+  let wordsOf t = T.unwords [ cut w | w <- T.words (T.map (\c -> if isAlphaNum c then toLower c else ' ') t) ]
+      cut w = if cutPlural && T.length w > 3 && T.last w == 's' then T.init w else w
+      make ts | any ("boom" `T.isInfixOf`) ts = throwIO (userError "boom")
+              | otherwise                      = pure (map wordsOf ts)
+  pure (Tokenizer { tkMark = mark, tkWords = make, tkClose = modifyIORef' closes (+ 1) }, closes)
+
+-- | Fulltext attributes whose words a tokenizer of the host makes, on a khana of any backend.
+wordsTests :: KhanaBackend -> [Test]
+wordsTests be =
+  [ ("words: a tokenizer makes the words of a fulltext attribute (found by them, not as written); a changed or erased value is found no more, and clean leaves its words in no file", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      (tk, closes) <- toyTokenizer "toy/1" True
+      let cfg = (backendCfg be) { hcClock = clock, hcTokenizer = Just tk }
+          sch = M.fromList [ ("note/body", fulltext (attr TString)), ("note/by", attr TString) ]
+          search h q = sort <$> query h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]" [InScalar (VStr q)]
+          note h t = (\r -> wrTemps r M.! 1) <$> write h [Create (Tmp 1) "note/body" (Lit (VStr t)), Create (Tmp 1) "note/by" (Lit (VStr "x"))]
+          ids = map (\i -> [VInt (fromIntegral i)])
+      h <- openHosiWith cfg dir sch
+      cats   <- note h "Cats sleep all day"
+      dog    <- note h "A dog barks at night"
+      ver    <- note h "Version 3.10 released"
+      secret <- note h "The password is swordfish"
+      checkEq "a word as the tokenizer made it: cat finds Cats" (ids [cats]) =<< search h "cat"
+      checkEq "a search text is made into words by it, too: CATS finds Cats" (ids [cats]) =<< search h "CATS"
+      checkEq "barks, bark" (ids [dog]) =<< search h "bark"
+      checkEq "a number" (ids [ver]) =<< search h "3"
+      checkEq "a word that is nowhere" [] =<< search h "unicorn"
+      checkEq "the text may be written in the query" (ids [cats])
+        =<< (sort <$> query h "[:find ?e :where [(fulltext $ :note/body \"cats\") [[?e ?a ?v]]]]" [])
+      checkEq "with no attribute, every fulltext attribute is searched" (ids [cats])
+        =<< (sort <$> query h "[:find ?e :in $ ?q :where [(fulltext $ ?q) [[?e _ _]]]]" [InScalar (VStr "cats")])
+      checkEq "several words: all of them must be there (cat and day are in one note, day and night in none)" (ids [cats]) =<< search h "cat day"
+      checkEq "...and a note that has one of them is not found" [] =<< search h "day night"
+      checkEq "the other attribute is not searched" [] =<< search h "x"
+      -- the text is kept as written: the words are beside it
+      ent <- getEntity h cats
+      checkEq "the attribute has the text as written" (Just [VStr "Cats sleep all day"]) (M.lookup "note/body" ent)
+      check "...and its words are in another attribute" (M.member "note/body.words" ent)
+      checkEq "verify" [] =<< verify h
+      -- it follows the data: a value taken out is not found, a new one is
+      _ <- write h [Delete (Id cats) "note/body" (Lit (VStr "Cats sleep all day")), Create (Id cats) "note/body" (Lit (VStr "Birds sing"))]
+      checkEq "the old words of a changed value are gone" [] =<< search h "sleep"
+      checkEq "...and the new ones are there" (ids [cats]) =<< search h "sing"
+      -- a value taken out and nothing put in its place (a new value would replace the words by itself: this is the Delete alone)
+      gone <- note h "An elephant has a trunk"
+      checkEq "(found before)" (ids [gone]) =<< search h "elephant"
+      _ <- write h [Delete (Id gone) "note/body" (Lit (VStr "An elephant has a trunk"))]
+      checkEq "a value taken out is found no more" [] =<< search h "elephant"
+      -- a note with no words, and then with some: the old words do not stay
+      empty <- note h ""
+      _ <- write h [Delete (Id empty) "note/body" (Lit (VStr "")), Create (Id empty) "note/body" (Lit (VStr "rain"))]
+      checkEq "a text that had no words, and now has" (ids [empty]) =<< search h "rain"
+      -- an erased note is not found, and after clean its words are in no file
+      before <- markerCount (TE.encodeUtf8 "swordfish") dir
+      check "(the words are in some file before an erase)" (before > 0)
+      _ <- erase h [EraseIds [secret]]
+      checkEq "an erased note is not found" [] =<< search h "swordfish"
+      rep <- clean h defaultCleanOptions
+      check "clean made the khana again, as it must for an index of words" (crKhanaCleaned rep && crKhanaRebuilt rep)
+      checkEq "its words are in no file" 0 =<< markerCount (TE.encodeUtf8 "swordfish") dir
+      checkEq "the others are still found" (ids [dog]) =<< search h "bark"
+      checkEq "verify after clean" [] =<< verify h
+      -- closing the world closes the tokenizer it made the runtime with
+      checkEq "(not closed yet)" 0 =<< readIORef closes
+      closeHosi h
+      checkEq "closeHosi closed the tokenizer" 1 =<< readIORef closes
+      -- opened again with the same tokenizer (the same mark): the khana is kept, not made again
+      h2 <- openHosiWith cfg dir sch
+      checkEq "found after a reopen" (ids [dog]) =<< search h2 "bark"
+      closeHosi h2
+      -- another mark is other words (here: the plural stays), so another khana, made again from the events
+      (tk2, _) <- toyTokenizer "toy/2" False
+      h3 <- openHosiWith (cfg { hcTokenizer = Just tk2 }) dir sch
+      checkEq "the plural stays now: barks finds it" (ids [dog]) =<< search h3 "barks"
+      checkEq "...and bark does not" [] =<< search h3 "bark"
+      closeHosi h3
+      -- no tokenizer: the schema is a fulltext one, and only the JVM has an analyzer of its own
+      r <- try (openHosiWith (cfg { hcTokenizer = Nothing }) dir sch) :: IO (Either HosiError Hosi)
+      case be of
+        KhanaDatalevinJvm _ _ -> either (const (pure ())) closeHosi r
+        _ -> check "without a tokenizer the native dtlv refuses a fulltext attribute" (case r of Left (SchemaRefused _) -> True; _ -> False))
+
+  , ("words: a search of several words finds what has all of them (of the best :top by relevance, those that have every word)", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      (tk, _) <- toyTokenizer "toy/1" True
+      let sch = M.fromList [ ("note/body", fulltext (attr TString)), ("note/by", attr TString) ]
+          ask h qtxt t = sort <$> query h qtxt [InScalar (VStr t)]
+          search h = ask h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]"
+          note h t = (\r -> wrTemps r M.! 1) <$> write h [Create (Tmp 1) "note/body" (Lit (VStr t)), Create (Tmp 1) "note/by" (Lit (VStr "x"))]
+          ids = sort . map (\i -> [VInt (fromIntegral i)])
+      h <- openHosiWith ((backendCfg be) { hcClock = clock, hcTokenizer = Just tk }) dir sch
+      d1 <- note h "Cats sleep all day"          -- cat sleep all day
+      d2 <- note h "A dog barks at night"        -- a dog bark at night
+      d3 <- note h "Cats chase dogs at night"    -- cat chase dog at night
+      d4 <- note h "Day night day night"
+      d5 <- note h "Dogs bark all night"         -- dog bark all night
+      d6 <- note h "Dogma of the night"          -- dogma: not the word dog
+      let dogNight = ids [d2, d3, d5]
+      checkEq "one word is what it was: every note that has it" (ids [d2, d3, d4, d5, d6]) =<< search h "night"
+      checkEq "two words: the notes that have both" dogNight =<< search h "dog night"
+      checkEq "...in any order" dogNight =<< search h "night dog"
+      checkEq "...a word said twice is one word" dogNight =<< search h "dog DOGS night"
+      checkEq "...made into words as the tokenizer does (dogs is dog)" dogNight =<< search h "dogs night"
+      checkEq "a word is a word, not the start of one (dogma is not dog)" [] =<< search h "dogma dog"
+      checkEq "three words" (ids [d3]) =<< search h "cat chase night"
+      checkEq "a word that is nowhere" [] =<< search h "cat unicorn"
+      checkEq "a word that the analyzer of the search drops (at) is still asked for" (ids [d2, d3]) =<< search h "dog at night"
+      -- the same, with the text written in the query, with no attribute, with a short binding, beside other clauses
+      checkEq "the text written in the query" dogNight
+        =<< (sort <$> query h "[:find ?e :where [(fulltext $ :note/body \"dogs night\") [[?e ?a ?v]]]]" [])
+      checkEq "no attribute: every fulltext attribute is searched" dogNight
+        =<< ask h "[:find ?e :in $ ?q :where [(fulltext $ ?q) [[?e _ _]]]]" "dog night"
+      checkEq "a binding of ?e only" dogNight
+        =<< ask h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e]]]]" "dog night"
+      checkEq "beside another clause" dogNight
+        =<< ask h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]] [?e :note/by \"x\"]]" "dog night"
+      checkEq "two searches in one query" (ids [d1])
+        =<< (sort <$> query h "[:find ?e :where [(fulltext $ :note/body \"cat day\") [[?e]]] [(fulltext $ :note/body \"cat sleep\") [[?e]]]]" [])
+      checkEq "two searches that find different notes do not share what the checks add" (sort [[VInt (fromIntegral d1), VInt (fromIntegral f)] | f <- [d2, d3, d5]])
+        =<< (sort <$> query h "[:find ?e ?f :where [(fulltext $ :note/body \"cat day\") [[?e]]] [(fulltext $ :note/body \"dog night\") [[?f]]]]" [])
+      checkEq "the query as a map" dogNight
+        =<< ask h "{:find [?e] :in [$ ?q] :where [[(fulltext $ :note/body ?q) [[?e ?a ?v]]]]}" "dog night"
+      -- :top: the best N by relevance, and of them the ones that have every word
+      let top n = ask h (T.pack ("[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q {:top " ++ show (n :: Int) ++ "}) [[?e ?a ?v]]]]"))
+      checkEq "a :top as big as the notes is the whole answer" dogNight =<< top 100 "dog night"
+      one <- top 1 "dog night"
+      check "{:top 1}: at most one, and one that has both" (length one <= 1 && all (`elem` dogNight) one)
+      checkEq "{:top 1} on one word gives the best one" 1 . length =<< top 1 "night"
+      -- a call inside or / not cannot have its words checked there: several words are refused, one word is as before
+      checkEq "one word inside not" (ids [d1])
+        =<< (sort <$> query h "[:find ?e :where [?e :note/by \"x\"] (not [(fulltext $ :note/body \"night\") [[?e]]])]" [])
+      checkEq "...and a word said twice is still one word there" (ids [d1])
+        =<< (sort <$> query h "[:find ?e :where [?e :note/by \"x\"] (not [(fulltext $ :note/body \"night NIGHT\") [[?e]]])]" [])
+      refused <- try (query h "[:find ?e :where [?e :note/by \"x\"] (not [(fulltext $ :note/body \"dog night\") [[?e]]])]" []) :: IO (Either SomeException [[Value]])
+      check "several words inside not are refused, not searched as if there were one" (either (const True) (const False) refused)
+      refusedOr <- try (query h "[:find ?e :where (or [(fulltext $ :note/body \"dog night\") [[?e]]] [(fulltext $ :note/body \"cat\") [[?e]]])]" []) :: IO (Either SomeException [[Value]])
+      check "...and inside or" (either (const True) (const False) refusedOr)
+      checkEq "verify" [] =<< verify h
+      closeHosi h)
+
+  , ("words: a tokenizer that throws rejects the write (nothing is written) and fails the query; the world goes on", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      (tk, _) <- toyTokenizer "toy/1" True
+      let sch = M.fromList [ ("note/body", fulltext (attr TString)) ]
+          search h q = query h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]" [InScalar (VStr q)]
+      h <- openHosiWith ((backendCfg be) { hcClock = clock, hcTokenizer = Just tk }) dir sch
+      r1 <- write h [Create (Tmp 1) "note/body" (Lit (VStr "fine"))]
+      bad <- try (write h [Create (Tmp 1) "note/body" (Lit (VStr "a boom here"))])
+      check "the write is rejected" (case bad of Left (WriteRejected _) -> True; _ -> False)
+      q <- try (search h "boom") :: IO (Either SomeException [[Value]])
+      check "a search that makes it throw fails" (either (const True) (const False) q)
+      checkEq "nothing of the rejected write is there" [[VInt (fromIntegral (wrTemps r1 M.! 1))]] =<< search h "fine"
+      checkEq "verify (the events and the khana agree: the rejected write is in neither)" [] =<< verify h
+      _ <- write h [Create (Tmp 1) "note/body" (Lit (VStr "and onward"))]
+      checkEq "a write after it goes in" 1 . length =<< search h "onward"
+      closeHosi h)
+
+  , ("words: a runtime made with a tokenizer is the one a Hosi opened on it uses, and closeHosi leaves it for whoever made the runtime", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      (tk, closes) <- toyTokenizer "toy/1" True
+      let sch = M.fromList [ ("note/body", fulltext (attr TString)) ]
+      rt <- newKhanaRuntimeWith be (Just tk)
+      h <- openHosiShared rt ((backendCfg be) { hcClock = clock }) dir sch
+      r <- write h [Create (Tmp 1) "note/body" (Lit (VStr "Cats sleep"))]
+      found <- query h "[:find ?e :in $ ?q :where [(fulltext $ :note/body ?q) [[?e]]]]" [InScalar (VStr "cat")]
+      checkEq "found" [[VInt (fromIntegral (wrTemps r M.! 1))]] found
+      closeHosi h
+      checkEq "the Hosi did not close what it was lent" 0 =<< readIORef closes
+      closeKhanaRuntime rt
+      checkEq "the runtime closes the tokenizer" 1 =<< readIORef closes)
+  ]

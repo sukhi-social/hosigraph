@@ -5,7 +5,7 @@ synopsis:           An embedded database: the past as events, "now" as a Datalev
 description:
   An embedded database for one process on one machine, on a local disk (the hosigraph design, formerly hosiDB):
   it keeps the past as frozen chunks of Create/Delete events and "now" (the khana) as a rebuildable instant.
-  The khana ("now") is a Datalevin database (through the dtlv program or a resident JVM, which you bring along).
+  The khana ("now") is a Datalevin database (through the dtlv program, one resident dtlv repl, or a resident JVM, which you bring along).
   The words it speaks (values, EDN, Datalog and pull syntax) are takka, which lives in this repository (takka/).
   What 0.1.0 wrote, every 0.1.x and 0.2.x reads. There is no C in the package. S3 is not in 0.2.
 category:           Database
@@ -43,6 +43,7 @@ library
     Hosigraph.Events
     Hosigraph.Khana
     Hosigraph.Khana.Dtlv
+    Hosigraph.Khana.Repl
     Hosigraph.Khana.Sidecar
     Hosigraph.Event
     Hosigraph.Id

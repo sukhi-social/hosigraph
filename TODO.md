@@ -21,7 +21,7 @@ A reader who knows SQL has no map from "I would make this table, this index, thi
 
 * The timeline of the people one follows, the newest 20, a page after a page (PostgreSQL: an index on `(author, created_at desc, id desc)` and `author = any(...)`; hosigraph: `highestIn` on a tuple, against `:order-by :limit`).
 * "Does A follow B?" (a unique index; an `identity` tuple), and following without looking first.
-* A search box, in English and in Japanese (`tsvector` and GIN, `pg_trgm`; `fulltext`, JVM khana only).
+* A search box, in English and in Japanese (`tsvector` and GIN, `pg_trgm`; `fulltext`, the JVM khana, or any khana with a tokenizer).
 * The counts on a profile (`count(*)`, or a counter kept by hand; what hosigraph has instead is not known yet: that is part of the finding).
 * Erasing an account (`delete`, vacuum, and the backups; `erase` and `clean`, and what is left, and where).
 * The history of one entity (an audit table, or a temporal table; `history`).
@@ -51,6 +51,9 @@ A reader who knows SQL has no map from "I would make this table, this index, thi
 * **A backup call.** The khana is derived, so `events/` alone is a backup. Open: may it be copied while writes go on (seal first, under the lock?), or only when the `Hosi` is closed?
 * **Many threads.** Not tested: `clean` from two threads at once, many readers while `seal` or `erase` runs, and "the world changed between the read and the lock" in a rewrite.
 * **A `verify` that walks both khanas in one `dtlv` process.** It asks for a page at a time, and each page is a `dtlv` process (about 110 of them on real data; the 65 s is 34 s of rebuild and about 30 s of this walk, not measured call by call). The JVM keeps one process and takes 22 s. `verify` is rare work.
+* **A time limit for a call to the resident khana.** `KhanaDtlvRepl` (and the JVM) wait for as long as the process is alive and silent: a form that never ends, or a process that hangs, holds the call (and the lock) for good. A limit would end the process and fail that one call, as a death does.
+* **A `dtlv repl` left behind.** When a process that used `KhanaDtlvRepl` ends without `closeHosi` (it is killed, say), the repl is not ended by the closed pipe while a database is open in it: it stays, with its memory (about 50 to 110 MB) and the LMDB files open. Not tried: a form that closes every connection when the pipe closes, or a repl that watches its parent.
+* **`KhanaDtlvRepl` against a power cut, and with the JVM side by side.** Only `kill -9` was tried (200 acknowledged writes, all kept). The measurement of the repl was not taken beside the JVM's (no JDK 21 at hand), the tests that write with the JVM and read with the repl do not exist, and CI does not run the native `dtlv` at all.
 * **Linux, for real.** CI runs on ubuntu with the JVM khana only; the native `dtlv` is not run there, and the `abi` job has been seen to pass on macOS only. Windows has no `System.Posix`.
 * **The khana backend that fails, as a kind of error.** It is a `DtlvError` (a bare string, not a `HosiError`), thrown in about a dozen places, and some of them are the caller's fault: an unreadable query, a value that has no EDN form. The C door tells it `HOSI_ERR_INTERNAL`.
   To make it a kind (say `KhanaFailed`) the caller's own mistakes there must be told apart first.
@@ -67,7 +70,14 @@ A reader who knows SQL has no map from "I would make this table, this index, thi
   * an order part that is not a long (a double, a string), and the other way, smallest first (`lowestIn`);
   * **a filter that is not "the key is one of these"** (muted, hidden, followers only): the way is "ask for more than you need, drop what fails, and go on from the last fact looked at". How that does when the filter drops most of what it sees is not measured.
 * **`highest`:** the walk upwards (`lowest`: `seek-datoms` on `:ave`, a few lines when it is wanted); a long string as the walked attribute was not tried.
-* **Fulltext without the JVM.** The analyzer is an `inter-fn`, which the native `dtlv` cannot run (`Can only freeze an inter-fn`), so the native khana refuses the schema. With the default analyzer it would work for English and not for Japanese; whether that half is worth having is open. Also not tried: a phrase search, other analyzers, an attribute name that is not `ns/name`.
+* **Fulltext without the JVM.** The analyzer is an `inter-fn`, which the native `dtlv` cannot run (`Can only freeze an inter-fn`), so without a tokenizer the native khana refuses the schema. Also not tried: a phrase search, other analyzers, an attribute name that is not `ns/name`.
+* **The tokenizer (`hcTokenizer`), what is left:**
+  * **A faster AND that gives every answer.** A search of several words is the best `:top` of Datalevin's OR, checked for every word (the guide): cheap, and it can give fewer than the `:top`, or none, when the notes that have every word are not among the best ones; a `:top` as big as the notes gives them all and scores every note that has any one word (1.2 to 2.7 s on 50,000 notes). Two ways, neither tried: ask again with a wider `:top` until there are enough or no more; or keep one fact for each word of a text (a many-valued, indexed attribute beside `<attribute>.words`), so that "all of these words" is an index lookup on the rarest word, with no scoring, and the OR with its order stays for `:top`. Another way, for a tokenizer that can: give A and C words in one index, and cut the search as C.
+  * **The JVM khana with a tokenizer** is written, with its tests, and was never run (no JDK here). Whether its default analyzer takes the `<attribute>.words` attributes as the native one does is not known.
+  * **The rough edges of the words attribute:** it shows in `entity`, `datoms` and the counts, `?a`/`?v` of a `fulltext` call are the words, and the default analyzer of Datalevin still drops English stop words from them.
+  * **An option of the C door** (`:tokenizer`): a `Tokenizer` is Haskell, so what the door could take is a way to name one the library knows.
+  * **A cost not measured:** a write that has a long text (the tokenizer is asked once for each batch); a world with 100,000 posts made again (the words are made once for each text, in batches).
+  * What is left of the Sudachi one (more of the real-post check, the program's version in the mark) is in the README of `example/hosi-mikke`.
 * **Tuples.** Not checked at open: a tuple of an attribute that is not in the schema, or of itself (Datalevin refuses `many` itself, when the schema is made). A pull of a tuple attribute was not tried.
 
 ## Not built, no plan

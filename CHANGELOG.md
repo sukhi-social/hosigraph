@@ -7,7 +7,7 @@
 
 ### New
 
-* **`:order-by`, `:limit` and `:offset`** in a query (a relation `:find`; the forms Datalevin would answer without sorting or cutting are refused), **composite tuples** (`tuple`: a pair that is kept by the khana and held once) and **fulltext** (`fulltext`: words, with a CJK-aware analyzer; JVM khana only; `clean` makes the khana again for it).
+* **`:order-by`, `:limit` and `:offset`** in a query (a relation `:find`; the forms Datalevin would answer without sorting or cutting are refused), **composite tuples** (`tuple`: a pair that is kept by the khana and held once) and **fulltext** (`fulltext`: words, with a CJK-aware analyzer; JVM khana, or any khana with a tokenizer, below; `clean` makes the khana again for it).
   What they are, what they cost and what they do not do: [the guide](docs/guide.md#order-and-cut-tuples-and-words).
 * **`highest`**: the *n* facts of one attribute with the largest values, from the end of its index, a page after a page (`:after` is the place of the last one). It reads about *n* facts and not all of them, where `:order-by … :limit` sorts every row first.
   One attribute with a type, and no filter. Also an operation of the C door (`highest`) and `Hosi.highest` in Elixir.
@@ -16,12 +16,22 @@
 * **`highest` and `highestIn` are experimental** in 0.2 (under that heading in `Hosigraph`): what they answer now is not meant to change, but their form may, in a 0.2.x, when an order that is not a long or the other direction is added.
 * **A tuple crosses the C door:** a vector, with `nil` for a missing part. It is read, and asked for in an input or a condition; it is never written.
 * **`hosigraph stdio`**: the operations of the C door over stdin and stdout, one line each, EDN or (`--json`) JSON; `--ids-as-strings` writes integers past 2^53 as strings. `{"type":"double","value":1}` says the type of a value. An executable of `hosigraph-abi`: [the guide](docs/guide.md#hosigraph-stdio).
+* **`KhanaDtlvRepl path`**: the khana through one resident `dtlv repl`, so a call costs a fraction of a millisecond (a read about 0.1 ms, a write 0.235 ms) and not the 25 ms of a process for each call, and it needs no JVM. It opens the same files, with the same write-ahead log (relaxed) and `transact-ack!` as `KhanaDatalevinJvm`.
+  No `fulltext` without a tokenizer (refused at open, as with `KhanaDtlv`). Tried with `dtlv` 1.2.11 only; the power going off was not tried. Also `[:dtlv-repl exe]` in the `:khana` of the C door's `open`.
+  What it is, what was tried and what was not: [the guide](docs/guide.md#where-now-lives).
+* **Words of your own: a `Tokenizer`** (`hcTokenizer = Just tk`, experimental): the words of a `fulltext` attribute are made by a `Tokenizer` of the host (`tkWords`, `tkMark`, `tkClose`), so **the native khanas have `fulltext` too**, and a language that the analyzer of the JVM cuts badly (Japanese: pairs of characters) gets the words it needs.
+  The events and the text are as written; the khana has the words beside it, in `<attribute>.words`. Off by default. A khana made with another `tkMark` is made again. A search of several words finds the entities that have all of them, within the best `:top` (a `:top` as big as the notes gives all of them). Tried with `KhanaDtlv` and `KhanaDtlvRepl`; not with the JVM. Not an option of the C door yet.
+  What it does, what it does not, and its rough edges: [the guide](docs/guide.md#words-of-your-own-a-tokenizer-experimental).
+* **`example/hosi-mikke`**: a `Tokenizer` for Japanese from one resident [sudachi](https://github.com/WorksApplications/sudachi.rs) process (with a [SudachiDict](https://github.com/WorksApplications/SudachiDict) dictionary): 猫, 受付 = 受け付け, and 京都 is not found in 東京都. An example, not a part of the package; you bring the program and the dictionary.
+  Tried on 4,602 real notes (a word searched alone was found in every note that has it). [Its README](example/hosi-mikke/README.md).
 * The query parser reads a function's binding in every form (`[(f ?x) [?a ?b]]`, `[?x ...]`, `[[?e ?a ?v]]`), `$` and an option map as arguments, and a vector of values as a tuple.
 
 ### Changed (visible to a host)
 
 * **`Value` has a constructor more, `VTuple`, and `AttrSchema` has two fields more (`asTuple`, `asFulltext`).** Keep a catch-all case when you match a `Value`, and build a schema with `attr`, `many`, `identity`, … and not with the constructor. A schema that uses neither of the new things has the schema mark it had, so a world made before is not made again.
   (`takka`, which holds `Value`, is still `0.1.0.1`.)
+* **`KhanaBackend` has a constructor more, `KhanaDtlvRepl`.** Keep a catch-all case when you match on it.
+* **`HosiConfig` has a field more, `hcTokenizer`** (`Nothing` in `defaultConfig`). Build a config from `defaultConfig` with record syntax, as before, and nothing changes. A new type, `Tokenizer`, and `newKhanaRuntimeWith` (a runtime with a tokenizer).
 
 ### Not in 0.2
 

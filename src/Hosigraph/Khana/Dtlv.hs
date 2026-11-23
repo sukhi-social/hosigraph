@@ -26,8 +26,8 @@
 --
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
-  ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..)
-  , openDtlv, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvHighest, dtlvHighestIn, dtlvQueryCells
+  ( Dtlv(..), Runner(..), DtlvError(..), DtlvOp(..), Words(..), wordsAttr
+  , openDtlv, openDtlvWith, attachDtlv, closeDtlv, dtlvTransact, dtlvEntity, dtlvDatoms, dtlvDatomPage, dtlvDatomCount, dtlvHighest, dtlvHighestIn, dtlvQueryCells
     -- * Many in one round trip
   , dtlvMulti, dtlvEntities, dtlvEntityAndCount, dtlvQueryMany
     -- * Taking out whole entities
@@ -44,8 +44,11 @@ import           Control.Exception
 import           Control.Monad
 import qualified Data.ByteString as B
 import           Data.Char (isAlpha, isAlphaNum, ord)
+import           Data.Containers.ListUtils (nubOrd)
 import qualified Data.Map.Strict as M
 import           Data.Maybe (catMaybes)
+import           Data.IORef
+import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -60,6 +63,7 @@ import           System.Process
 import           Takka.Edn
 import           Takka.Syntax (Cell(..), FindShape(..), Input(..), Pulled(..), Query(..), parseQuery)
 import           Takka.Types
+import           Hosigraph.Khana.Repl
 import           Hosigraph.Khana.Sidecar
 
 -- | Anything that went wrong while talking to @dtlv@ (including Datalevin refusing a transaction).
@@ -73,13 +77,30 @@ instance Exception DtlvError
 data Runner
   = Native FilePath         -- ^ the @dtlv@ executable: one process per operation
   | Resident Sidecar        -- ^ a JVM that stays up (shared by every database that uses it)
+  | NativeRepl DtlvRepl     -- ^ the native @dtlv repl@, one process that stays up (shared by every database that uses it)
 
 -- | A Datalevin database: who runs it, the directory, and the schema it is opened with.
 data Dtlv = Dtlv
   { dtlvRunner :: Runner
   , dtlvDir    :: FilePath      -- ^ absolute
   , dtlvSchema :: Schema
+  , dtlvWords  :: Maybe Words   -- ^ words made outside Datalevin for some attributes (see 'Words')
   }
+
+-- | Fulltext attributes whose words are made /outside/ Datalevin (a Japanese morphological analyzer, say), which no analyzer that Datalevin can
+-- freeze into its file can be.  For each such attribute @a@ the database has a second one, @a.words@ ('wordsAttr'), that holds the
+-- words of the text joined by a space, and is the one Datalevin indexes (with its default analyzer, which cuts at the space).
+-- A fact of @a@ that goes in or out takes its words with it ('dtlvTransact'), and a @fulltext@ call on @a@ in a query
+-- is made a call on @a.words@ for the words of its text ('dtlvQueryCells').  @a@ itself is an ordinary attribute with the text as written.
+data Words = Words
+  { wdTokenize :: [Text] -> IO [Text]       -- ^ the words of each text (joined by a space), in the order given
+  , wdAttrs    :: M.Map Keyword Keyword     -- ^ the attribute with the text, and the attribute with its words
+  , wdMark     :: Text                      -- ^ what makes these words (it is in the schema mark: other words, another khana)
+  }
+
+-- | The attribute that holds the words of the text in @a@.
+wordsAttr :: Keyword -> Keyword
+wordsAttr (Keyword t) = Keyword (t <> ".words")
 
 -- | One fact to put in or take out.
 data DtlvOp
@@ -89,10 +110,15 @@ data DtlvOp
 -- | Open (creating if needed) the database in a directory.  Running a first, empty
 -- operation here finds out early whether @dtlv@ starts and whether the directory is usable.
 openDtlv :: Runner -> FilePath -> Schema -> IO Dtlv
-openDtlv runner dir schema = do
+openDtlv runner = openDtlvWith runner Nothing
+
+-- | 'openDtlv' for a schema some of whose fulltext attributes have their words made outside ('Words').  The schema is the
+-- one Datalevin gets: it has the @.words@ attributes, and the attributes with the text are not fulltext.
+openDtlvWith :: Runner -> Maybe Words -> FilePath -> Schema -> IO Dtlv
+openDtlvWith runner ws dir schema = do
   createDirectoryIfMissing True dir
   absDir <- makeAbsolute dir
-  let d = Dtlv runner absDir schema
+  let d = Dtlv runner absDir schema ws
   _ <- run d "nil"
   pure d
 
@@ -102,7 +128,7 @@ attachDtlv :: Runner -> FilePath -> Schema -> IO Dtlv
 attachDtlv runner dir schema = do
   createDirectoryIfMissing True dir
   absDir <- makeAbsolute dir
-  pure (Dtlv runner absDir schema)
+  pure (Dtlv runner absDir schema Nothing)
 
 -- | Let go of the database.  With a resident JVM the connection is closed (so the directory can be
 -- moved or removed); the JVM itself stays up for the other databases.  With the native @dtlv@
@@ -112,13 +138,38 @@ closeDtlv d = case dtlvRunner d of
   Native _     -> pure ()
   Resident sc  -> void (sidecarRequestIfRunning sc ("{:op :drop :dir " <> ednStr (T.pack (dtlvDir d)) <> "}"))
                     `catch` \(_ :: SidecarError) -> pure ()
+  NativeRepl r -> void (replRequestIfRunning r ("(do (drop! " <> ednStr (T.pack (dtlvDir d)) <> ") :dropped)"))
+                    `catch` \(_ :: DtlvReplError) -> pure ()
 
 -- | Apply facts in one atomic transaction (in the order given).
 dtlvTransact :: Dtlv -> [DtlvOp] -> IO ()
 dtlvTransact _ [] = pure ()
-dtlvTransact d ops = do
+dtlvTransact d ops0 = do
+  ops   <- wordsOps d ops0
   forms <- either (throwIO . DtlvError) pure (mapM opEdn ops)
   void (runWithC True d (Just ("[" <> T.unwords forms <> "]")) ("(" <> transactFn d <> " c data) nil"))
+
+-- | With 'Words': after each fact of an attribute that has them, the fact of its words (the same kind, the same entity), so
+-- the words of a text that is replaced or taken out are replaced or taken out with it.  One round trip to the tokenizer for all of them.
+wordsOps :: Dtlv -> [DtlvOp] -> IO [DtlvOp]
+wordsOps d ops = case dtlvWords d of
+  Nothing -> pure ops
+  Just w  -> do
+    let text op = case op of
+          DAdd _ a (VStr t)     | M.member a (wdAttrs w) -> Just t
+          DRetract _ a (VStr t) | M.member a (wdAttrs w) -> Just t
+          _                                              -> Nothing
+        texts = [ t | Just t <- map text ops ]
+    if null texts then pure ops else do
+      made <- wdTokenize w texts
+      when (length made /= length texts) (throwIO (DtlvError "the tokenizer answered with another number of texts than it was given"))
+      pure (weave w ops made)
+  where
+    weave _ [] _ = []
+    weave w (op : rest) ws = case (op, ws) of
+      (DAdd e a (VStr _), x : xs)     | Just a' <- M.lookup a (wdAttrs w) -> op : DAdd e a' (VStr x) : weave w rest xs
+      (DRetract e a (VStr _), x : xs) | Just a' <- M.lookup a (wdAttrs w) -> op : DRetract e a' (VStr x) : weave w rest xs
+      _                                                                    -> op : weave w rest ws
 
 opEdn :: DtlvOp -> Either String Text
 opEdn op = case op of
@@ -204,7 +255,8 @@ dtlvCompactTo d dst = do
       let said = TE.decodeUtf8With TE.lenientDecode (out <> err)
       when (code /= ExitSuccess || "Copy error" `T.isInfixOf` said) $
         bad ("compact copy: " ++ T.unpack (T.take 400 said))
-    Resident _ -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
+    Resident _   -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
+    NativeRepl _ -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
   made <- doesFileExist (absDst </> "data.mdb")
   unless made $ bad "compact copy: the copy has no data.mdb"
 
@@ -361,7 +413,8 @@ dtlvDatomCount d = do
 -- a list of rows, also for @:find ?x .@ (one row, or none) and @:find [?x ...]@ (one cell per row).
 -- A map in a cell is a pull result.  'InRules' cannot be sent (see below).
 dtlvQueryCells :: Dtlv -> Text -> [Input] -> IO [[Cell]]
-dtlvQueryCells d txt inputs = do
+dtlvQueryCells d txt0 inputs0 = do
+  (txt, inputs) <- wordsQuery d txt0 inputs0
   (shape, dat, body) <- prepareQueryD txt inputs
   e     <- readReplyC d (Just dat) body
   rows  <- either (throwIO . DtlvError) pure (shapeRows shape e)
@@ -372,7 +425,8 @@ dtlvQueryCells d txt inputs = do
 -- anything is sent.  If Datalevin itself rejects one, the whole call fails.
 dtlvQueryMany :: Dtlv -> [(Text, [Input])] -> IO [[[Cell]]]
 dtlvQueryMany _ [] = pure []
-dtlvQueryMany d qs = do
+dtlvQueryMany d qs0 = do
+  qs <- mapM (uncurry (wordsQuery d)) qs0
   prepared <- mapM (uncurry (prepareQuery "db")) qs
   es <- dtlvMulti d (map snd prepared)
   forM (zip (map fst prepared) es) $ \(shape, e) -> do
@@ -396,6 +450,167 @@ prepareQueryD txt inputs = do
   -- (@(apply q ...)@ or @(let [f q] ...)@ is "Unable to resolve symbol: q"), and the text is still the same for the
   -- same query and the same number of inputs.
   pure (shape, "[" <> T.unwords args <> "]", "(q '" <> txt <> " @c" <> T.concat [ " (nth data " <> T.pack (show i) <> ")" | i <- [0 .. length args - 1] ] <> ")")
+
+-- | With 'Words': a query that calls @fulltext@ on an attribute that has them is sent as a call on its words attribute, for the
+-- words of the text it searches for.  The text is a string written in the query, or a scalar @:in@ input (which is then made
+-- into its words, wherever else the query uses it).  A call with no attribute searches every fulltext attribute, and its text is
+-- made into words too (every one of them has its words made the same way).  Any other query is sent as it was written.
+--
+-- A text of /several words/ finds the entities that have all of them.  Datalevin's own search finds the ones that have any (and ranks
+-- them by how many and how rare), so the call stays as it is, with its @:top@ (Datalevin's: the best 10 when none is written), and what
+-- it finds is checked in the query: the words of the entity come back as @?v@, and one clause for each word asks whether it is one of
+-- them.  The answer is the ones of the best @:top@ that have every word, and a @:top@ as big as the number of entities makes it all of
+-- them.  (A call for each word, joined on @?e@, would be all of them whatever the @:top@, and it would pay for every entity that has any
+-- one of the words, however few the answer: measured, 1.2 s for a word of 50,000 entities, again for each word.)
+-- A word is a word of the tokenizer, as it made it: a word that Datalevin's analyzer drops from a search (@at@) is still asked for.
+-- The checks need the row as @[[?e ?a ?v]]@ (the three may be @_@, or the row may be shorter), and they are clauses beside the call: a call
+-- of several words inside @or@, @not@ or any other form that is not a clause of the query itself is refused, not searched as if it were one word.
+--
+-- A call that binds @?a@ and @?v@ gets the words attribute and the words, not the attribute and the text: bind @?e@ and ask
+-- for the text of the entity.
+wordsQuery :: Dtlv -> Text -> [Input] -> IO (Text, [Input])
+wordsQuery d txt inputs = case dtlvWords d of
+  Just w | "fulltext" `T.isInfixOf` txt -> do
+    q   <- either (\m -> throwIO (DtlvError ("query: " ++ m))) pure (readEdn txt)
+    wk  <- Walk w (inputSlots q) inputs <$> newIORef False <*> newIORef M.empty <*> newIORef 0
+    q'  <- wordsWalk wk q
+    did <- readIORef (wkChanged wk)
+    if not did then pure (txt, inputs) else do
+      made <- readIORef (wkMade wk)
+      pure (renderEdn q', foldr (uncurry setScalar) inputs (M.toList made))
+  _ -> pure (txt, inputs)
+
+-- | Which input each variable of @:in@ is (the source @$@ is not an input: the database is given apart).
+inputSlots :: Edn -> M.Map Text Int
+inputSlots q = M.fromList [ (v, i) | (i, ESym v) <- zip [0 ..] consumed, "?" `T.isPrefixOf` v ]
+  where
+    consumed = filter (\x -> case x of ESym v -> not ("$" `T.isPrefixOf` v); _ -> True) specs
+    specs = case q of
+      EVec xs  -> takeWhile (\x -> case x of EKw _ -> False; _ -> True) (drop 1 (dropWhile (/= EKw "in") xs))
+      EMap kvs -> case lookup (EKw "in") kvs of Just (EVec ys) -> ys; _ -> []
+      _        -> []
+
+-- | What the rewrite of one query knows and keeps.
+data Walk = Walk
+  { wkWords   :: Words
+  , wkSlots   :: M.Map Text Int          -- ^ which input each variable of @:in@ is
+  , wkInputs  :: [Input]
+  , wkChanged :: IORef Bool              -- ^ a call was made a call on words
+  , wkMade    :: IORef (M.Map Int Text)  -- ^ the inputs that were made into their words, by place
+  , wkFresh   :: IORef Int               -- ^ for the names of the variables the checks add
+  }
+
+-- | The query with each @fulltext@ call on words made a call on them.  The clauses of the query itself may search for several words
+-- ('wordsClause'); a call anywhere else may search for one.
+wordsWalk :: Walk -> Edn -> IO Edn
+wordsWalk wk q = case q of
+  EVec xs  -> EVec <$> wordsClauses wk xs
+  EMap kvs -> EMap <$> mapM (\(k, v) -> case (k, v) of
+                                (EKw "where", EVec cs) -> (,) k . EVec <$> wordsClauses wk cs
+                                _                      -> (,) k <$> wordsNested wk v) kvs
+  _        -> wordsNested wk q
+
+wordsClauses :: Walk -> [Edn] -> IO [Edn]
+wordsClauses wk = fmap concat . mapM one
+  where
+    one c = case c of
+      EVec [EList (ESym "fulltext" : args), bnd] -> wordsClause wk args bnd
+      _                                          -> (: []) <$> wordsNested wk c
+
+-- | One @[(fulltext $ ...) binding]@ clause of the query, as the clauses it becomes: the call on the words, and, for a text of several
+-- words, a check of each word on the words of the entity.
+wordsClause :: Walk -> [Edn] -> Edn -> IO [Edn]
+wordsClause wk args bnd = case callOnWords (wkWords wk) args of
+  Nothing -> pure [EVec [EList (ESym "fulltext" : args), bnd]]
+  Just (rebuild, q) -> do
+    (q', ws) <- wordsText wk q
+    let call = EList (ESym "fulltext" : rebuild q')
+    case ws of
+      _ : _ : _ -> do
+        (bnd', v) <- checkedBinding wk bnd
+        p <- freshName wk "?fulltext-p"
+        pure ( EVec [call, bnd']
+             : EVec [EList [ESym "str", EStr " ", ESym v, EStr " "], ESym p]
+             : [ EVec [EList [ESym "clojure.string/includes?", ESym p, EStr (" " <> x <> " ")]] | x <- ws ] )
+      _ -> pure [EVec [call, bnd]]
+
+-- | Any other place of the query: a @fulltext@ call on words is made a call on them there too, for one word only.
+wordsNested :: Walk -> Edn -> IO Edn
+wordsNested wk e = case e of
+  EList (ESym "fulltext" : args) | Just (rebuild, q) <- callOnWords (wkWords wk) args -> do
+    (q', ws) <- wordsText wk q
+    when (length ws > 1) $ throwIO (DtlvError "a fulltext call that searches for several words must be a clause of the query itself, not inside or, not or another form: its words are checked by clauses beside it")
+    pure (EList (ESym "fulltext" : rebuild q'))
+  EList xs -> EList <$> mapM (wordsNested wk) xs
+  EVec xs  -> EVec  <$> mapM (wordsNested wk) xs
+  ESet xs  -> ESet  <$> mapM (wordsNested wk) xs
+  EMap kv  -> EMap  <$> mapM (\(k, v) -> (,) <$> wordsNested wk k <*> wordsNested wk v) kv
+  _        -> pure e
+
+-- | The arguments of a @fulltext@ call that is on words: how to put them together again for a new text, and the text.
+callOnWords :: Words -> [Edn] -> Maybe (Edn -> [Edn], Edn)
+callOnWords w args = case args of
+  src@(ESym "$") : EKw a : q : more | Just a' <- M.lookup (Keyword a) (wdAttrs w) -> Just (\q' -> src : EKw (kwText a') : q' : more, q)
+  src@(ESym "$") : q : more         | notKw q                                    -> Just (\q' -> src : q' : more, q)
+  _                                                                              -> Nothing
+  where notKw x = case x of EKw _ -> False; _ -> True
+
+-- | What a call searches for, as its words: the text to put in the call (a string written in the query is made into its words; an @:in@
+-- variable stays, and its input is made into them, 'wkMade') and the words, each once.
+wordsText :: Walk -> Edn -> IO (Edn, [Text])
+wordsText wk q = do
+  writeIORef (wkChanged wk) True
+  case q of
+    EStr s -> do
+      t <- tokenized s
+      pure (EStr t, wordsIn t)
+    ESym v | Just i <- M.lookup v (wkSlots wk) -> do
+      made <- readIORef (wkMade wk)
+      t <- case M.lookup i made of
+        Just t  -> pure t
+        Nothing -> case drop i (wkInputs wk) of
+          InScalar (VStr s) : _ -> do
+            t <- tokenized s
+            modifyIORef' (wkMade wk) (M.insert i t)
+            pure t
+          _ -> throwIO (DtlvError "the :in input that a fulltext call searches for must be a string")
+      pure (q, wordsIn t)
+    _ -> throwIO (DtlvError "a fulltext call on an attribute with words must search for a string written in the query, or for a scalar :in input")
+  where
+    tokenized s = do
+      ws <- wdTokenize (wkWords wk) [s]
+      case ws of
+        [t] -> pure t
+        _   -> throwIO (DtlvError "the tokenizer answered with another number of texts than it was given")
+    wordsIn t = nubOrd (filter (not . T.null) (T.splitOn " " t))
+
+-- | The binding of a call whose words are checked: a relation with the words in its third place, as a variable (the one written there, or
+-- a new one for @_@ or for a row that is shorter), and the name of that variable.
+checkedBinding :: Walk -> Edn -> IO (Edn, Text)
+checkedBinding wk bnd = case bnd of
+  EVec [EVec (e : rest)] -> do
+    let (a, rest1) = case rest of x : xs -> (x, xs); [] -> (ESym "_", [])
+    (v, rest2) <- case rest1 of
+      []                                -> newV []
+      ESym "_" : xs                     -> newV xs
+      ESym s : xs | "?" `T.isPrefixOf` s -> pure (s, xs)
+      _                                 -> throwIO (DtlvError bindMsg)
+    pure (EVec [EVec (e : a : ESym v : rest2)], v)
+  _ -> throwIO (DtlvError bindMsg)
+  where
+    newV xs = do { n <- freshName wk "?fulltext-v"; pure (n, xs) }
+    bindMsg = "a fulltext call that searches for several words must bind its rows as [[?e ?a ?v]] (any of them may be _, and the row may be shorter): its words are checked beside it"
+
+freshName :: Walk -> Text -> IO Text
+freshName wk base = do
+  n <- atomicModifyIORef' (wkFresh wk) (\k -> (k + 1, k + 1))
+  pure (base <> T.pack (show n))
+
+-- | Input number @i@ (a string), as the words it was made into.
+setScalar :: Int -> Text -> [Input] -> [Input]
+setScalar i t ins = case splitAt i ins of
+  (before, InScalar (VStr _) : after) -> before ++ InScalar (VStr t) : after
+  _                                   -> ins
 
 cell :: Edn -> IO Cell
 cell x = case x of
@@ -440,13 +655,26 @@ pulled e = case e of
 -- ---------------------------------------------------------------------------
 -- Running dtlv
 
+-- | The code for one operation.  Under @dtlv exec@ it opens the database and closes it again; under the resident
+-- @dtlv repl@ ('NativeRepl') the connection is kept (@conn!@ finds it, 'Hosigraph.Khana.Repl.setup' made it) and let go of
+-- by 'closeDtlv'.
 script :: Dtlv -> Maybe Text -> Text -> Text
-script d dat body = T.unlines
-  [ "(let [c (get-conn " <> ednStr (T.pack (dtlvDir d)) <> " " <> schemaEdn (dtlvSchema d) <> ")"
+script d dat body = T.unlines $
+  [ "(let [c (" <> opener <> " " <> ednStr (T.pack (dtlvDir d)) <> " " <> schemaEdn (dtlvSchema d) <> openOpts <> ")"
     <> maybe "" (\x -> " data " <> x) dat <> "]"
-  , "  (try [:ok (binding [*print-namespace-maps* false] (pr-str (do " <> body <> ")))]"
-  , "       (catch Exception e [:err (str (ex-message e))])"
-  , "       (finally (close c))))" ]
+  , "  (try [:ok (binding [*print-namespace-maps* false] (pr-str (do " <> body <> ")))]" ]
+  ++ case dtlvRunner d of
+       NativeRepl _ -> [ "       (catch Exception e [:err (str (ex-message e))])))" ]
+       _            -> [ "       (catch Exception e [:err (str (ex-message e))])"
+                       , "       (finally (close c))))" ]
+  where
+    opener = case dtlvRunner d of
+      NativeRepl _ -> "conn!"
+      _            -> "get-conn" :: Text
+    -- the resident repl opens the khana as the resident JVM does: with the write-ahead log ('walOpts')
+    openOpts = case dtlvRunner d of
+      NativeRepl _ -> " " <> walOpts
+      _            -> ""
 
 -- | How the resident JVM opens a khana: with Datalevin's write-ahead log, in its /relaxed/ durability profile.
 --
@@ -459,16 +687,17 @@ script d dat body = T.unlines
 -- @snapshots\/@) until the khana is made a new file; without it they stay in @data.mdb@ until LMDB happens to reuse the page.
 -- 'dtlvCompactTo' copies neither, so @clean@ still leaves them nowhere.
 --
--- Only the resident JVM gets this.  The native @dtlv@ is one process per operation and is left as it was.
+-- The resident JVM and the resident @dtlv repl@ get this.  The native @dtlv exec@ is one process per operation and is left as it was.
 walOpts :: Text
 walOpts = "{:wal? true :wal-durability-profile :relaxed :wal-segment-max-bytes 4194304 :wal-retention-bytes 8388608 :wal-retention-ms 60000}"
 
 -- | The function that applies a transaction and comes back when it is done.  @transact-ack!@ does the same as
--- @transact!@ and does not build the report we throw away.  (Resident only; the native @dtlv@ keeps @transact!@.)
+-- @transact!@ and does not build the report we throw away.  (Resident only; @dtlv exec@ keeps @transact!@.)
 transactFn :: Dtlv -> Text
 transactFn d = case dtlvRunner d of
-  Resident _ -> "transact-ack!"
-  Native _   -> "transact!"
+  Resident _   -> "transact-ack!"
+  Native _     -> "transact!"
+  NativeRepl _ -> "transact-ack!"
 
 -- | Run a body with the connection @c@ in scope; return the text of its value.
 run :: Dtlv -> Text -> IO Text
@@ -485,20 +714,30 @@ runWith = runWithC False
 -- @dtlv@ runs a script and has nothing to keep, so it ignores the flag.
 runWithC :: Bool -> Dtlv -> Maybe Text -> Text -> IO Text
 runWithC cached d dat body = case dtlvRunner d of
-  Native exe  -> runNative exe d dat body
-  Resident sc -> runResident cached sc d dat body
+  Native exe   -> runNative exe d dat body
+  Resident sc  -> runResident cached sc d dat body
+  NativeRepl r -> runRepl r d dat body
 
 runNative :: FilePath -> Dtlv -> Maybe Text -> Text -> IO Text
 runNative exe d dat body = do
   (code, out, err) <- runBytes exe ["exec"] (TE.encodeUtf8 (script d dat body))
-  let outT   = TE.decodeUtf8With TE.lenientDecode out
-      errT   = TE.decodeUtf8With TE.lenientDecode err
-      lastLn = case filter (not . T.null . T.strip) (T.lines outT) of [] -> ""; ls -> last ls
+  let outT = TE.decodeUtf8With TE.lenientDecode out
+      errT = TE.decodeUtf8With TE.lenientDecode err
+  scriptReply ("exit " ++ show (code :: ExitCode)) outT errT
+
+-- | What a 'script' printed (its last line) as the value, or as the error it caught.
+scriptReply :: String -> Text -> Text -> IO Text
+scriptReply what outT errT =
   case readEdn (tameEdn lastLn) of
     Right (EVec [EKw "ok", EStr s])  -> pure s
     Right (EVec [EKw "err", EStr m]) -> throwIO (DtlvError (T.unpack m))
-    _ -> throwIO (DtlvError ("an answer we did not expect (" ++ describe code ++ "): " ++ T.unpack (T.take 400 (outT <> errT))))
-  where describe code = "exit " ++ show (code :: ExitCode)
+    _ -> throwIO (DtlvError ("an answer we did not expect (" ++ what ++ "): " ++ T.unpack (T.take 400 (outT <> errT))))
+  where lastLn = case filter (not . T.null . T.strip) (T.lines outT) of [] -> ""; ls -> last ls
+
+runRepl :: DtlvRepl -> Dtlv -> Maybe Text -> Text -> IO Text
+runRepl r d dat body = do
+  out <- replRequest r (script d dat body) `catch` \(DtlvReplError m) -> throwIO (DtlvError m)
+  scriptReply "the resident dtlv repl" out ""
 
 runResident :: Bool -> Sidecar -> Dtlv -> Maybe Text -> Text -> IO Text
 runResident cached sc d dat body = do
@@ -510,9 +749,11 @@ runResident cached sc d dat body = do
     _ -> throwIO (DtlvError ("an answer we did not expect: " ++ T.unpack (T.take 400 line)))
   where
     -- the attributes whose words are searched: the JVM gives each of them its analyzer ('Hosigraph.Khana.Sidecar.sidecarSource')
-    search = case fulltextAttrs (dtlvSchema d) of
+    search = case [ k | k <- fulltextAttrs (dtlvSchema d), k `S.notMember` madeOutside ] of
       [] -> ""
       ks -> " :search [" <> T.unwords [ ednStr (kwText k) | k <- ks ] <> "]"
+    -- the words attributes get Datalevin's default analyzer: their words are made already
+    madeOutside = maybe S.empty (S.fromList . M.elems . wdAttrs) (dtlvWords d)
     request = "{:dir " <> ednStr (T.pack (dtlvDir d)) <> " :schema " <> ednStr (schemaEdn (dtlvSchema d))
               <> " :opts " <> walOpts <> search <> " :body " <> ednStr body <> maybe "" (\x -> " :data " <> x) dat <> (if cached then " :cache true" else "") <> "}"
 

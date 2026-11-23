@@ -6,7 +6,8 @@
 --   * Each region has its own events, its own tail, its own lock and its own khana.  A scan (erase by owner, a
 --     backfill, a rebuild of the khana) reads the size of a region and not of everything; the fsync of one region's
 --     write does not stand behind another's; a region that is slow or full or broken does not make the others so.
---   * The regions share the resident JVM(s) ('rgJvms'): a JVM costs about 300 MB and some seconds to start, a database
+--   * The regions share the resident JVM(s) ('rgJvms'; with 'KhanaDtlvRepl' they are @dtlv repl@ processes, and each is
+--     one pipe in the same way): a JVM costs about 300 MB and some seconds to start, a database
 --     inside it costs far less (see 'openHosiShared').  But one JVM is one pipe: the questions of all its regions to
 --     their khanas are asked one at a time.  With 'rgJvms' above 1 the regions are spread over that many JVMs (a region
 --     always goes to the same one) and ask in parallel, for the memory of one more JVM each.

@@ -1,0 +1,46 @@
+cabal-version:      3.0
+name:               hosi-mikke
+version:            0.0.1.0
+synopsis:           An example: Japanese words for hosigraph's fulltext, from Sudachi
+description:
+  An example, not a part of hosigraph: a Tokenizer that makes the words of a fulltext attribute from one resident
+  sudachi.rs process, so that Japanese is found by its words (猫, 受付 = 受け付け, 京都 is not found in 東京都) in any
+  Datalevin khana, the native ones too.  Experimental.  You bring sudachi and a dictionary; neither is in this package.
+  The library is one module; the test-suite and the real-post check are what was tried.
+category:           Database
+license:            BlueOak-1.0.0
+license-file:       LICENSE
+copyright:          2026 Hosigraph Contributors
+build-type:         Simple
+extra-doc-files:
+  README.md
+extra-source-files:
+  real-check/*.py
+
+common shared
+  default-language: GHC2021
+  ghc-options:      -Wall -Wno-name-shadowing
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:  Hosigraph.Mikke.Sudachi
+  build-depends:    base, hosigraph, bytestring, directory, process, text
+
+-- Needs HOSIGRAPH_SUDACHI (the sudachi program) and HOSIGRAPH_SUDACHI_DICT (its dictionary); the khana tests also need
+-- HOSIGRAPH_DTLV (and, for the JVM, HOSIGRAPH_DATALEVIN_JAR and HOSIGRAPH_JAVA).  What is not set is skipped, and said so.
+test-suite spec
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Spec.hs
+  build-depends:    base, hosi-mikke, hosigraph, takka, bytestring, containers, directory, filepath, text, time
+  ghc-options:      -threaded -rtsopts
+
+-- The check on real posts: writes them into a world, asks for words, prints numbers (see README.md, "On real posts").
+executable mikke-real-check
+  import:           shared
+  hs-source-dirs:   real-check
+  main-is:          Main.hs
+  build-depends:    base, hosi-mikke, hosigraph, takka, aeson, containers, directory, process, text, time
+  ghc-options:      -threaded -rtsopts
