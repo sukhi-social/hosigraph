@@ -112,6 +112,7 @@ Speed is only roughly measured, and the guide lists the limits.
 - [The long guide](docs/guide.md): Datalevin setup, file layout, limits, and what the names mean
 - [The design this grew from](docs/hosiDB-design-v0.2.0-draft.md) (it was called hosiDB then) and [design notes](docs/design-notes.md)
 - [takka](takka/README.md): the small library of words hosigraph and Datalevin share
+- [hosi-mikke](example/hosi-mikke/README.md): an example, Japanese words for `fulltext` from Sudachi (experimental)
 
 *P.S.* `Hosi` + `Khana` sounds like *hoshi kana*: "is it a star?"
 
