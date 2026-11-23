@@ -83,6 +83,8 @@ module Hosigraph
   , Stats(..), stats
     -- ** Reading the past into a khana, newest first
   , Coverage(..), cvQueryable, BackfillStage(..), backfillSince
+    -- ** Words made by a tokenizer of the host (Japanese search, say)
+  , Tokenizer(..), newKhanaRuntimeWith
   ) where
 
 import           Control.Exception
@@ -122,13 +124,19 @@ data HosiConfig = HosiConfig
   , hcKhanaBackend :: KhanaBackend    -- ^ where "now" lives: Datalevin through a resident JVM (the default; give it the real jar), or through @dtlv@
   , hcClock       :: Clock            -- ^ milliseconds since the POSIX epoch (tests inject their own)
   , hcReaderCacheBytes :: Int         -- ^ memory the open chunk readers may hold together (least recently used go first)
+  , hcTokenizer :: Maybe Tokenizer
+    -- ^ /Experimental./ 'Nothing' (the default): the @fulltext@ attributes get the words of the JVM's analyzer (pairs of Han, kana
+    --   and hangul characters), and only the JVM has them.  'Just': the words are made by this 'Tokenizer', in any backend (see the
+    --   guide; @example/hosi-mikke@ makes one for Japanese from a morphological analyzer).  Used when this Hosi makes its own runtime,
+    --   and then closing the Hosi closes it ('tkClose'); with 'openHosiShared' the runtime's own tokenizer ('newKhanaRuntimeWith') is
+    --   the one.  A khana made with other words (another 'tkMark') is made again.
   }
 
 defaultConfig :: HosiConfig
 defaultConfig = HosiConfig
   { hcSealEvents = 10000, hcSealAgeMs = Nothing, hcBlockEvents = 256, hcColdBlockEvents = 4096, hcColdAfterMs = Nothing
   , hcSync = True, hcKhanaBackend = KhanaDatalevinJvm "java" "datalevin-standalone.jar", hcClock = systemClock
-  , hcReaderCacheBytes = 64 * 1024 * 1024 }
+  , hcReaderCacheBytes = 64 * 1024 * 1024, hcTokenizer = Nothing }
 
 eventsConfig :: HosiConfig -> EventsConfig
 eventsConfig c = EventsConfig
@@ -141,7 +149,7 @@ data Hosi = Hosi
   , hSchema :: Schema
   , hEvents :: Events                 -- ^ the truth
   , hKhana  :: IORef Khana            -- ^ the instant (swapped when it is rebuilt)
-  , hRuntime :: KhanaRuntime          -- ^ what every khana of this Hosi shares (the resident JVM, if any)
+  , hRuntime :: KhanaRuntime          -- ^ what every khana of this Hosi shares (the resident JVM or repl, if any)
   , hOwnsRuntime :: Bool              -- ^ False when the runtime was lent ('openHosiShared'): closing this Hosi leaves it running
   }
 
@@ -161,6 +169,9 @@ checkBackend :: KhanaBackend -> IO ()
 checkBackend (KhanaDtlv exe) = do
   found <- runnable exe
   unless found $ throwIO (BackendMissing ("KhanaDtlv: no executable dtlv at " ++ show exe))
+checkBackend (KhanaDtlvRepl exe) = do
+  found <- runnable exe
+  unless found $ throwIO (BackendMissing ("KhanaDtlvRepl: no executable dtlv at " ++ show exe))
 checkBackend (KhanaDatalevinJvm java jar) = do
   okJava <- runnable java
   unless okJava $ throwIO (BackendMissing ("KhanaDatalevinJvm: no java at " ++ show java))
@@ -188,7 +199,7 @@ openHosi = openHosiWith defaultConfig
 openHosiWith :: HosiConfig -> FilePath -> Schema -> IO Hosi
 openHosiWith cfg dir schema = openHosiWithRuntime Nothing cfg dir schema
 
--- | 'openHosiWith' on a runtime (the resident JVM) that somebody else made with 'newKhanaRuntime' and keeps: this
+-- | 'openHosiWith' on a runtime (the resident JVM, or the resident @dtlv repl@) that somebody else made with 'newKhanaRuntime' and keeps: this
 -- Hosi uses it and 'closeHosi' does /not/ stop it, so many databases (a Hosi for each region, say) can live in one
 -- JVM, which costs the memory and the start-up of one.  Whoever made the runtime closes it with 'closeKhanaRuntime',
 -- after the last Hosi on it is closed.  A runtime is one pipe: the questions of all the Hosi on it to their khanas are
@@ -202,7 +213,7 @@ openHosiWithRuntime lent cfg dir schema = do
   createDirectoryIfMissing True dir
   -- the world first: an opener that comes second is refused here ('WorldBusy'), before it starts a JVM or touches a khana
   ev <- E.openEvents (eventsConfig cfg) (dir </> "events")
-  rt <- maybe (newKhanaRuntime (hcKhanaBackend cfg)) pure lent `onException` E.closeEvents ev
+  rt <- maybe (newKhanaRuntimeWith (hcKhanaBackend cfg) (hcTokenizer cfg)) pure lent `onException` E.closeEvents ev
   let owns = case lent of Nothing -> True; Just _ -> False
       letGo = if owns then closeKhanaRuntime rt else pure ()
   (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
@@ -234,7 +245,7 @@ recoverKhana h lastS = do
     Left (_ :: SomeException) -> rebuildBeside False      -- it cannot be opened: which schema it was made under is not known
     Right (fs, gen, mark) -> do
       mgen <- E.eraseGeneration ev
-      let same = mark == Just (schemaMark (hSchema h))
+      let same = mark == Just (schemaMarkIn (hRuntime h) (hSchema h))
           mustRebuild =
                fs > lastS || gen /= mgen    -- the khana saw a write the events never kept, or has not followed an erase (or is ahead of one)
             || fs == 0 && lastS > 0         -- it holds nothing, and there are events (it was lost)

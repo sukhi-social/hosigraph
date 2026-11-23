@@ -82,11 +82,12 @@ HOSIGRAPH_DATALEVIN_JAR=/path/to/datalevin-1.2.10-standalone.jar HOSIGRAPH_JAVA=
 | You give | Tests that run |
 |---|---|
 | nothing | those of the events, chunks, filters, the deep path, the tail log and the EDN writer |
-| `dtlv` | those, and the ones that use the khana through `dtlv` |
-| the JVM | those, and the ones that use the khana through the JVM |
+| `dtlv` | those, and the ones that use the khana through `dtlv`, both ways: one process for each operation (`KhanaDtlv`, the tests start with `[dtlv]`) and one resident `dtlv repl` (`KhanaDtlvRepl`, `[dtlv-repl]`) |
+| the JVM | those, and the ones that use the khana through the JVM (`[jvm]`) |
 | `dtlv` and the JVM | all of them (including: write with the JVM and read with `dtlv`, and the reverse) |
 
-The same scenarios run on `dtlv` and on the JVM. The tests choose the khana themselves.
+The same scenarios run on `dtlv`, on the resident `dtlv repl` and on the JVM; the write queue and the regions run on the JVM and on the repl.
+The tests choose the khana themselves. `HOSIGRAPH_TEST_ONLY='[dtlv-repl]'` runs one group (any text in a test's name will do).
 
 The demo needs the JVM: set `HOSIGRAPH_DATALEVIN_JAR` (and `HOSIGRAPH_JAVA` if `java` is not on your path).
 
@@ -250,26 +251,63 @@ schema = M.fromList [ ("note/body", fulltext (attr TString)) ]
 -- [:find ?e ?v :in $ ?q :where [(fulltext $ :note/body ?q) [[?e ?a ?v]]]]      with InScalar (VStr "fox")
 ```
 
-* **Only with `KhanaDatalevinJvm`.** The words are made by an analyzer that has to run inside the JVM; with the native `dtlv` the schema is refused at open (`SchemaRefused`, before anything is made).
+* **Without a tokenizer, only with `KhanaDatalevinJvm`.** The words are made by an analyzer of our own, a function that Datalevin keeps in the database, so it has to be an `inter-fn`. The JVM makes one; `dtlv` 1.2.11 cannot (tried in its repl:
+  a plain `fn` is refused with "Can only freeze an inter-fn", and `inter-fn` itself stops at "Unable to resolve symbol: datalevin.interpret/compile-inter-fn-source").
+  Its own default analyzer does work (Latin words found in any case, a Hangul word found whole), but it does not cut Han, kana and hangul into pairs: 東京 does not find 東京都, nor 문장 find 문장입니다. Those would be other words, in files that another backend opens, so it is refused rather than made different. With the native `dtlv`, whether `KhanaDtlv` or `KhanaDtlvRepl`, the schema is refused at open (`SchemaRefused`, before anything is made) unless you give a tokenizer: "Words of your own", below.
 * **What a word is:** a run of letters and digits, lower-cased. A run of Han, kana or hangul is cut into overlapping pairs of characters, so that it is found by any two of its characters in a row. (A search for one such character on its own does not find it.)
   This is one analyzer, fixed; nothing about stems, stop words or a language was tried. Another analyzer will be another version (`words/1` is in the schema mark), and the khana is made again under it.
 * The query is Datalevin's `fulltext`: with the attribute, `(fulltext $ :note/body ?q)`; without it, `(fulltext $ ?q)` searches every fulltext attribute; `{:top 5}` is an option (a last argument). Several words are matched as Datalevin matches them (best first); a phrase search was not tried.
 * It follows the data: a value that is taken out or changed is out of the index, and an erased note is found no more.
 * **`clean` always makes the khana again from the events** when the schema has a `fulltext` attribute (`crKhanaRebuilt` is `True`). The quick way, a compacted copy, **keeps the words of an erased value** (tried: an erased word was still in two files of the copy). The cost is the cost of `rebuildKhana`.
 
-## Where "now" lives
-
-The khana is a Datalevin database. There are two ways to reach it:
-
-| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlv path` |
-|---|---|---|
-| What it is | Datalevin in **one JVM that stays up** (one JVM for each `Hosi`) | Datalevin through the `dtlv` command, **one process for each operation** |
-| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 25 ms (the first call: about 0.4 s) |
-| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file |
-| `(max ?x)` and `(min ?x)` | work | **do not work** (see "Limits") |
-| Files in | `khana-dtlv/` | `khana-dtlv/` |
+#### Words of your own: a `Tokenizer` (experimental)
 
 ```haskell
+cfg = defaultConfig
+  { hcKhanaBackend = KhanaDtlvRepl "/usr/local/bin/dtlv"
+  , hcTokenizer    = Just myTokenizer }       -- a Tokenizer { tkMark, tkWords, tkClose }
+```
+
+With a tokenizer the words are made by you, outside Datalevin, so **any khana can have a `fulltext` attribute**, the native `dtlv` too, and the words can be the ones your language needs (the analyzer of the JVM cuts Han, kana and hangul into pairs of characters, which is not Japanese). `hcTokenizer` is `Nothing` by default, and then nothing here happens: the JVM has its analyzer, and the native khana refuses the schema.
+[`example/hosi-mikke`](../example/hosi-mikke/README.md) makes one for Japanese from [Sudachi](https://github.com/WorksApplications/sudachi.rs), and is the way to see what it does on real posts.
+
+A `Tokenizer` is three things:
+
+* `tkWords :: [Text] -> IO [Text]`: the words of each text, joined by a single space, one answer for each text in the order given (`""` for a text with no words). It is asked for what is written and for what is searched, so a search is cut the way a text was. It may throw: a write is then rejected (`WriteRejected`, nothing is written) and a query fails with it.
+* `tkMark :: Text`: says which words this makes (the rules, the dictionary, the way of cutting). It is in the schema mark, so **another mark makes the khana again from the events** at the next open; keep it the same while the words are the same, and change it when they are not.
+* `tkClose :: IO ()`: let go of what it holds (a process). The runtime calls it when it closes: `closeHosi` when the `Hosi` made the runtime (`hcTokenizer`), `closeKhanaRuntime` when you made one with `newKhanaRuntimeWith`. A tokenizer that starts again when it is used again can be given to the next world.
+
+What hosigraph does with it:
+
+* **The events and the text are as written.** A `fulltext` attribute `note/body` is kept by the khana as an ordinary string attribute, and beside it `note/body.words` holds the words of that text, joined by a space; that one is the fulltext attribute, with Datalevin's default analyzer (which cuts at the space). A schema that has an attribute with that name is refused (`BadArgument`). The words follow every write (`Create`, `Delete`, `erase`), and `rebuildKhana` makes them again from the events.
+* **A search text is cut the same way**, in the query: a string written in it, or a scalar `:in` input (`[(fulltext $ :note/body "猫") …]`, `:in $ ?q`). Any other form of the text is refused. Both forms of the call (with an attribute, and `(fulltext $ ?q)`) work, with `{:top 5}` too.
+* **`clean` makes the khana again**, as it does for the JVM (see above).
+* **Several words are AND, within the best `:top`.** A text that the tokenizer cuts into several words finds the entities that have **all** of them, in any order, as whole words (`dog` is not found in `dogma`; a word said twice is one word). Datalevin's own search finds the ones that have *any* of them, so the call is sent as it is, with its `:top` (Datalevin's own: the best 10 when none is written), and the same query checks what it found: the words of the entity come back as `?v`, and one clause for each word asks whether it is one of them. So the answer is **the ones of the best `:top` (by Datalevin's relevance) that have every word**:
+  a small `:top` can give fewer than it, or none, while more entities that have every word are further down; a `:top` as big as the number of entities gives all of them (and then every entity that has any one of the words is scored: 1.2 s to 2.7 s on 50,000 notes with the native `dtlv`). One word is as before.
+  A word that Datalevin's analyzer drops from a search (an English stop word, `at`) is still asked for, since it is a word of the tokenizer. The call must be a clause of the query itself (inside `or`, `not` or any other form it is refused, not searched as if it were one word), and its rows `[[?e ?a ?v]]` (any of the three may be `_`, and a shorter row is fine; the checks add the variables `?fulltext-v1`, `?fulltext-p1`, ... to the query).
+* **What the call gives back:** `?a` is `note/body.words` and `?v` is the words (`"猫 動画"`), not the text; ask for the text with `[?e :note/body ?t]`. An `:in` input used by a `fulltext` call is the words in the whole query, not only there. `note/body.words` is also seen in `entity`, `datoms` and the counts.
+* **The default analyzer still works on the words:** it seems to drop English stop words (a search for `on` found nothing in a text that had it, `and onward`). The list was not looked at. (With several words, a stop word is still asked for: see above.)
+* **Not done:** the C door has no option for it (`:khana` and `:schema` only, no tokenizer); with `openHosiShared` the runtime that was lent keeps its own tokenizer and `hcTokenizer` is not looked at.
+* **Tried** with `KhanaDtlv` and `KhanaDtlvRepl` (`dtlv` 1.2.11), by tests with a tokenizer made for them and by the Sudachi one of the example on 4,602 real notes. With `KhanaDatalevinJvm` it is written and the tests for it are written, and **were not run** (no JDK here).
+
+## Where "now" lives
+
+The khana is a Datalevin database. There are three ways to reach it:
+
+| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlvRepl path` | `KhanaDtlv path` |
+|---|---|---|---|
+| What it is | Datalevin in **one JVM that stays up** (one JVM for each `Hosi`) | Datalevin in **one native `dtlv repl` that stays up** (one process for each `Hosi`) | Datalevin through the `dtlv` command, **one process for each operation** |
+| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 0.1 ms to read, 0.25 ms to write (the first call: about 30 ms to start) | about 25 ms (the first call: about 0.4 s) |
+| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file (tried with 1.2.11) | one `dtlv` file |
+| Write-ahead log | yes (relaxed) | yes (the same) | no |
+| `(max ?x)` and `(min ?x)` | work | work | work with `dtlv` 1.2.11; **do not** with 1.2.10 (see "Limits") |
+| `fulltext` | yes | with a tokenizer | with a tokenizer |
+| Files in | `khana-dtlv/` | `khana-dtlv/` | `khana-dtlv/` |
+
+The numbers of the JVM and of `dtlv` are from 2026-11-16 and the repl's from 2026-11-22 (another program, `dtlv` 1.2.11): they are not side by side. See "Measurements".
+
+```haskell
+cfg = defaultConfig { hcKhanaBackend = KhanaDtlvRepl "/usr/local/bin/dtlv" }
 cfg = defaultConfig { hcKhanaBackend = KhanaDtlv "/usr/local/bin/dtlv" }
 cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datalevin-1.2.10-standalone.jar" }
 ```
@@ -277,13 +315,23 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datale
 * If `dtlv`, `java`, or the jar is missing, `openHosi` stops with `BackendMissing` **before it touches anything**.
   The default expects `datalevin-standalone.jar` in the place where you run, so give the real path.
 * To switch from one khana to another, just fold the events into the new one. The tests do this in both directions.
-* The two Datalevin khanas read the same files, so they must not be open at the same time. Through hosigraph they cannot be: a world is open once at a time (see "One opener at a time" under Limits).
+* The Datalevin khanas read the same files, so they must not be open at the same time. Through hosigraph they cannot be: a world is open once at a time (see "One opener at a time" under Limits).
   A program that opens `khana-dtlv/` on its own is not stopped by that, and hosigraph does not check the LMDB lock.
 * `KhanaDtlv` sends the code on standard input to `dtlv exec`. A write is one `transact!`, so "all or none" holds.
+* `KhanaDtlvRepl` starts `dtlv repl` at the first call and keeps it. It sends one form at a time (one call at a time, under a lock) and reads one line back;
+  the form prints a string, so what comes back is one line however many newlines the value has. The connection stays open in the repl, so a call does not open and close the database.
+  A value with a newline, the word `user> `, a lone parenthesis, a thousand characters or unicode in it comes back whole, and 20,000 facts go through in one write (tested).
+  `closeHosi` closes the connection and ends the repl. **If your process ends without `closeHosi`, the repl stays:** a `dtlv repl` with a database open was still there ten seconds after its input closed (it leaves at once when the connection was closed first), so it has to be killed by hand.
+  If the repl dies, that one call fails (a write fails with `WriteRejected`), and the next call starts a new one. Nothing is lost, because the khana can be built again from the events. This was tried with `kill -9`.
+  What the interpreter itself refuses (a form it cannot read) is said on standard error; hosigraph returns the first lines of it as the error.
+  **A call has no time limit**, as with the JVM: a repl that is alive and says nothing is waited for.
+* `KhanaDtlvRepl` opens the khana with the same write-ahead log as the JVM (the same options) and writes with `transact-ack!`; `txlog/` is made, and the compacted copy that `clean` makes is taken through the repl too.
+  An erased value stays in `txlog/` until `clean` and is in no file after it (the same test as the JVM's). Measured, a write is 0.235 ms with the log and 0.37 ms without (about 1.6 times; the JVM's is about 3 times).
+  **The repl killed with `kill -9` after 200 acknowledged writes kept all 200** (three times). **Not tried: the power going off, or the operating system crashing**, with the relaxed profile.
 * `KhanaDatalevinJvm` talks to the JVM one line at a time. `closeHosi` ends it, and so does the end of your process.
   If the JVM dies, that one call fails (a write fails with `WriteRejected`), and the next call starts a new JVM.
   Nothing is lost, because the khana can be built again from the events.
-* `KhanaDatalevinJvm` opens the khana with Datalevin's **write-ahead log in the relaxed profile** (small segments, small retention), and writes with `transact-ack!`.
+* `KhanaDatalevinJvm` (and, as above, `KhanaDtlvRepl`) opens the khana with Datalevin's **write-ahead log in the relaxed profile** (small segments, small retention), and writes with `transact-ack!`.
   A write waits for the log once, not for the log and LMDB's own sync as well; measured, one write per transaction is about 3 times faster (batches, `writeMany`, are the same speed).
   If the process dies, the khana may lose its last few writes; the folded seq is in the same transaction as the facts, so the next open sees that the khana is behind the tail log and folds the rest in.
   `KhanaDtlv` is left as it was: one process per operation, with `transact!`.
@@ -326,6 +374,7 @@ bump h post = do
   if somebody wrote in between. That is what `Holds` is for.
 * With `KhanaDtlv`, a read made at the very moment another call writes can fail to open the
   database. The lock only orders the writers; it does not stop an outside read. (The JVM backend was not tried for this.)
+  `KhanaDtlvRepl` asks its one process one thing at a time, so two calls of hosigraph do not meet in two processes; the tests of `writeIf` run on it and pass.
 
 Through the C door it is the same call: `write` takes an optional `:when`, a vector of `[:holds id attr v]`,
 `[:lacks id attr v]` and `[:unset id attr]`. When one does not hold the answer is the error kind `:conflict`
@@ -385,6 +434,20 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 * The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms; not part of the run above). hosigraph calls only `fsync(2)`,
   and on macOS that does not wait for the disk write cache. On systems that really wait, the time is higher. It is not measured.
 
+**`KhanaDtlvRepl`** was measured on **2026-11-22**, on the same Mac, with `dtlv` 1.2.11 and **not by `scripts/bench.hs`**, so it is not in the table above.
+A small program over `openHosiWith` (not in the repository): a world of 1,000 people, then one call at a time through `Hosi`, median of 500 for the repl and of 60 for `dtlv`, `fsync` on.
+
+| | `KhanaDtlvRepl` | `KhanaDtlv` |
+|---|---|---|
+| `write`, one person at a time | 0.235 ms (0.37 ms without the write-ahead log) | 23.1 ms |
+| `getEntity` | 0.106 ms | 22.4 ms |
+| `[:find (max ?a) .]` | 0.098 ms | 25.1 ms |
+
+* The slowest of the 500 calls took 2 to 8 ms; the 95th percentile is under 0.35 ms.
+* It starts in about 25 to 30 ms (263 ms the first time, when `dtlv` was not in the file cache); that is from a small probe, not through hosigraph.
+  In that probe the process held about 53 MB after it opened a database, and about 108 MB after 1,000 writes and 140 point queries. The JVM's memory (below) is from another world; none of these were taken side by side.
+* The JVM was not run in this measurement (there was no JDK 21 on the machine), so the table does not say how the repl and the JVM compare.
+
 **What a world costs.** A made-up world: 25,000 entities of 4 facts each (name, age, score, tag), so **100,000 events**, written in groups of 500 by `writeMany`:
 
 | | `KhanaDatalevinJvm` | `KhanaDtlv` |
@@ -415,10 +478,10 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 ## Limits
 
 * `query` does not accept `InRules`, because a `Rule` is a structure and not EDN text. Write the rules inside the query.
-* **`KhanaDtlv` cannot use `(max ?x)` or `(min ?x)`.** In `dtlv exec` 1.2.10, they return the collection of values, not the maximum or the minimum.
+* **`dtlv` 1.2.10 cannot do `(max ?x)` or `(min ?x)`** (`KhanaDtlv`; `KhanaDtlvRepl` runs the same interpreter). In `dtlv exec` 1.2.10, they return the collection of values, not the maximum or the minimum.
   They seem to resolve to `clojure.core/max` and `min`. `count`, `sum`, and `avg` are correct, and the same jar on a JVM is correct too.
-  So the problem is in `exec` of the native `dtlv`. hosigraph returns an error and does not read the result.
-  A canary test tells you when upstream fixes it.
+  So the problem is in the interpreter of the native `dtlv`. hosigraph returns an error and does not read the result.
+  **`dtlv` 1.2.11 does them right** (tried through `KhanaDtlv` and `KhanaDtlvRepl`; the test of the repl asks for both). The canary test, which expects the 1.2.10 answer, fails against 1.2.11: that is how you are told.
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
 * The order of rows is not guaranteed (a Datalevin answer is a set), **unless the query has `:order-by`** (see "Order and cut"). Sort the rows before you compare them otherwise.
@@ -444,7 +507,7 @@ A `HosiError` says which kind it is, so that you can answer it without reading t
 | `BackendMissing` | `backend-missing` | `dtlv`, or `java` and the Datalevin jar, is not where the config says | install it, or fix the path |
 | `SchemaRefused` | `schema-refused` | the khana cannot be made under this schema (a type that clashes with the data, a unique value that is not unique); nothing was changed | open again with the schema the world was made with |
 
-A khana that fails while it runs (the `dtlv` process or the JVM) is not a `HosiError` yet. It is a `DtlvError`, a bare string, and the C door tells it as `HOSI_ERR_INTERNAL`.
+A khana that fails while it runs (the `dtlv` process, the repl or the JVM) is not a `HosiError` yet. It is a `DtlvError`, a bare string, and the C door tells it as `HOSI_ERR_INTERNAL`.
 So a backend that has failed cannot be told from a query that the caller wrote wrongly and that reached the khana (a Haskell caller's `query`; the C door reads the query first and refuses it as `parse-error`). Making it a kind of its own is in `TODO.md`.
 
 ## What 0.1 promises
@@ -614,7 +677,7 @@ the chunks that got a record, how many facts left "now", and the ids that `Erase
 
 `erase` hides at once, but the bytes are still in the chunk, and the retracted facts are still in the khana's file. (This was measured: after a retract, a marker text was still in Datalevin's
 `data.mdb` twice, in the native `dtlv` and in the JVM alike. LMDB reuses freed pages *sometime*, which is luck, not a promise. A plain copy keeps the bytes; a compacted copy has none.
-With the JVM khana's write-ahead log the bytes are also in `txlog/segment-*.wal` and in `snapshots/*/data.mdb`, and *stay there until `clean`* (retracting, writing more, closing: none of it removes them).
+With the write-ahead log of the JVM khana (and of the repl's) the bytes are also in `txlog/segment-*.wal` and in `snapshots/*/data.mdb`, and *stay there until `clean`* (retracting, writing more, closing: none of it removes them).
 So the promise is the same, "after `clean` it is nowhere", but the time in between is different: without the log it was sometimes gone by luck, with it it is there for sure. The compacted copy has neither
 directory, and the old khana directory is replaced as a whole, so the log goes with it.)
 `clean` finishes the job, in this order:
@@ -895,8 +958,8 @@ What has been seen working: the Haskell tests above, and the ctypes conformance 
   The choice between PtrHash, PTHash, and RecSplit is open.
 * `takka/` exports the types (`Value`, `Schema`, …), EDN, and the Datalog and pull syntax (`Takka.Types`, `Takka.Edn`, `Takka.Syntax`).
   hosigraph needs these to write to Datalevin and to read its answers back.
-* **There is no in-process khana.** The khana is Datalevin, through `dtlv` or a JVM.
-  If Datalevin gets a native core of its own, it would be a new backend next to the two above.
+* **There is no in-process khana.** The khana is Datalevin, through `dtlv` (a process for each operation, or one `dtlv repl`) or a JVM.
+  If Datalevin gets a native core of its own, it would be a new backend next to the ones above.
 * The license is the Blue Oak Model License 1.0.0 (see [`LICENSE`](../LICENSE) and [`dependency-licenses.md`](dependency-licenses.md)).
 
 ## Open questions for the design document

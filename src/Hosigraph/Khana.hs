@@ -14,15 +14,17 @@
 -- 「星かな？」 ("a star, I wonder?"), which is also the question the point lookup asks,
 -- see "Hosigraph.Probe".
 --
--- /Two ways to reach Datalevin./  The instant is a Datalevin database, driven through
+-- /Three ways to reach Datalevin./  The instant is a Datalevin database, driven through
 --
 -- * @'KhanaDtlv' path@: a Datalevin database, driven through the @dtlv@ command
---   (the executable at @path@; in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), or
+--   (the executable at @path@; in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), one process for each operation,
+-- * @'KhanaDtlvRepl' path@: the same, through one resident @dtlv repl@ (see "Hosigraph.Khana.Repl"); the same write-ahead log
+--   as the JVM, and an operation costs a fraction of a millisecond, or
 -- * @'KhanaDatalevinJvm' java jar@: the same Datalevin database (same @khana-dtlv/@ directory),
 --   driven through one resident JVM running the Datalevin standalone jar
 --   (see "Hosigraph.Khana.Sidecar").  One JVM serves every khana a 'KhanaRuntime' opens.
 --
--- Both use the same files, so moving from one to the other needs no migration.
+-- All use the same files, so moving from one to the other needs no migration.
 --
 -- Folding is:
 --
@@ -34,8 +36,9 @@
 -- the events themselves, so "which events are in me" can never disagree with the data.
 module Hosigraph.Khana
   ( KhanaBackend(..), khanaDirName, Khana
-  , KhanaRuntime, newKhanaRuntime, closeKhanaRuntime
-  , metaEntity, foldedSeqAttr, eraseGenAttr, schemaMarkAttr, schemaMark, khanaSchema
+  , KhanaRuntime, newKhanaRuntime, newKhanaRuntimeWith, closeKhanaRuntime
+  , Tokenizer(..)
+  , metaEntity, foldedSeqAttr, eraseGenAttr, schemaMarkAttr, schemaMark, schemaMarkIn, khanaSchema
   , openKhana, closeKhana, foldedSeq, applyEvents, applyBatched, applyFacts, foldRefused, khanaDatoms, khanaDatomPage, compareKhanas, khanaDatomCount
   , khanaFoldedAndCount
     -- * Erasing
@@ -55,6 +58,7 @@ import           Data.Word
 import           Hosigraph.Backfill (Fact)
 import           Hosigraph.Event
 import           Hosigraph.Khana.Dtlv
+import           Hosigraph.Khana.Repl (DtlvRepl, newDtlvRepl, stopDtlvRepl)
 import           Hosigraph.Khana.Sidecar (Sidecar, newSidecar, stopSidecar)
 import           Hosigraph.Sha256 (sha256Hex)
 import qualified Takka.Syntax as Q
@@ -66,24 +70,50 @@ data KhanaBackend
   | KhanaDatalevinJvm FilePath FilePath
                                -- ^ the same, through one resident JVM: the @java@ command, and the
                                --   @datalevin-<version>-standalone.jar@
+  | KhanaDtlvRepl FilePath     -- ^ the same, through one resident native @dtlv repl@ (the @dtlv@ executable at this path):
+                               --   the process stays up, so an operation does not pay for a start (see "Hosigraph.Khana.Repl")
   deriving (Eq, Show)
 
 -- | The directory (inside the database directory) that holds this backend's khana.
 khanaDirName :: KhanaBackend -> FilePath
 khanaDirName (KhanaDtlv _)           = "khana-dtlv"
 khanaDirName (KhanaDatalevinJvm _ _) = "khana-dtlv"       -- the same Datalevin files, whoever runs them
+khanaDirName (KhanaDtlvRepl _)       = "khana-dtlv"
 
--- | What the khanas of one database share: with 'KhanaDatalevinJvm', the resident JVM (not started
--- until the first operation).  Close it after the last khana.
-newtype KhanaRuntime = KhanaRuntime (Maybe Sidecar)
+-- | What makes the words of a text, for a host that wants the words of a @fulltext@ attribute to be its own (Japanese, say, where the
+-- analyzer of the JVM cuts pairs of characters).  Hosigraph does not know how a text is cut: it asks.  One is made by the host
+-- ("example/hosi-mikke" makes one from a morphological analyzer), and given in 'newKhanaRuntimeWith' (or @hcTokenizer@).
+data Tokenizer = Tokenizer
+  { tkMark  :: Text
+    -- ^ Says which words this makes: the rules, the dictionary, the way of cutting.  It is in the mark of the schema, so a khana made
+    --   under another mark is made again from the events; so keep it the same while the words are the same, and change it when they are not.
+  , tkWords :: [Text] -> IO [Text]
+    -- ^ The words of each text, joined by a single space, in the order given, one answer for each text (an empty text has no words: @""@).
+    --   Used for what is written and for what is searched, so a search is made into words the way a text was.  It may be called from
+    --   several threads, and may throw: a write is then rejected ('WriteRejected': nothing is written), and a query fails with it.
+  , tkClose :: IO ()
+    -- ^ Let go of what it holds (a process, say).  Called when the runtime closes ('closeKhanaRuntime'); the tokenizer is not asked
+    --   for words after, unless it is given to another runtime, so one that starts again when it is used again is fine.
+  }
+
+-- | What the khanas of one database share: with 'KhanaDatalevinJvm', the resident JVM; with 'KhanaDtlvRepl', the
+-- resident @dtlv repl@; and, if there is a tokenizer ('newKhanaRuntimeWith'), that.  Close it after the last khana.
+data KhanaRuntime = KhanaRuntime (Maybe Sidecar) (Maybe DtlvRepl) (Maybe Tokenizer)
 
 newKhanaRuntime :: KhanaBackend -> IO KhanaRuntime
-newKhanaRuntime b = case b of
-  KhanaDatalevinJvm java jar -> KhanaRuntime . Just <$> newSidecar java jar
-  _                          -> pure (KhanaRuntime Nothing)
+newKhanaRuntime b = newKhanaRuntimeWith b Nothing
+
+-- | 'newKhanaRuntime' with a tokenizer: the words of the @fulltext@ attributes are made by it, and then any backend can have them
+-- (the native @dtlv@ too: it cannot run an analyzer of ours, and does not have to).  See "Hosigraph.Khana.Dtlv" ('Words').
+-- The runtime owns the tokenizer: closing the runtime calls 'tkClose'.
+newKhanaRuntimeWith :: KhanaBackend -> Maybe Tokenizer -> IO KhanaRuntime
+newKhanaRuntimeWith b tk = case b of
+  KhanaDatalevinJvm java jar -> (\s -> KhanaRuntime (Just s) Nothing tk) <$> newSidecar java jar
+  KhanaDtlvRepl exe          -> (\r -> KhanaRuntime Nothing (Just r) tk) <$> newDtlvRepl exe
+  _                          -> pure (KhanaRuntime Nothing Nothing tk)
 
 closeKhanaRuntime :: KhanaRuntime -> IO ()
-closeKhanaRuntime (KhanaRuntime m) = mapM_ stopSidecar m
+closeKhanaRuntime (KhanaRuntime s r t) = mapM_ stopSidecar s >> mapM_ stopDtlvRepl r >> mapM_ tkClose t
 
 -- | An open khana.
 newtype Khana = DtlvKhana Dtlv
@@ -118,11 +148,20 @@ schemaMarkAttr = "hosi.meta/schema"
 -- | A mark of a schema: a hash of every attribute's name, type, cardinality and uniqueness (in name order), so two
 -- schemas have the same mark exactly when they fold the same events the same way.
 schemaMark :: Schema -> Text
-schemaMark s = T.pack ("hosi-schema/1:" ++ sha256Hex (TE.encodeUtf8 (T.pack text)))
+schemaMark = schemaMarkWith Nothing
+
+-- | The mark of a schema as a runtime sees it: with a tokenizer, a fulltext attribute has the words that tokenizer makes
+-- ('tkMark') in its mark in place of the analyzer of the JVM.
+schemaMarkIn :: KhanaRuntime -> Schema -> Text
+schemaMarkIn (KhanaRuntime _ _ t) = schemaMarkWith (tkMark <$> t)
+
+-- | 'schemaMark', with the mark of the tokenizer that makes the words, if there is one.
+schemaMarkWith :: Maybe Text -> Schema -> Text
+schemaMarkWith tokenizer s = T.pack ("hosi-schema/1:" ++ sha256Hex (TE.encodeUtf8 (T.pack text)))
   where
     text = concat [ T.unpack (kwText k) ++ " " ++ show (asType a) ++ " " ++ show (asCard a) ++ " " ++ show (asUnique a)
                     ++ concat [ " tuple " ++ unwords (map (T.unpack . kwText) (asTuple a)) | not (null (asTuple a)) ]   -- only when set: a mark made before tuples stays the same
-                    ++ concat [ " fulltext " ++ analyzerVersion | asFulltext a ]
+                    ++ concat [ " fulltext " ++ maybe analyzerVersion T.unpack tokenizer | asFulltext a ]
                     ++ "\n"
                   | (k, a) <- M.toAscList s ]
 
@@ -137,15 +176,42 @@ khanaSchema = M.insert schemaMarkAttr (attr TString) . M.insert cleanGenAttr (at
 
 -- | Open (creating if needed) a khana in a directory.
 openKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> Schema -> IO Khana
-openKhana (KhanaRuntime sc) backend dir schema = case backend of
-  KhanaDtlv exe
-    | any asFulltext (M.elems schema) -> throwIO (SchemaRefused
-        ("the attribute(s) " ++ unwords [ T.unpack (kwText k) | (k, a) <- M.toList schema, asFulltext a ]
-         ++ " are fulltext, and the native dtlv cannot run the analyzer that makes their words: use KhanaDatalevinJvm"))
-    | otherwise -> DtlvKhana <$> openDtlv (Native exe) dir (khanaSchema schema)
-  KhanaDatalevinJvm _ _ -> case sc of
-    Just s  -> DtlvKhana <$> openDtlv (Resident s) dir (khanaSchema schema)
-    Nothing -> throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)")
+openKhana (KhanaRuntime sc rp tk) backend dir schema0 = do
+  (schema, ws) <- either (throwIO . BadArgument) pure (wordsFor tk schema0)
+  let open runner = DtlvKhana <$> openDtlvWith runner ws dir (khanaSchema schema)
+  case backend of
+    KhanaDtlv exe
+      | any asFulltext (M.elems schema0), Nothing <- tk -> throwIO (SchemaRefused fulltextRefusal)
+      | otherwise -> open (Native exe)
+    KhanaDtlvRepl _
+      | any asFulltext (M.elems schema0), Nothing <- tk -> throwIO (SchemaRefused fulltextRefusal)
+      | otherwise -> case rp of
+          Just r  -> open (NativeRepl r)
+          Nothing -> throwIO (BadArgument "KhanaDtlvRepl needs a KhanaRuntime made for it (newKhanaRuntime)")
+    KhanaDatalevinJvm _ _ -> case sc of
+      Just s  -> open (Resident s)
+      Nothing -> throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)")
+  where
+    fulltextRefusal =
+      "the attribute(s) " ++ unwords [ T.unpack (kwText k) | (k, a) <- M.toList schema0, asFulltext a ]
+      ++ " are fulltext, and the native dtlv cannot run the analyzer that makes their words: use KhanaDatalevinJvm, or give the runtime a tokenizer (hcTokenizer)"
+
+-- | With a tokenizer, the schema a khana is opened with: each @fulltext@ attribute is an ordinary one (its text as written), and
+-- has beside it the attribute that holds its words ('wordsAttr'), which is the fulltext one.  And the 'Words' that do it.
+-- Without a tokenizer, nothing changes.
+wordsFor :: Maybe Tokenizer -> Schema -> Either String (Schema, Maybe Words)
+wordsFor Nothing schema = Right (schema, Nothing)
+wordsFor (Just tk) schema
+  | M.null ft = Right (schema, Nothing)
+  | not (null clash) = Left ("the attribute(s) " ++ unwords (map (T.unpack . kwText) clash)
+                             ++ " are taken by the words of a fulltext attribute (it keeps its words in an attribute of the name + \".words\")")
+  | otherwise = Right (M.unions [plain, shadows, schema], Just (Words (tkWords tk) names (tkMark tk)))
+  where
+    ft      = M.filter asFulltext schema
+    plain   = M.map (\a -> a { asFulltext = False }) ft
+    names   = M.fromList [ (k, wordsAttr k) | k <- M.keys ft ]
+    shadows = M.fromList [ (wordsAttr k, AttrSchema TString (asCard a) NotUnique [] True) | (k, a) <- M.toList ft ]
+    clash   = [ k | k <- M.elems names, M.member k schema ]
 
 closeKhana :: Khana -> IO ()
 closeKhana k = case k of
@@ -180,9 +246,11 @@ markIn m = case M.lookup schemaMarkAttr m of
 -- The khana is opened with only its own bookkeeping declared, and let go of at once.  Datalevin writes the schema it is
 -- opened with into the file, so a schema that may still be refused must not be given to a khana that is to be left as it was.
 peekKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> IO (Word64, Int, Maybe Text)
-peekKhana (KhanaRuntime sc) backend dir = do
+peekKhana (KhanaRuntime sc rp _) backend dir = do
   runner <- case backend of
     KhanaDtlv exe         -> pure (Native exe)
+    KhanaDtlvRepl _       -> maybe (throwIO (BadArgument "KhanaDtlvRepl needs a KhanaRuntime made for it (newKhanaRuntime)"))
+                                   (pure . NativeRepl) rp   -- through the repl: it opens with the log, which may be ahead of the data file
     KhanaDatalevinJvm _ _ -> maybe (throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)"))
                                    (pure . Resident) sc
   d <- attachDtlv runner dir (khanaSchema M.empty)
@@ -193,7 +261,7 @@ peekKhana (KhanaRuntime sc) backend dir = do
 -- whole; an empty one (nothing folded yet) is stamped at open.
 setSchemaMark :: Khana -> Schema -> IO ()
 setSchemaMark k s = case k of
-  DtlvKhana d -> dtlvTransact d [ DAdd metaEntity schemaMarkAttr (VStr (schemaMark s)) ]
+  DtlvKhana d -> dtlvTransact d [ DAdd metaEntity schemaMarkAttr (VStr (schemaMarkWith (wdMark <$> dtlvWords d) s)) ]
 
 -- | Say that the khana has followed the erases up to this one, and holds nothing they took out: for a khana just
 -- made from the events, which left the erased ids out from the start (so both numbers are this one).

@@ -110,7 +110,7 @@ I did not confirm that. `hsc2hs` is a build tool that nothing depends on. Even i
 
 | what | licence | how hosigraph uses it |
 |---|---|---|
-| Datalevin 1.2.10 | EPL-2.0 (upstream `LICENSE`) | `KhanaDtlv`: starts the `dtlv` executable. `KhanaDatalevinJvm`: starts `java -jar` on the standalone jar. Talks over standard input/output. |
+| Datalevin 1.2.10 | EPL-2.0 (upstream `LICENSE`) | `KhanaDtlv`: starts the `dtlv` executable. `KhanaDtlvRepl`: starts `dtlv repl` and keeps it. `KhanaDatalevinJvm`: starts `java -jar` on the standalone jar. Talks over standard input/output. |
 | JDK 21 or newer | Depends on the build. CI uses Eclipse Temurin (GPL-2.0 with Classpath Exception). | Only `java` is started. |
 
 Nothing of Datalevin is compiled into or linked with hosigraph, and no Datalevin source is copied into this repository

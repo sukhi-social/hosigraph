@@ -77,6 +77,7 @@ main = do
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
       real = maybe [] (\exe -> tag "[dtlv]" (realTests ("[:dtlv " <> tshow exe <> "]"))) mexe
+          ++ maybe [] (\exe -> tag "[dtlv-repl]" (realTests ("[:dtlv-repl " <> tshow exe <> "]"))) mexe
           ++ maybe [] (\jar -> tag "[jvm]" (realTests ("[:jvm " <> tshow java <> " " <> tshow jar <> "]"))) mjar
   when (null real) $ putStrLn "  (real hosigraph tests skipped: set HOSIGRAPH_DTLV, or HOSIGRAPH_DATALEVIN_JAR and HOSIGRAPH_JAVA)"
   results <- forM (apiTests ++ codecTests ++ opTests ++ failureTests ++ openTests ++ stdioTests ++ jsonTests ++ generatedTests ++ real) $ \(name, act) -> do
@@ -626,6 +627,16 @@ openTests =
         checkEq "cold-after-ms: nothing is cold unless asked" Nothing (hcColdAfterMs c)
         checkEq "cold-block-events" (hcColdBlockEvents dc) (hcColdBlockEvents c)
         checkEq "schema" M.empty (oaSchema a))
+
+  , ("open: the three ways to run the khana are read, and each means what it says", do
+      let khana txt = either (Left . T.unpack) (Right . hcKhanaBackend . oaConfig) (parseOpen ("{:dir \"d\" :config {:khana " <> txt <> "}}"))
+      checkEq "dtlv" (Right (KhanaDtlv "/bin/dtlv")) (khana "[:dtlv \"/bin/dtlv\"]")
+      checkEq "dtlv-repl" (Right (KhanaDtlvRepl "/bin/dtlv")) (khana "[:dtlv-repl \"/bin/dtlv\"]")
+      checkEq "jvm" (Right (KhanaDatalevinJvm "java" "/opt/d.jar")) (khana "[:jvm \"java\" \"/opt/d.jar\"]")
+      forM_ ["[:dtlv-repl]", "[:dtlv-repl \"a\" \"b\"]", "[:dtlv-repl 1]", ":dtlv-repl"] $ \txt ->
+        case khana txt of
+          Left e  -> check ("the message names khana: " ++ e) ("khana" `T.isInfixOf` T.pack e)
+          Right b -> throwIO (userError ("accepted " ++ T.unpack txt ++ " as " ++ show b)))
 
   , ("open: what is not the shape is said at once, with where", do
       forM_ [ ("not edn (", "not EDN"), ("{:dir 5}", ":dir"), ("{:dir \"d\" :surprise 1}", "surprise")

@@ -33,6 +33,11 @@
 -- >  :schema {:person/name {:type :string} :person/age {:type :long}}
 -- >  :config {:khana [:jvm "java" "/opt/datalevin-standalone.jar"] :sync true}}
 --
+-- @:khana@ is how the khana is run: @[:jvm java jar]@ (a resident JVM, the default), @[:dtlv exe]@ (the native
+-- @dtlv@, one process for each operation) or @[:dtlv-repl exe]@ (one resident native @dtlv repl@).  They open the same
+-- files.  Only the JVM has fulltext through this door (the native khanas have it with a tokenizer, 'Hosigraph.hcTokenizer', which
+-- is not an option here).
+--
 -- Without @:dir@ (@{}@) nothing is opened: the connection answers @:ping@ and @:abi@ and refuses
 -- every other operation (@HOSI_ERR_APP@, kind @:bad-argument@).  A host can use it to check that
 -- the library loads, and which contract it speaks, before it has a database to give.
@@ -263,4 +268,4 @@ openTy = TMap
       , Field "cold-after-ms"     (TOpt TInt)
       , Field "sync"              (TOpt TBool)
       , Field "reader-cache-bytes" (TOpt TInt)
-      , Field "khana" (TOpt (TTag [Variant "dtlv" [TStr], Variant "jvm" [TStr, TStr]])) ]
+      , Field "khana" (TOpt (TTag [Variant "dtlv" [TStr], Variant "dtlv-repl" [TStr], Variant "jvm" [TStr, TStr]])) ]
