@@ -38,6 +38,7 @@ import           Hosigraph.Event (kindName)
 import           Hosigraph.Manifest (ChunkEntry(..), FileEntry(..))
 import           Setu.Codec
 import           Takka.Edn (Edn(..), renderEdn)
+import           Takka.Syntax (parseRulesText)
 import           Takka.Syntax (Pulled(..))
 
 deriving instance Generic Op
@@ -104,6 +105,9 @@ instance FromEdn Input where
     EVec [EKw "scalar", v] -> InScalar <$> fromEdn v
     EVec [EKw "coll", vs]  -> InColl <$> fromEdn vs
     EVec [EKw "rel", rows] -> InRel <$> fromEdn rows
+    EVec [EKw "rules", EStr t] -> case parseRulesText t of
+      Left err -> Left (T.pack ("rules: " ++ err))
+      Right _  -> Right (InRulesEdn t)
     _                      -> Left "not an input"
 
 -- | The value under a key of the arguments (a missing key is nil).

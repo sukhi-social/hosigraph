@@ -109,6 +109,7 @@ data Input
   | InColl   [Value]
   | InRel    [[Value]]
   | InRules  [Rule]
+  | InRulesEdn Text   -- ^ rules as EDN text (a vector of rules), checked by 'parseRulesText' and sent on as written
   deriving (Eq, Show)
 
 -- | Which way an @:order-by@ variable sorts.

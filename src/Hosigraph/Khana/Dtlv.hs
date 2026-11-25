@@ -415,7 +415,7 @@ dtlvDatomCount d = do
 dtlvQueryCells :: Dtlv -> Text -> [Input] -> IO [[Cell]]
 dtlvQueryCells d txt0 inputs0 = do
   (txt, inputs) <- wordsQuery d txt0 inputs0
-  (shape, dat, body) <- prepareQueryD txt inputs
+  (shape, dat, body) <- prepareQueryD (dataIsEvaluated d) txt inputs
   e     <- readReplyC d (Just dat) body
   rows  <- either (throwIO . DtlvError) pure (shapeRows shape e)
   forM rows (mapM cell)
@@ -437,15 +437,15 @@ dtlvQueryMany d qs0 = do
 prepareQuery :: Text -> Text -> [Input] -> IO (FindShape, Text)
 prepareQuery dbName txt inputs = do
   shape <- either (throwIO . DtlvError . ("query: " ++)) (pure . qShape) (readEdn txt >>= parseQuery)
-  args  <- either (throwIO . DtlvError) pure (mapM inputEdn inputs)
+  args  <- either (throwIO . DtlvError) pure (mapM (inputEdn True) inputs)
   pure (shape, "(q '" <> txt <> " " <> dbName <> T.concat (map (" " <>) args) <> ")")
 
 -- | 'prepareQuery' for one query against @c@: the code is the same for the same query text, and the inputs go as
 -- data, so the resident JVM compiles it once.
-prepareQueryD :: Text -> [Input] -> IO (FindShape, Text, Text)
-prepareQueryD txt inputs = do
+prepareQueryD :: Bool -> Text -> [Input] -> IO (FindShape, Text, Text)
+prepareQueryD evaluated txt inputs = do
   shape <- either (throwIO . DtlvError . ("query: " ++)) (pure . qShape) (readEdn txt >>= parseQuery)
-  args  <- either (throwIO . DtlvError) pure (mapM inputEdn inputs)
+  args  <- either (throwIO . DtlvError) pure (mapM (inputEdn evaluated) inputs)
   -- @q@ stays in the call position, with each input as @(nth data i)@: the native @dtlv exec@ takes @q@ only there
   -- (@(apply q ...)@ or @(let [f q] ...)@ is "Unable to resolve symbol: q"), and the text is still the same for the
   -- same query and the same number of inputs.
@@ -617,12 +617,16 @@ cell x = case x of
   EMap _ -> either (throwIO . DtlvError) (pure . CPull) (pulled x)
   _      -> CVal <$> value x
 
-inputEdn :: Input -> Either String Text
-inputEdn i = case i of
+-- | An input as the text of a form. 'True': the form is /evaluated/ (@dtlv exec@ code), so rules text is quoted;
+-- 'False': it travels as data, which is read and not evaluated, so it is left as written.
+inputEdn :: Bool -> Input -> Either String Text
+inputEdn evaluated i = case i of
   InScalar v -> ednVal v
   InColl vs  -> vec <$> mapM ednVal vs
   InRel rs   -> vec <$> mapM (fmap vec . mapM ednVal) rs
-  InRules _  -> Left "rules (InRules) cannot be sent to dtlv: write them into the query instead"
+  InRules _  -> Left "rules (InRules) cannot be sent to dtlv as parsed rules; send them as EDN text (InRulesEdn)"
+  -- evaluated, the rule heads would be calls: quoted, they are lists of symbols. As data they are read as they are.
+  InRulesEdn t -> Right (if evaluated then "'" <> t else t)
   where vec xs = "[" <> T.unwords xs <> "]"
 
 shapeRows :: FindShape -> Edn -> Either String [[Edn]]
@@ -654,6 +658,13 @@ pulled e = case e of
 
 -- ---------------------------------------------------------------------------
 -- Running dtlv
+
+-- | Is the @data@ of 'runWith' evaluated?  Under the native @dtlv@ and the resident @dtlv repl@ it is written into the
+-- code; the resident JVM reads it as data.
+dataIsEvaluated :: Dtlv -> Bool
+dataIsEvaluated d = case dtlvRunner d of
+  Resident _ -> False
+  _          -> True
 
 -- | The code for one operation.  Under @dtlv exec@ it opens the database and closes it again; under the resident
 -- @dtlv repl@ ('NativeRepl') the connection is kept (@conn!@ finds it, 'Hosigraph.Khana.Repl.setup' made it) and let go of
