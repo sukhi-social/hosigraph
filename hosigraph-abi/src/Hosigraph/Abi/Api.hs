@@ -162,6 +162,7 @@ tyInput = TTag
   [ Variant "scalar" [tyValue]
   , Variant "coll"   [TVec tyValue]
   , Variant "rel"    [TVec (TVec tyValue)]
+  , Variant "rules"  [TStr]
   ]
 
 -- | A cell of a row: a value, or a pulled tree (the tree is not described further).  A tuple whose first part is the

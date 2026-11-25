@@ -3221,6 +3221,20 @@ dtlvTests be =
       checkEq "...and the khana is still good" [] =<< verify h
       closeHosi h)
 
+  , ("dtlv: rules sent as EDN text answer a recursive rule next to other inputs, and a cycle ends", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do
+        -- a -> b -> c, and c -> b: a cycle between b and c
+        r <- write h [ Create (Tmp 1) "person/name" (Lit (VStr "a")), Create (Tmp 2) "person/name" (Lit (VStr "b")), Create (Tmp 3) "person/name" (Lit (VStr "c"))
+                     , Create (Tmp 1) "person/friend" (RefTo (Tmp 2)), Create (Tmp 2) "person/friend" (RefTo (Tmp 3)), Create (Tmp 3) "person/friend" (RefTo (Tmp 2)) ]
+        let a = wrTemps r M.! 1
+            -- every clause of one rule names its head variables the same way: Datalevin refuses to join them otherwise
+            rules = "[[(knows ?a ?b) [?a :person/friend ?b]] [(knows ?a ?b) [?a :person/friend ?x] (knows ?x ?b)]]"
+            q = "[:find ?n :in $ ?a % :where (knows ?a ?x) [?x :person/name ?n]]"
+        rows <- query h q [InScalar (VInt (fromIntegral a)), InRulesEdn rules]
+        checkEq "everyone a reaches, the cycle once" (sortOn show [[VStr "b"], [VStr "c"]]) (sortOn show rows)
+        checkEq "...and the khana is still good" [] =<< verify h)
+
   , ("dtlv: :order-by, :limit and :offset sort and cut a relation; a form Datalevin would ignore is refused before it is asked", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do

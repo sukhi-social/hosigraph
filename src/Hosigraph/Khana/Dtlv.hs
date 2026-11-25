@@ -622,7 +622,9 @@ inputEdn i = case i of
   InScalar v -> ednVal v
   InColl vs  -> vec <$> mapM ednVal vs
   InRel rs   -> vec <$> mapM (fmap vec . mapM ednVal) rs
-  InRules _  -> Left "rules (InRules) cannot be sent to dtlv: write them into the query instead"
+  InRules _  -> Left "rules (InRules) cannot be sent to dtlv as parsed rules; send them as EDN text (InRulesEdn)"
+  -- the inputs sit in a vector that dtlv evaluates: quoted, the rule heads are lists of symbols, not calls
+  InRulesEdn t -> Right ("'" <> t)
   where vec xs = "[" <> T.unwords xs <> "]"
 
 shapeRows :: FindShape -> Edn -> Either String [[Edn]]
