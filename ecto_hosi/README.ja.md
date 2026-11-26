@@ -4,9 +4,8 @@
 Ecto の `Repo` / `Changeset` / `preload` はそのまま使えて、Datalog ならではの**ルール(再帰を含む)**も書けます。
 
 > 状態: 0.1。本物の hosigraph + Datalevin 1.2.10 で、テスト 52 本が通っています(下の「確かめたこと・確かめていないこと」)。
-> **ただし、ルールを使うには hosigraph に「ルールを渡す口」が要ります。** 0.2 にはまだ無く、
-> [docs/hosigraph-patches/hosigraph-rules-input.patch](docs/hosigraph-patches/hosigraph-rules-input.patch)(約70行)で足せます。
-> 仕様と、試して分かったことは [docs/rules-input-contract.md](docs/rules-input-contract.md)。ルールを使わない部分は、パッチなしの hosigraph で動きます。
+> ルールを渡す口(rules input)は、はじめ hosigraph 0.2 に無く、このアダプター用のパッチで足していました。いまは hosigraph 本体に入っています(PR #27)。
+> 仕様と、試して分かったことは [docs/rules-input-contract.md](docs/rules-input-contract.md)。
 
 ## 使い方
 
