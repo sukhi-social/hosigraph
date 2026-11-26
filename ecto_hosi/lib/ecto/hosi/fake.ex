@@ -1,0 +1,418 @@
+defmodule Ecto.Hosi.Fake do
+  @moduledoc """
+  An in-memory stand-in for `Hosi`, with the same functions and the same answers as documented in
+  hosigraph-ex (`{:ok, %{temps: [[n, id]]}}`, `{:error, {:app, :conflict, _}}`, `[:ref, id]` values,
+  `when:` conditions, `[:rules, text]` query inputs). It exists so the adapter can be tested
+  without libhosi or Datalevin. It is NOT a model of every hosigraph rule: where this file and
+  hosigraph differ, hosigraph is right.
+  """
+  use GenServer
+
+  def start_link(opts \\ []) do
+    {open, gen_opts} = Keyword.pop(opts, :open, %{})
+    GenServer.start_link(__MODULE__, open, gen_opts)
+  end
+
+  def stop(conn), do: GenServer.stop(conn)
+
+  def write(conn, ops, opts \\ []),
+    do: GenServer.call(conn, {:write, ops, Keyword.get(opts, :when, [])})
+
+  def get_entities(conn, ids), do: GenServer.call(conn, {:get_entities, ids})
+  def query_many(conn, queries), do: GenServer.call(conn, {:query_many, queries})
+
+  def highest_in(conn, attr, keys, limit, opts \\ []),
+    do: GenServer.call(conn, {:highest_in, attr, keys, limit, opts})
+
+  def highest(conn, attr, limit, opts \\ []),
+    do: GenServer.call(conn, {:highest, attr, limit, opts})
+
+  def history(conn, id), do: GenServer.call(conn, {:history, id})
+  def erase(conn, erasures), do: GenServer.call(conn, {:erase, erasures})
+  @doc "The opening arguments and all facts, for assertions in tests."
+  def dump(conn), do: GenServer.call(conn, :dump)
+
+  @impl true
+  def init(open),
+    do:
+      {:ok,
+       %{open: open, schema: Map.get(open, :schema, %{}), facts: %{}, events: [], next_id: 1000}}
+
+  @impl true
+  def handle_call({:write, ops, conds}, _from, st) do
+    with :ok <- check_conditions(conds, st.facts),
+         {:ok, acc} <- apply_ops(ops, st),
+         :ok <- check_unique(acc.facts, st.schema) do
+      temps = for {n, id} <- Enum.sort(acc.tmp), do: [n, id]
+
+      st = %{
+        st
+        | facts: acc.facts,
+          events: st.events ++ Enum.reverse(acc.events),
+          next_id: acc.next_id
+      }
+
+      {:reply, {:ok, %{temps: temps}}, st}
+    else
+      {:error, _} = e -> {:reply, e, st}
+    end
+  end
+
+  def handle_call({:get_entities, ids}, _from, st),
+    do: {:reply, {:ok, Enum.map(ids, &entity(st.facts, &1))}, st}
+
+  def handle_call({:query_many, queries}, _from, st) do
+    facts = for {{id, a}, vals} <- st.facts, v <- vals, do: {id, a, v}
+    results = Enum.map(queries, &Ecto.Hosi.Fake.Datalog.run(&1, facts))
+
+    case Enum.find(results, &match?({:error, _}, &1)) do
+      nil -> {:reply, {:ok, Enum.map(results, fn {:ok, rows} -> rows end)}, st}
+      {:error, msg} -> {:reply, {:error, {:app, :"bad-argument", msg}}, st}
+    end
+  end
+
+  def handle_call({:highest, attr, limit, opts}, _from, st) do
+    places =
+      for {{id, ^attr}, vals} <- st.facts, v <- vals, do: %{val: v, id: id}
+
+    places = Enum.sort_by(places, &{&1.val, &1.id}, :desc)
+
+    places =
+      case opts[:after] do
+        nil -> places
+        %{val: v, id: i} -> Enum.filter(places, &({&1.val, &1.id} < {v, i}))
+      end
+
+    {:reply, {:ok, Enum.take(places, limit)}, st}
+  end
+
+  def handle_call({:highest_in, attr, keys, limit, opts}, _from, st) do
+    %{tuple: [ka, oa]} = Map.fetch!(st.schema, attr)
+
+    places =
+      for {{id, ^ka}, [k | _]} <- st.facts, k in keys, {{^id, ^oa}, [v | _]} <- [{{id, oa}, Map.get(st.facts, {id, oa}, [])}] ,
+          v != nil,
+          do: %{key: k, val: v, id: id}
+
+    places = Enum.sort_by(places, &{&1.val, &1.id}, :desc)
+
+    places =
+      case opts[:after] do
+        nil -> places
+        %{val: v, id: i} -> Enum.filter(places, &({&1.val, &1.id} < {v, i}))
+      end
+
+    {:reply, {:ok, Enum.take(places, limit)}, st}
+  end
+
+  def handle_call({:history, id}, _from, st),
+    do: {:reply, {:ok, Enum.filter(st.events, &(&1.id == id))}, st}
+
+  def handle_call({:erase, erasures}, _from, st) do
+    ids = for [:ids, ids] <- erasures, id <- ids, do: id
+    facts = Map.reject(st.facts, fn {{id, _}, _} -> id in ids end)
+    {:reply, {:ok, %{erased: length(ids)}}, %{st | facts: facts}}
+  end
+
+  def handle_call(:dump, _from, st), do: {:reply, %{open: st.open, facts: st.facts}, st}
+
+  ## ---- conditions
+
+  defp check_conditions(conds, facts) do
+    failed =
+      Enum.reject(conds, fn
+        [:holds, id, attr, v] -> v in vals(facts, id, attr)
+        [:lacks, id, attr, v] -> v not in vals(facts, id, attr)
+        [:unset, id, attr] -> vals(facts, id, attr) == []
+      end)
+
+    if failed == [],
+      do: :ok,
+      else: {:error, {:app, :conflict, "conditions failed: " <> inspect(failed)}}
+  end
+
+  ## ---- ops (all or nothing: a copy is changed and kept only if every op is good)
+
+  defp apply_ops(ops, st) do
+    acc = %{facts: st.facts, events: [], tmp: %{}, next_id: st.next_id, seq: length(st.events)}
+
+    Enum.reduce_while(ops, {:ok, acc}, fn op, {:ok, acc} ->
+      case apply_op(op, acc, st.schema) do
+        {:ok, acc} -> {:cont, {:ok, acc}}
+        {:error, _} = e -> {:halt, e}
+      end
+    end)
+  end
+
+  defp apply_op([kind, ref, attr, val], acc, schema) when kind in [:create, :delete] do
+    {id, acc} = resolve(acc, ref)
+    {val, acc} = resolve_ref_value(acc, val)
+
+    with {:ok, value} <- check_value(Map.get(schema, attr, %{}), attr, val) do
+      key = {id, attr}
+      current = Map.get(acc.facts, key, [])
+      card = get_in(schema, [attr, :card]) || :one
+
+      new =
+        case {kind, card} do
+          {:create, :one} -> [value]
+          {:create, :many} -> Enum.uniq(current ++ [value])
+          {:delete, _} -> List.delete(current, value)
+        end
+
+      facts = if new == [], do: Map.delete(acc.facts, key), else: Map.put(acc.facts, key, new)
+      seq = acc.seq + 1
+      event = %{seq: seq, kind: kind, id: id, attr: attr, val: value}
+      {:ok, %{acc | facts: facts, events: [event | acc.events], seq: seq}}
+    end
+  end
+
+  defp apply_op(other, _acc, _schema),
+    do: {:error, {:app, :"bad-argument", "not an op: " <> inspect(other)}}
+
+  defp resolve(acc, [:tmp, n]) do
+    case acc.tmp do
+      %{^n => id} -> {id, acc}
+      _ -> {acc.next_id, %{acc | tmp: Map.put(acc.tmp, n, acc.next_id), next_id: acc.next_id + 1}}
+    end
+  end
+
+  defp resolve(acc, id) when is_integer(id), do: {id, acc}
+
+  defp resolve_ref_value(acc, [:ref, [:tmp, _] = t]) do
+    {id, acc} = resolve(acc, t)
+    {[:ref, id], acc}
+  end
+
+  defp resolve_ref_value(acc, val), do: {val, acc}
+
+  # `[:ref, id]` is how an op names another entity; only `:ref` attributes take it, and they take nothing else.
+  defp check_value(%{type: :ref}, _attr, [:ref, id]) when is_integer(id), do: {:ok, id}
+
+  defp check_value(%{type: :ref}, attr, v),
+    do: bad("#{attr} is a ref, write [:ref, id] (got #{inspect(v)})")
+
+  defp check_value(_spec, attr, [:ref, _]), do: bad("#{attr} is not a ref attribute")
+  defp check_value(%{type: :long}, _a, v) when is_integer(v), do: {:ok, v}
+  defp check_value(%{type: :string}, _a, v) when is_binary(v), do: {:ok, v}
+  defp check_value(%{type: :boolean}, _a, v) when is_boolean(v), do: {:ok, v}
+  defp check_value(%{type: :double}, _a, v) when is_float(v), do: {:ok, v}
+  defp check_value(%{type: t}, a, v), do: bad("#{a} is #{t}, got #{inspect(v)}")
+  defp check_value(_no_type, _a, v), do: {:ok, v}
+
+  defp bad(msg), do: {:error, {:app, :"bad-argument", msg}}
+
+  ## ---- unique: a value one entity holds may not be held by another
+
+  defp check_unique(facts, schema) do
+    uniques = for {attr, %{unique: _}} <- schema, do: attr
+
+    dup =
+      Enum.find_value(uniques, fn attr ->
+        facts
+        |> Enum.flat_map(fn {{id, a}, vals} ->
+          if a == attr, do: Enum.map(vals, &{&1, id}), else: []
+        end)
+        |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+        |> Enum.find_value(fn {v, ids} ->
+          case Enum.sort(Enum.uniq(ids)) do
+            [first, second | _] -> {attr, v, first, second}
+            _ -> nil
+          end
+        end)
+      end)
+
+    case dup do
+      nil ->
+        :ok
+
+      {attr, v, first, second} ->
+        # the words of Datalevin 1.2.10, as hosigraph passes them on
+        {:error,
+         {:app, :"write-rejected",
+          "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}}
+    end
+  end
+
+  defp vals(facts, id, attr), do: Map.get(facts, {id, attr}, [])
+
+  defp entity(facts, id) do
+    for {{^id, a}, vals} <- facts, vals != [], into: %{}, do: {a, vals}
+  end
+end
+
+defmodule Ecto.Hosi.Fake.Datalog do
+  @moduledoc false
+  # A small Datalog evaluator over `{e, attr, v}` facts: patterns, predicates, `not-join`, `or-join`,
+  # rule calls (recursive ones to a fixed point), and the inputs scalar / coll / rules.
+
+  @special ["not-join", "or-join", "and"]
+
+  def run(%{q: text} = req, facts) do
+    inputs = Map.get(req, :inputs, [])
+
+    with {:ok, form} <- Hosi.Edn.decode(text) do
+      sec = sections(form)
+      {bindings, rules_text} = bind_inputs(Map.get(sec, :in, []), inputs)
+      rules = parse_rules(rules_text)
+      names = MapSet.new(rules, &elem(&1, 0))
+      rels = fixpoint(rules, %{facts: facts, rels: %{}, names: names})
+      ctx = %{facts: facts, rels: rels, names: names}
+
+      find = for {:symbol, v} <- Map.get(sec, :find, []), do: v
+
+      rows =
+        Map.get(sec, :where, [])
+        |> eval_clauses(bindings, ctx)
+        |> Enum.map(fn b -> Enum.map(find, &Map.fetch!(b, &1)) end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      {:ok, rows}
+    end
+  rescue
+    e -> {:error, Exception.message(e)}
+  end
+
+  defp sections(form) do
+    form
+    |> Enum.reduce({nil, %{}}, fn
+      k, {_, acc} when k in [:find, :in, :where] -> {k, Map.put(acc, k, [])}
+      x, {k, acc} -> {k, Map.update!(acc, k, &(&1 ++ [x]))}
+    end)
+    |> elem(1)
+  end
+
+  defp bind_inputs(ins, inputs) do
+    specs = Enum.reject(ins, &(&1 == {:symbol, "$"}))
+
+    if length(specs) != length(inputs),
+      do:
+        raise(
+          "the :in has #{length(specs)} inputs but #{length(inputs)} were given: #{inspect(ins)}"
+        )
+
+    specs
+    |> Enum.zip(inputs)
+    |> Enum.reduce({[%{}], nil}, fn
+      {{:symbol, "%"}, [:rules, text]}, {bs, _} when is_binary(text) ->
+        {bs, text}
+
+      {{:symbol, "?" <> _ = name}, [:scalar, v]}, {bs, r} ->
+        {Enum.map(bs, &Map.put(&1, name, v)), r}
+
+      {[{:symbol, name}, {:symbol, "..."}], [:coll, vs]}, {bs, r} when is_list(vs) ->
+        {for(b <- bs, v <- vs, do: Map.put(b, name, v)), r}
+
+      {spec, input}, _ ->
+        raise "cannot bind #{inspect(spec)} to #{inspect(input)}"
+    end)
+  end
+
+  defp parse_rules(nil), do: []
+
+  defp parse_rules(text) do
+    {:ok, rules} = Hosi.Edn.decode(text)
+
+    for [[{:symbol, name} | args] | body] <- rules do
+      {name, for({:symbol, a} <- args, do: a), body}
+    end
+  end
+
+  defp fixpoint(rules, ctx) do
+    rels =
+      Enum.reduce(rules, ctx.rels, fn {name, args, body}, acc ->
+        tuples =
+          for b <- eval_clauses(body, [%{}], %{ctx | rels: acc}),
+              do: Enum.map(args, &Map.fetch!(b, &1))
+
+        Map.update(acc, name, MapSet.new(tuples), &MapSet.union(&1, MapSet.new(tuples)))
+      end)
+
+    if rels == ctx.rels, do: rels, else: fixpoint(rules, %{ctx | rels: rels})
+  end
+
+  defp eval_clauses(clauses, bindings, ctx) do
+    Enum.reduce(clauses, bindings, fn clause, bs ->
+      Enum.flat_map(bs, &eval_clause(clause, &1, ctx))
+    end)
+  end
+
+  # [(op a b)]
+  defp eval_clause([[{:symbol, op} | args]], b, _ctx) do
+    [x, y] = Enum.map(args, &value(&1, b))
+    if predicate(op, x, y), do: [b], else: []
+  end
+
+  defp eval_clause([{:symbol, "not-join"}, vars, clauses | more], b, ctx) do
+    inner = Map.take(b, names(vars))
+    if eval_clauses([clauses | more], [inner], ctx) == [], do: [b], else: []
+  end
+
+  defp eval_clause([{:symbol, "or-join"}, vars | branches], b, ctx) do
+    join = names(vars)
+
+    for branch <- branches,
+        r <- eval_clauses(branch_clauses(branch), [Map.take(b, join)], ctx),
+        uniq: true,
+        do: Map.merge(b, Map.take(r, join))
+  end
+
+  # a clause that starts with a symbol: [?e :a ?v] (a variable first) or (rule a b)
+  defp eval_clause([{:symbol, name} | args] = clause, b, ctx) when name not in @special do
+    if String.starts_with?(name, ["?", "_"]) do
+      pattern(clause, b, ctx)
+    else
+      unless MapSet.member?(ctx.names, name), do: raise("unknown rule #{name} (no rules input?)")
+
+      for tuple <- Map.get(ctx.rels, name, MapSet.new()),
+          length(tuple) == length(args),
+          b2 <- unify_all(args, tuple, b),
+          do: b2
+    end
+  end
+
+  # [123 :a ?v]  -- an entity id first
+  defp eval_clause([_e, attr, _v] = clause, b, ctx) when is_atom(attr),
+    do: pattern(clause, b, ctx)
+
+  defp pattern([e, attr, v], b, ctx) do
+    for {id, a, val} <- ctx.facts,
+        a == attr,
+        b1 <- unify(e, id, b),
+        b2 <- unify(v, val, b1),
+        do: b2
+  end
+
+  defp branch_clauses([{:symbol, "and"} | clauses]), do: clauses
+  defp branch_clauses(clause), do: [clause]
+
+  defp unify_all(terms, values, b) do
+    Enum.zip(terms, values)
+    |> Enum.reduce([b], fn {t, v}, bs -> Enum.flat_map(bs, &unify(t, v, &1)) end)
+  end
+
+  defp unify({:symbol, "_"}, _v, b), do: [b]
+
+  defp unify({:symbol, name}, v, b) do
+    case b do
+      %{^name => ^v} -> [b]
+      %{^name => _} -> []
+      _ -> [Map.put(b, name, v)]
+    end
+  end
+
+  defp unify(lit, v, b), do: if(lit == v, do: [b], else: [])
+
+  defp value({:symbol, name}, b), do: Map.fetch!(b, name)
+  defp value(lit, _b), do: lit
+
+  defp names(vars), do: for({:symbol, n} <- vars, do: n)
+
+  defp predicate(op, x, y) when op in ["=", "=="], do: x == y
+  defp predicate(op, x, y) when op in ["not=", "!="], do: x != y
+  defp predicate("<", x, y), do: x < y
+  defp predicate("<=", x, y), do: x <= y
+  defp predicate(">", x, y), do: x > y
+  defp predicate(">=", x, y), do: x >= y
+end
