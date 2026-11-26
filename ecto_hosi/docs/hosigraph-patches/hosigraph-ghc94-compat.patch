@@ -1,0 +1,93 @@
+--- a/src/Hosigraph/Sync.hs
++++ b/src/Hosigraph/Sync.hs
+@@ -44,7 +44,7 @@
+     open  = createFile p gENERIC_WRITE share Nothing oPEN_EXISTING fILE_ATTRIBUTE_NORMAL Nothing
+     share = fILE_SHARE_READ .|. fILE_SHARE_WRITE .|. fILE_SHARE_DELETE
+ #else
+-fsyncPath p = bracket (openFd p ReadOnly defaultFileFlags) closeFd fileSynchronise
++fsyncPath p = bracket (openFd p ReadOnly Nothing defaultFileFlags) closeFd fileSynchronise
+ #endif
+ 
+ -- | The "write new, then swap" step: @tmp@ must already be fully written.
+--- a/src/Hosigraph/WorldLock.hs
++++ b/src/Hosigraph/WorldLock.hs
+@@ -58,7 +58,7 @@
+ import Data.Bits ((.|.))
+ import Foreign.C.Error (Errno, eAGAIN, eINTR, eWOULDBLOCK, getErrno, throwErrno)
+ import Foreign.C.Types (CInt(..))
+-import System.Posix.IO (OpenMode(ReadWrite), OpenFileFlags(..), closeFd, defaultFileFlags, openFd)
++import System.Posix.IO (OpenMode(ReadWrite), FdOption(CloseOnExec), closeFd, defaultFileFlags, openFd, setFdOption)
+ import System.Posix.Types (Fd(..))
+ 
+ foreign import ccall unsafe "flock" c_flock :: CInt -> CInt -> IO CInt
+@@ -74,7 +74,8 @@
+ -- | Take the lock on this file (made if it is not there).  'Nothing' when someone holds it.
+ tryWorldLock :: FilePath -> IO (Maybe WorldLock)
+ tryWorldLock path = do
+-  fd@(Fd n) <- openFd path ReadWrite defaultFileFlags { creat = Just 0o644, cloexec = True }
++  fd@(Fd n) <- openFd path ReadWrite (Just 0o644) defaultFileFlags
++  setFdOption fd CloseOnExec True   -- unix-2.7: no cloexec flag at open (unix-2.8 has one)
+   let go = do
+         r <- c_flock n (lockEx .|. lockNb)
+         if r == 0 then pure (Just (WorldLock fd)) else do
+--- a/src/Hosigraph/Backfill.hs
++++ b/src/Hosigraph/Backfill.hs
+@@ -29,6 +29,7 @@
+   ( Fact, Back, emptyBack, backStep
+   ) where
+ 
++import Data.List (foldl')  -- base < 4.20 does not export it from Prelude
+ import qualified Data.Map.Strict as M
+ import qualified Data.Set as S
+ 
+--- a/src/Hosigraph/Bin.hs
++++ b/src/Hosigraph/Bin.hs
+@@ -11,6 +11,7 @@
+   , crc32
+   ) where
+ 
++import Data.List (foldl')  -- base < 4.20 does not export it from Prelude
+ import           Data.Array.Unboxed (UArray, listArray, (!))
+ import           Data.Bits
+ import           Data.Int (Int64)
+--- a/src/Hosigraph/Chunk.hs
++++ b/src/Hosigraph/Chunk.hs
+@@ -62,6 +62,7 @@
+   , hashChunkFiles
+   ) where
+ 
++import Data.List (foldl')  -- base < 4.20 does not export it from Prelude
+ import           Control.Exception (throwIO)
+ import           Control.Monad
+ import           Data.Array (Array, bounds, listArray, rangeSize, (!))
+--- a/src/Hosigraph/Sha256.hs
++++ b/src/Hosigraph/Sha256.hs
+@@ -8,6 +8,7 @@
+ -- suite checks it against known vectors.
+ module Hosigraph.Sha256 (sha256, sha256Hex, toHex) where
+ 
++import Data.List (foldl')  -- base < 4.20 does not export it from Prelude
+ import           Control.Monad (forM_)
+ import           Data.Array.ST (newArray, readArray, runSTUArray, writeArray)
+ import           Data.Array.Unboxed (UArray, listArray, (!))
+--- a/takka/src/Takka/Edn.hs
++++ b/takka/src/Takka/Edn.hs
+@@ -18,6 +18,7 @@
+   , ednToValue
+   ) where
+ 
++import Data.List (foldl')  -- base < 4.20 does not export it from Prelude
+ import           Data.Char (chr, isDigit, isHexDigit, isSpace, digitToInt, ord)
+ import           Data.Text (Text)
+ import qualified Data.Text as T
+--- a/test/Spec.hs
++++ b/test/Spec.hs
+@@ -13,7 +13,7 @@
+ import           Data.Bits (xor)
+ import           Data.IORef
+ import           Data.Int (Int64)
+-import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate)
++import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate, foldl')
+ import qualified Data.Map.Strict as M
+ import qualified Data.Set as S
+ import qualified Data.Text as T

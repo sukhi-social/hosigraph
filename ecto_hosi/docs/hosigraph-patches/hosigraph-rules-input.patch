@@ -1,0 +1,76 @@
+--- a/takka/src/Takka/Syntax.hs
++++ b/takka/src/Takka/Syntax.hs
+@@ -109,6 +109,7 @@
+   | InColl   [Value]
+   | InRel    [[Value]]
+   | InRules  [Rule]
++  | InRulesEdn Text   -- ^ rules as EDN text (a vector of rules), checked by 'parseRulesText' and sent on as written
+   deriving (Eq, Show)
+ 
+ -- | Which way an @:order-by@ variable sorts.
+--- a/hosigraph-abi/src/Hosigraph/Abi/Api.hs
++++ b/hosigraph-abi/src/Hosigraph/Abi/Api.hs
+@@ -157,6 +157,7 @@
+   [ Variant "scalar" [tyValue]
+   , Variant "coll"   [TVec tyValue]
+   , Variant "rel"    [TVec (TVec tyValue)]
++  , Variant "rules"  [TStr]
+   ]
+ 
+ -- | A cell of a row: a value, or a pulled tree (the tree is not described further).  A tuple whose first part is the
+--- a/hosigraph-abi/src/Hosigraph/Abi/Codec.hs
++++ b/hosigraph-abi/src/Hosigraph/Abi/Codec.hs
+@@ -38,6 +38,7 @@
+ import           Hosigraph.Manifest (ChunkEntry(..), FileEntry(..))
+ import           Setu.Codec
+ import           Takka.Edn (Edn(..), renderEdn)
++import           Takka.Syntax (parseRulesText)
+ import           Takka.Syntax (Pulled(..))
+ 
+ deriving instance Generic Op
+@@ -104,6 +105,9 @@
+     EVec [EKw "scalar", v] -> InScalar <$> fromEdn v
+     EVec [EKw "coll", vs]  -> InColl <$> fromEdn vs
+     EVec [EKw "rel", rows] -> InRel <$> fromEdn rows
++    EVec [EKw "rules", EStr t] -> case parseRulesText t of
++      Left err -> Left (T.pack ("rules: " ++ err))
++      Right _  -> Right (InRulesEdn t)
+     _                      -> Left "not an input"
+ 
+ -- | The value under a key of the arguments (a missing key is nil).
+--- a/src/Hosigraph/Khana/Dtlv.hs
++++ b/src/Hosigraph/Khana/Dtlv.hs
+@@ -407,7 +407,9 @@
+   InScalar v -> ednVal v
+   InColl vs  -> vec <$> mapM ednVal vs
+   InRel rs   -> vec <$> mapM (fmap vec . mapM ednVal) rs
+-  InRules _  -> Left "rules (InRules) cannot be sent to dtlv: write them into the query instead"
++  InRules _  -> Left "rules (InRules) cannot be sent to dtlv as parsed rules; send them as EDN text (InRulesEdn)"
++  -- the inputs sit in a vector that dtlv evaluates: quoted, the rule heads are lists of symbols, not calls
++  InRulesEdn t -> Right ("'" <> t)
+   where vec xs = "[" <> T.unwords xs <> "]"
+ 
+ shapeRows :: FindShape -> Edn -> Either String [[Edn]]
+--- a/test/Spec.hs
++++ b/test/Spec.hs
+@@ -3217,6 +3217,20 @@
+       checkEq "...and the khana is still good" [] =<< verify h
+       closeHosi h)
+ 
++  , ("dtlv: rules sent as EDN text answer a recursive rule next to other inputs, and a cycle ends", withTmp $ \dir -> do
++      (_, clock) <- newClock nov11
++      withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do
++        -- a -> b -> c, and c -> b: a cycle between b and c
++        r <- write h [ Create (Tmp 1) "person/name" (Lit (VStr "a")), Create (Tmp 2) "person/name" (Lit (VStr "b")), Create (Tmp 3) "person/name" (Lit (VStr "c"))
++                     , Create (Tmp 1) "person/friend" (RefTo (Tmp 2)), Create (Tmp 2) "person/friend" (RefTo (Tmp 3)), Create (Tmp 3) "person/friend" (RefTo (Tmp 2)) ]
++        let a = wrTemps r M.! 1
++            -- every clause of one rule names its head variables the same way: Datalevin refuses to join them otherwise
++            rules = "[[(knows ?a ?b) [?a :person/friend ?b]] [(knows ?a ?b) [?a :person/friend ?x] (knows ?x ?b)]]"
++            q = "[:find ?n :in $ ?a % :where (knows ?a ?x) [?x :person/name ?n]]"
++        rows <- query h q [InScalar (VInt (fromIntegral a)), InRulesEdn rules]
++        checkEq "everyone a reaches, the cycle once" (sortOn show [[VStr "b"], [VStr "c"]]) (sortOn show rows)
++        checkEq "...and the khana is still good" [] =<< verify h)
++
+   , ("dtlv: :order-by, :limit and :offset sort and cut a relation; a form Datalevin would ignore is refused before it is asked", withTmp $ \dir -> do
+       (_, clock) <- newClock nov11
+       withHosiCfg ((backendCfg be) { hcClock = clock }) dir $ \h -> do
