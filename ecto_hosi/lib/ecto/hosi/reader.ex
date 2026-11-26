@@ -5,7 +5,7 @@ defmodule Ecto.Hosi.Reader do
   # `offset`, `select` of fields (or the struct), and `count`. Anything else raises and points
   # to `Repo.datalog/1`.
 
-  alias Ecto.Hosi.{Attr, Backend, Types}
+  alias Ecto.Hosi.{Attr, Backend, Kw, Types}
 
   @cmp_ops [:==, :!=, :<, :<=, :>, :>=]
   @cmp_text %{==: "=", !=: "not=", <: "<", <=: "<=", >: ">", >=: ">="}
@@ -50,7 +50,7 @@ defmodule Ecto.Hosi.Reader do
   defp legacy_ok?(query, params) do
     check_supported!(query)
     {source, _schema} = source!(query)
-    st = %{n: 0, inputs: [], params: params}
+    st = %{n: 0, inputs: [], params: params, kw: %{}}
     expr = where_expr(query)
     if expr, do: comp(expr, source, st)
     Enum.each(query.select.fields, &select_field/1)
@@ -144,7 +144,7 @@ defmodule Ecto.Hosi.Reader do
   defp direct_ids(_, _), do: :error
 
   defp datalog_ids(meta, marker, source, expr, params) do
-    st = %{n: 0, inputs: [], params: params}
+    st = %{n: 0, inputs: [], params: params, kw: Backend.keywords(meta)}
     {clauses, st} = if expr, do: comp(expr, source, st), else: {[], st}
     inputs = Enum.reverse(st.inputs)
     specs = Enum.map(inputs, &elem(&1, 0))
@@ -206,7 +206,7 @@ defmodule Ecto.Hosi.Reader do
           {["[(= 0 1)]"], st}
 
         vs ->
-          {var, st} = input(:coll, vs, st)
+          {var, st} = input(:coll, store(st, source, f, vs), st)
 
           if f == :id,
             do: {["[(= ?e #{var})]"], st},
@@ -238,15 +238,19 @@ defmodule Ecto.Hosi.Reader do
   defp comp(other, _source, _st), do: unsupported_expr(other)
 
   defp field_vs_value(:==, f, v, source, st) when f != :id do
-    {var, st} = input(:scalar, v, st)
+    {var, st} = input(:scalar, store(st, source, f, v), st)
     {["[?e #{Attr.kw(Attr.attr(source, f))} #{var}]"], st}
   end
 
   defp field_vs_value(op, f, v, source, st) do
     {lv, clauses, st} = field_var(f, source, st)
-    {var, st} = input(:scalar, v, st)
+    {var, st} = input(:scalar, store(st, source, f, v), st)
     {clauses ++ ["[(#{@cmp_text[op]} #{lv} #{var})]"], st}
   end
+
+  # a `hosi_keyword` field is compared as the keyword hosigraph keeps (a string for Elixir)
+  defp store(_st, _source, :id, v), do: v
+  defp store(st, source, f, v), do: Kw.to_store(st.kw, Attr.attr(source, f), v)
 
   defp field_var(:id, _source, st), do: {"?e", [], st}
 

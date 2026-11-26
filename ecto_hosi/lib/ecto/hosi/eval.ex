@@ -247,6 +247,7 @@ defmodule Ecto.Hosi.Eval do
 
   defp exists?(meta, table, column, value) do
     attr = Attr.attr(table, column)
+    value = Ecto.Hosi.Kw.to_store(Backend.keywords(meta), attr, value)
 
     req = %{
       q:

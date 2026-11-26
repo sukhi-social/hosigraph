@@ -62,7 +62,7 @@ defmodule Ecto.Hosi.Fake do
     do: {:reply, {:ok, Enum.map(ids, &entity(st.facts, &1))}, st}
 
   def handle_call({:query_many, queries}, _from, st) do
-    facts = for {{id, a}, vals} <- st.facts, v <- vals, do: {id, a, v}
+    facts = (for {{id, a}, vals} <- st.facts, v <- vals, do: {id, a, v}) ++ tuple_facts(st)
     results = Enum.map(queries, &Ecto.Hosi.Fake.Datalog.run(&1, facts))
 
     case Enum.find(results, &match?({:error, _}, &1)) do
@@ -197,6 +197,7 @@ defmodule Ecto.Hosi.Fake do
   defp check_value(%{type: :string}, _a, v) when is_binary(v), do: {:ok, v}
   defp check_value(%{type: :boolean}, _a, v) when is_boolean(v), do: {:ok, v}
   defp check_value(%{type: :double}, _a, v) when is_float(v), do: {:ok, v}
+  defp check_value(%{type: :keyword}, _a, v) when is_atom(v) and not is_nil(v) and not is_boolean(v), do: {:ok, v}
   defp check_value(%{type: t}, a, v), do: bad("#{a} is #{t}, got #{inspect(v)}")
   defp check_value(_no_type, _a, v), do: {:ok, v}
 
@@ -204,8 +205,43 @@ defmodule Ecto.Hosi.Fake do
 
   ## ---- unique: a value one entity holds may not be held by another
 
+  # What the khana keeps for a tuple attribute: `[a b]` for each entity that has one of the parts
+  # (`nil` for a part it lacks, which is a value there, not SQL's NULL).
+  defp tuples(facts, schema, attr) do
+    %{tuple: parts} = Map.fetch!(schema, attr)
+
+    ids = for {{id, a}, vals} <- facts, a in parts, vals != [], uniq: true, do: id
+    for id <- Enum.sort(ids), do: {id, attr, Enum.map(parts, &(facts |> vals(id, &1) |> List.first()))}
+  end
+
+  defp tuple_facts(st) do
+    for {attr, %{tuple: _}} <- st.schema, fact <- tuples(st.facts, st.schema, attr), do: fact
+  end
+
   defp check_unique(facts, schema) do
-    uniques = for {attr, %{unique: _}} <- schema, do: attr
+    with :ok <- check_unique_values(facts, schema), do: check_unique_tuples(facts, schema)
+  end
+
+  defp check_unique_tuples(facts, schema) do
+    Enum.find_value(for({attr, %{tuple: _, unique: _}} <- schema, do: attr), :ok, fn attr ->
+      facts
+      |> tuples(schema, attr)
+      |> Enum.group_by(&elem(&1, 2), &elem(&1, 0))
+      |> Enum.find_value(fn
+        {v, [first, second | _]} -> {:error, unique_error(attr, v, first, second)}
+        _ -> nil
+      end)
+    end)
+  end
+
+  defp unique_error(attr, v, first, second) do
+    # the words of Datalevin 1.2.10, as hosigraph passes them on
+    {:app, :"write-rejected",
+     "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}
+  end
+
+  defp check_unique_values(facts, schema) do
+    uniques = for {attr, %{unique: _} = spec} <- schema, not Map.has_key?(spec, :tuple), do: attr
 
     dup =
       Enum.find_value(uniques, fn attr ->

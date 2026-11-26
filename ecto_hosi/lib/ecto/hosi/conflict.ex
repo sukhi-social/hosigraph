@@ -195,7 +195,7 @@ defmodule Ecto.Hosi.Conflict do
       q:
         "[:find ?e :in $ #{Enum.join(vars, " ")} :where [?e #{Attr.kw(Attr.marker(source))} _] " <>
           "#{Enum.join(clauses, " ")}]",
-      inputs: for({_, v} <- pairs, do: [:scalar, v])
+      inputs: for({a, v} <- pairs, do: [:scalar, Ecto.Hosi.Kw.to_store(Backend.keywords(meta), a, v)])
     }
 
     case meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end) do
@@ -207,6 +207,7 @@ defmodule Ecto.Hosi.Conflict do
   # An expression / partial index. Datalog narrows by the plain columns and the WHERE; a
   # `lower(column)` is compared here, on the entities that came back.
   defp lookup_frag(meta, source, items, conds) do
+    kws = Backend.keywords(meta)
     plain = for {:plain, a, v} <- items, do: {a, v}
     lowers = for {:lower, a, v} <- items, do: {a, String.downcase(v)}
 
@@ -216,7 +217,7 @@ defmodule Ecto.Hosi.Conflict do
       |> Enum.map(fn
         {{:null, a}, _} -> {"(not-join [?e] [?e #{Attr.kw(a)} _])", []}
         {{:not_null, a}, _} -> {"[?e #{Attr.kw(a)} _]", []}
-        {{:eq, a, v}, i} -> {"[?e #{Attr.kw(a)} ?c#{i}]", [{"?c#{i}", v}]}
+        {{:eq, a, v}, i} -> {"[?e #{Attr.kw(a)} ?c#{i}]", [{"?c#{i}", Ecto.Hosi.Kw.to_store(kws, a, v)}]}
       end)
       |> Enum.unzip()
 
@@ -230,7 +231,9 @@ defmodule Ecto.Hosi.Conflict do
       q:
         "[:find ?e :in $ #{Enum.join(in_vars, " ")} :where [?e #{Attr.kw(Attr.marker(source))} _] " <>
           Enum.join(pclauses ++ lclauses ++ cond_clauses, " ") <> "]",
-      inputs: for({_, v} <- plain, do: [:scalar, v]) ++ for({_, v} <- cond_inputs, do: [:scalar, v])
+      inputs:
+        for({a, v} <- plain, do: [:scalar, Ecto.Hosi.Kw.to_store(kws, a, v)]) ++
+          for({_, v} <- cond_inputs, do: [:scalar, v])
     }
 
     ids = meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end)

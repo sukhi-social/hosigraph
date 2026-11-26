@@ -84,6 +84,9 @@ defmodule Ecto.Hosi.Batch do
       end
       |> Enum.reject(&is_nil/1)
 
+    # a `tuple: true` rule needs every field: a ref to a row made earlier in this batch counts as set
+    Ecto.Hosi.Derived.check_new!(meta, source, facts)
+
     # only values that are known now can be checked for uniqueness
     known = for {attr, v} <- facts, not is_list(v), do: {attr, v}
     derived = Ecto.Hosi.Derived.extend(meta, source, nil, known) -- known

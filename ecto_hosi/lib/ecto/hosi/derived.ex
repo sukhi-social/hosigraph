@@ -9,6 +9,10 @@ defmodule Ecto.Hosi.Derived do
   # `extend/5` is the one place that keeps the attribute right: whatever writes a row hands it the
   # attribute values it is about to write, and gets them back with the derived ones added (or
   # `{attr, nil}`, to retract one the row no longer has).
+  #
+  # A plain combination can instead be hosigraph's own tuple (`hosi_unique [:a, :b], tuple: true`,
+  # `native: true` here): the khana keeps `[a b]` itself, so nothing is derived or written, and
+  # `extend/5` only checks that no field is nil (a tuple's nil is a value, not SQL's NULL).
 
   alias Ecto.Hosi.{Attr, Backend}
 
@@ -20,10 +24,13 @@ defmodule Ecto.Hosi.Derived do
       for {fields, opts} <- mod.__hosi__(:uniques) do
         name = Keyword.get(opts, :name) || default_name(source, fields)
         where = Keyword.get(opts, :where, [])
+        native = Keyword.get(opts, :tuple, false)
+        if native, do: check_native!(mod, fields, opts)
 
         %{
           attr: Attr.attr(source, "uq-" <> name),
           name: name,
+          native: native,
           fields: fields,
           attrs: Enum.map(fields, &Attr.attr(source, &1)),
           lower: opts |> Keyword.get(:lower, []) |> Enum.map(&Attr.attr(source, &1)),
@@ -39,6 +46,14 @@ defmodule Ecto.Hosi.Derived do
   end
 
   defp default_name(source, [first | _]), do: "#{source}_#{first}_index"
+
+  defp check_native!(mod, fields, opts) do
+    if length(fields) < 2 or Keyword.has_key?(opts, :lower) or Keyword.has_key?(opts, :where) do
+      raise ArgumentError,
+            "#{inspect(mod)}: hosi_unique #{inspect(fields)}, tuple: true is for a plain combination " <>
+              "of two or more fields (no :lower, no :where): a tuple cannot say those"
+    end
+  end
 
   @doc "`%{source => [spec]}` for these schema modules; only sources that have a rule."
   def build(schemas) do
@@ -62,6 +77,8 @@ defmodule Ecto.Hosi.Derived do
 
       specs ->
         changed = Map.new(attrs)
+        {native, specs} = Enum.split_with(specs, & &1.native)
+        if id, do: Enum.each(native, &check_members!(&1, id, changed))
         touched = if id, do: Enum.filter(specs, &touches?(&1, changed)), else: specs
 
         if touched == [] do
@@ -83,6 +100,36 @@ defmodule Ecto.Hosi.Derived do
             end)
         end
     end
+  end
+
+  # A tuple's nil is a value: two rows `(1, nil)` would be the same pair. SQL's NULLs are distinct,
+  # so a rule that must keep that cannot be a tuple: say so instead of refusing rows later.
+  defp check_members!(spec, id, changed) do
+    missing =
+      if id,
+        do: for(a <- spec.attrs, Map.has_key?(changed, a), is_nil(changed[a]), do: a),
+        else: for(a <- spec.attrs, is_nil(Map.get(changed, a)), do: a)
+
+    if missing != [] do
+      raise ArgumentError,
+            "#{spec.name}: hosi_unique #{inspect(spec.fields)}, tuple: true needs every field set, " <>
+              "but #{inspect(missing)} would be nil (a tuple's nil is a value, SQL's NULL is not)"
+    end
+  end
+
+  @doc """
+  A new row's attributes (`[{attr, value}]`, a value that is not known yet written as `[:ref, ..]`)
+  checked against the `tuple: true` rules of `source`: every field of such a rule must be set.
+  `extend/5` checks an update (a field set to nil); only the caller knows a new row is complete.
+  """
+  def check_new!(meta, source, attrs) do
+    changed = Map.new(attrs)
+
+    meta
+    |> Map.get(:derived, %{})
+    |> Map.get(source, [])
+    |> Enum.filter(& &1.native)
+    |> Enum.each(&check_members!(&1, nil, changed))
   end
 
   defp touches?(spec, changed) do

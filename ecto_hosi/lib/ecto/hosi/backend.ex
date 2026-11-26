@@ -4,6 +4,11 @@ defmodule Ecto.Hosi.Backend do
   # the same functions) lives in the adapter meta as `:backend`; the connection as `:conn`.
 
   def write(meta, ops, opts \\ []) do
+    # a `hosi_keyword` field is a string for Elixir and a keyword for hosigraph: made here, once
+    kws = keywords(meta)
+    ops = Ecto.Hosi.Kw.ops(kws, ops)
+    opts = Ecto.Hosi.Kw.opts(kws, opts)
+
     if Ecto.Hosi.Tx.active?(meta) do
       Ecto.Hosi.Tx.before_write(meta, ops)
       result = meta.backend.write(meta.conn, ops, opts)
@@ -13,7 +18,15 @@ defmodule Ecto.Hosi.Backend do
       meta.backend.write(meta.conn, ops, opts)
     end
   end
-  def get_entities(meta, ids), do: meta.backend.get_entities(meta.conn, ids)
+
+  def get_entities(meta, ids) do
+    with {:ok, entities} <- meta.backend.get_entities(meta.conn, ids) do
+      {:ok, Enum.map(entities, &Ecto.Hosi.Kw.entity(keywords(meta), &1))}
+    end
+  end
+
+  @doc "`%{attr => %{string => keyword}}` of the `hosi_keyword` fields (empty if there are none)."
+  def keywords(meta), do: Map.get(meta, :keywords, %{})
 
   @doc "One query; the rows of its answer."
   def query(meta, %{q: _} = req) do
