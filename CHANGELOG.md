@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0.0 (not released)
+## 0.2.0.0 (2026-11-26)
 
 **No change to the files.** What 0.1.0 wrote, every 0.1.x and 0.2.x reads (the fixture of 0.1.0 is opened by every build), and a schema that uses none of the new things is the schema it was, so its khana is not made again.
 0.2 asks more of "now": an order and a cut, pairs, words, and the newest *n* of what some people wrote. It is still one process on one machine, on a local disk ([what is promised](docs/guide.md#what-01-promises)).
