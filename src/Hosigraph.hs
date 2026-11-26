@@ -166,9 +166,6 @@ verifyDir h = hDir h </> ("verify-" ++ khanaDirName (hcKhanaBackend (hCfg h)))
 
 -- | Fail early, and without touching any khana, if the chosen backend cannot start.
 checkBackend :: KhanaBackend -> IO ()
-checkBackend (KhanaDtlv exe) = do
-  found <- runnable exe
-  unless found $ throwIO (BackendMissing ("KhanaDtlv: no executable dtlv at " ++ show exe))
 checkBackend (KhanaDtlvRepl exe) = do
   found <- runnable exe
   unless found $ throwIO (BackendMissing ("KhanaDtlvRepl: no executable dtlv at " ++ show exe))
@@ -216,7 +213,7 @@ openHosiWithRuntime lent cfg dir schema = do
   rt <- maybe (newKhanaRuntimeWith (hcKhanaBackend cfg) (hcTokenizer cfg)) pure lent `onException` E.closeEvents ev
   let owns = case lent of Nothing -> True; Just _ -> False
       letGo = if owns then closeKhanaRuntime rt else pure ()
-  (do forM_ [KhanaDtlv ""] $ \b -> removePathForcibly (dir </> (khanaDirName b ++ ".new"))
+  (do removePathForcibly (dir </> (khanaDirName (hcKhanaBackend cfg) ++ ".new"))
       ref0 <- newIORef (error "khana not opened yet")
       let h = Hosi dir cfg schema ev ref0 rt owns
       lastS <- E.lastSeq ev

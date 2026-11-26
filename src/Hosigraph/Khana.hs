@@ -14,11 +14,10 @@
 -- 「星かな？」 ("a star, I wonder?"), which is also the question the point lookup asks,
 -- see "Hosigraph.Probe".
 --
--- /Three ways to reach Datalevin./  The instant is a Datalevin database, driven through
+-- /Two ways to reach Datalevin./  The instant is a Datalevin database, driven through
 --
--- * @'KhanaDtlv' path@: a Datalevin database, driven through the @dtlv@ command
---   (the executable at @path@; in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), one process for each operation,
--- * @'KhanaDtlvRepl' path@: the same, through one resident @dtlv repl@ (see "Hosigraph.Khana.Repl"); the same write-ahead log
+-- * @'KhanaDtlvRepl' path@: a Datalevin database (in the @khana-dtlv/@ directory, see "Hosigraph.Khana.Dtlv"), driven through
+--   one resident @dtlv repl@ (the executable at @path@; see "Hosigraph.Khana.Repl"); the same write-ahead log
 --   as the JVM, and an operation costs a fraction of a millisecond, or
 -- * @'KhanaDatalevinJvm' java jar@: the same Datalevin database (same @khana-dtlv/@ directory),
 --   driven through one resident JVM running the Datalevin standalone jar
@@ -66,8 +65,7 @@ import           Takka.Types
 
 -- | Where the instant lives.
 data KhanaBackend
-  = KhanaDtlv FilePath         -- ^ a Datalevin database, through the @dtlv@ executable at this path
-  | KhanaDatalevinJvm FilePath FilePath
+  = KhanaDatalevinJvm FilePath FilePath
                                -- ^ the same, through one resident JVM: the @java@ command, and the
                                --   @datalevin-<version>-standalone.jar@
   | KhanaDtlvRepl FilePath     -- ^ the same, through one resident native @dtlv repl@ (the @dtlv@ executable at this path):
@@ -76,7 +74,6 @@ data KhanaBackend
 
 -- | The directory (inside the database directory) that holds this backend's khana.
 khanaDirName :: KhanaBackend -> FilePath
-khanaDirName (KhanaDtlv _)           = "khana-dtlv"
 khanaDirName (KhanaDatalevinJvm _ _) = "khana-dtlv"       -- the same Datalevin files, whoever runs them
 khanaDirName (KhanaDtlvRepl _)       = "khana-dtlv"
 
@@ -110,7 +107,6 @@ newKhanaRuntimeWith :: KhanaBackend -> Maybe Tokenizer -> IO KhanaRuntime
 newKhanaRuntimeWith b tk = case b of
   KhanaDatalevinJvm java jar -> (\s -> KhanaRuntime (Just s) Nothing tk) <$> newSidecar java jar
   KhanaDtlvRepl exe          -> (\r -> KhanaRuntime Nothing (Just r) tk) <$> newDtlvRepl exe
-  _                          -> pure (KhanaRuntime Nothing Nothing tk)
 
 closeKhanaRuntime :: KhanaRuntime -> IO ()
 closeKhanaRuntime (KhanaRuntime s r t) = mapM_ stopSidecar s >> mapM_ stopDtlvRepl r >> mapM_ tkClose t
@@ -180,9 +176,6 @@ openKhana (KhanaRuntime sc rp tk) backend dir schema0 = do
   (schema, ws) <- either (throwIO . BadArgument) pure (wordsFor tk schema0)
   let open runner = DtlvKhana <$> openDtlvWith runner ws dir (khanaSchema schema)
   case backend of
-    KhanaDtlv exe
-      | any asFulltext (M.elems schema0), Nothing <- tk -> throwIO (SchemaRefused fulltextRefusal)
-      | otherwise -> open (Native exe)
     KhanaDtlvRepl _
       | any asFulltext (M.elems schema0), Nothing <- tk -> throwIO (SchemaRefused fulltextRefusal)
       | otherwise -> case rp of
@@ -215,7 +208,7 @@ wordsFor (Just tk) schema
 
 closeKhana :: Khana -> IO ()
 closeKhana k = case k of
-  DtlvKhana d     -> closeDtlv d             -- native: nothing stays open; JVM: close this one database
+  DtlvKhana d     -> closeDtlv d             -- the connection of this one database is let go of (the repl and the JVM stay up)
 
 -- | The seq of the last event folded in (0 for an empty khana).
 foldedSeq :: Khana -> IO Word64
@@ -248,7 +241,6 @@ markIn m = case M.lookup schemaMarkAttr m of
 peekKhana :: KhanaRuntime -> KhanaBackend -> FilePath -> IO (Word64, Int, Maybe Text)
 peekKhana (KhanaRuntime sc rp _) backend dir = do
   runner <- case backend of
-    KhanaDtlv exe         -> pure (Native exe)
     KhanaDtlvRepl _       -> maybe (throwIO (BadArgument "KhanaDtlvRepl needs a KhanaRuntime made for it (newKhanaRuntime)"))
                                    (pure . NativeRepl) rp   -- through the repl: it opens with the log, which may be ahead of the data file
     KhanaDatalevinJvm _ _ -> maybe (throwIO (BadArgument "KhanaDatalevinJvm needs a KhanaRuntime made for it (newKhanaRuntime)"))

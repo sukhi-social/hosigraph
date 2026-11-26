@@ -76,8 +76,7 @@ main = do
   mjava <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_JAVA"
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
-      real = maybe [] (\exe -> tag "[dtlv]" (realTests ("[:dtlv " <> tshow exe <> "]"))) mexe
-          ++ maybe [] (\exe -> tag "[dtlv-repl]" (realTests ("[:dtlv-repl " <> tshow exe <> "]"))) mexe
+      real = maybe [] (\exe -> tag "[dtlv-repl]" (realTests ("[:dtlv-repl " <> tshow exe <> "]"))) mexe
           ++ maybe [] (\jar -> tag "[jvm]" (realTests ("[:jvm " <> tshow java <> " " <> tshow jar <> "]"))) mjar
   when (null real) $ putStrLn "  (real hosigraph tests skipped: set HOSIGRAPH_DTLV, or HOSIGRAPH_DATALEVIN_JAR and HOSIGRAPH_JAVA)"
   results <- forM (apiTests ++ codecTests ++ opTests ++ failureTests ++ openTests ++ stdioTests ++ jsonTests ++ generatedTests ++ real) $ \(name, act) -> do
@@ -616,11 +615,11 @@ openTests =
         checkEq "cold-after-ms" (Just 86400000) (hcColdAfterMs c)
         checkEq "cold-block-events" 64 (hcColdBlockEvents c))
 
-  , ("open: what is left out is hosigraph's default", case parseOpen "{:dir \"d\" :config {:khana [:dtlv \"/bin/dtlv\"]}}" of
+  , ("open: what is left out is hosigraph's default", case parseOpen "{:dir \"d\" :config {:khana [:dtlv-repl \"/bin/dtlv\"]}}" of
       Left e  -> throwIO (userError (T.unpack e))
       Right a -> do
         let c = oaConfig a; dc = defaultConfig
-        checkEq "khana" (KhanaDtlv "/bin/dtlv") (hcKhanaBackend c)
+        checkEq "khana" (KhanaDtlvRepl "/bin/dtlv") (hcKhanaBackend c)
         checkEq "sync" (hcSync dc) (hcSync c)
         checkEq "seal-events" (hcSealEvents dc) (hcSealEvents c)
         checkEq "block-events" (hcBlockEvents dc) (hcBlockEvents c)
@@ -628,9 +627,9 @@ openTests =
         checkEq "cold-block-events" (hcColdBlockEvents dc) (hcColdBlockEvents c)
         checkEq "schema" M.empty (oaSchema a))
 
-  , ("open: the three ways to run the khana are read, and each means what it says", do
+  , ("open: the ways to run the khana are read, and each means what it says", do
       let khana txt = either (Left . T.unpack) (Right . hcKhanaBackend . oaConfig) (parseOpen ("{:dir \"d\" :config {:khana " <> txt <> "}}"))
-      checkEq "dtlv" (Right (KhanaDtlv "/bin/dtlv")) (khana "[:dtlv \"/bin/dtlv\"]")
+      checkEq "dtlv is not a way any more" True (either (const True) (const False) (khana "[:dtlv \"/bin/dtlv\"]"))
       checkEq "dtlv-repl" (Right (KhanaDtlvRepl "/bin/dtlv")) (khana "[:dtlv-repl \"/bin/dtlv\"]")
       checkEq "jvm" (Right (KhanaDatalevinJvm "java" "/opt/d.jar")) (khana "[:jvm \"java\" \"/opt/d.jar\"]")
       forM_ ["[:dtlv-repl]", "[:dtlv-repl \"a\" \"b\"]", "[:dtlv-repl 1]", ":dtlv-repl"] $ \txt ->
@@ -649,7 +648,7 @@ openTests =
           Right _ -> throwIO (userError ("accepted: " ++ T.unpack txt)))
 
   , ("open: a backend that is not there is HOSI_ERR_APP; no database at all is a connection that answers ping", do
-      r1 <- libConnect library "{:dir \"/tmp/hosi-abi-never\" :config {:khana [:dtlv \"/nonexistent/dtlv\"]}}"
+      r1 <- libConnect library "{:dir \"/tmp/hosi-abi-never\" :config {:khana [:dtlv-repl \"/nonexistent/dtlv\"]}}"
       case r1 of
         Left (Failure st kind _) -> checkEq "status, kind" (StApp, "backend-missing") (st, kind)
         Right _ -> throwIO (userError "opened with a backend that is not there")

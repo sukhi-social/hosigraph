@@ -82,7 +82,7 @@ HOSIGRAPH_DATALEVIN_JAR=/path/to/datalevin-1.2.10-standalone.jar HOSIGRAPH_JAVA=
 | You give | Tests that run |
 |---|---|
 | nothing | those of the events, chunks, filters, the deep path, the tail log and the EDN writer |
-| `dtlv` | those, and the ones that use the khana through `dtlv`, both ways: one process for each operation (`KhanaDtlv`, the tests start with `[dtlv]`) and one resident `dtlv repl` (`KhanaDtlvRepl`, `[dtlv-repl]`) |
+| `dtlv` | those, and the ones that use the khana through `dtlv`, through one resident `dtlv repl` (`KhanaDtlvRepl`, the tests start with `[dtlv-repl]`) |
 | the JVM | those, and the ones that use the khana through the JVM (`[jvm]`) |
 | `dtlv` and the JVM | all of them (including: write with the JVM and read with `dtlv`, and the reverse) |
 
@@ -219,7 +219,7 @@ page2 <- highestIn h "note/by+at" keys (Just (place (last page1))) 20   -- the 2
   The query's time follows the notes the keys have (about 1.5 µs a row, and it sorts them all); `highestIn`'s follows the keys (about 10 µs a key) over **a floor of 2 to 6 ms** for every call.
   So with few keys that wrote little (10 keys, 40 notes each) the query does as well, and the more the people have written, the more `highestIn` is for.
   Where the floor goes was not looked into. The same walk written as compiled Clojure took 0.27 ms in a spike, so it is probably the script, which the khana reads and runs afresh for each call.
-  With `KhanaDtlv`, every call starts a process, and both are tens of milliseconds (400 keys, 40 notes each: 29 ms against 55 ms).
+  With `dtlv exec` (removed; every call started a process), both were tens of milliseconds (400 keys, 40 notes each: 29 ms against 55 ms).
   The program that took these numbers is not in the repository (a small one over `openHosiWith`, `write` in batches of 5,000 notes, `highestIn` and `query`).
 * **A filter that is not "the key is one of these"** (hidden, muted, followers only): ask for more than you need, drop what fails, and go on from the last fact you looked at. It was not measured how that does when the filter drops most of what it sees.
 * **What the tuple costs at write** (one more datom and one more index entry for each note) was not measured.
@@ -253,7 +253,7 @@ schema = M.fromList [ ("note/body", fulltext (attr TString)) ]
 
 * **Without a tokenizer, only with `KhanaDatalevinJvm`.** The words are made by an analyzer of our own, a function that Datalevin keeps in the database, so it has to be an `inter-fn`. The JVM makes one; `dtlv` 1.2.11 cannot (tried in its repl:
   a plain `fn` is refused with "Can only freeze an inter-fn", and `inter-fn` itself stops at "Unable to resolve symbol: datalevin.interpret/compile-inter-fn-source").
-  Its own default analyzer does work (Latin words found in any case, a Hangul word found whole), but it does not cut Han, kana and hangul into pairs: 東京 does not find 東京都, nor 문장 find 문장입니다. Those would be other words, in files that another backend opens, so it is refused rather than made different. With the native `dtlv`, whether `KhanaDtlv` or `KhanaDtlvRepl`, the schema is refused at open (`SchemaRefused`, before anything is made) unless you give a tokenizer: "Words of your own", below.
+  Its own default analyzer does work (Latin words found in any case, a Hangul word found whole), but it does not cut Han, kana and hangul into pairs: 東京 does not find 東京都, nor 문장 find 문장입니다. Those would be other words, in files that another backend opens, so it is refused rather than made different. With the native `dtlv` (`KhanaDtlvRepl`), the schema is refused at open (`SchemaRefused`, before anything is made) unless you give a tokenizer: "Words of your own", below.
 * **What a word is:** a run of letters and digits, lower-cased. A run of Han, kana or hangul is cut into overlapping pairs of characters, so that it is found by any two of its characters in a row. (A search for one such character on its own does not find it.)
   This is one analyzer, fixed; nothing about stems, stop words or a language was tried. Another analyzer will be another version (`words/1` is in the schema mark), and the khana is made again under it.
 * The query is Datalevin's `fulltext`: with the attribute, `(fulltext $ :note/body ?q)`; without it, `(fulltext $ ?q)` searches every fulltext attribute; `{:top 5}` is an option (a last argument). Several words are matched as Datalevin matches them (best first); a phrase search was not tried.
@@ -288,27 +288,26 @@ What hosigraph does with it:
 * **What the call gives back:** `?a` is `note/body.words` and `?v` is the words (`"猫 動画"`), not the text; ask for the text with `[?e :note/body ?t]`. An `:in` input used by a `fulltext` call is the words in the whole query, not only there. `note/body.words` is also seen in `entity`, `datoms` and the counts.
 * **The default analyzer still works on the words:** it seems to drop English stop words (a search for `on` found nothing in a text that had it, `and onward`). The list was not looked at. (With several words, a stop word is still asked for: see above.)
 * **Not done:** the C door has no option for it (`:khana` and `:schema` only, no tokenizer); with `openHosiShared` the runtime that was lent keeps its own tokenizer and `hcTokenizer` is not looked at.
-* **Tried** with `KhanaDtlv` and `KhanaDtlvRepl` (`dtlv` 1.2.11), by tests with a tokenizer made for them and by the Sudachi one of the example on 4,602 real notes. With `KhanaDatalevinJvm` it is written and the tests for it are written, and **were not run** (no JDK here).
+* **Tried** with `KhanaDtlvRepl` (`dtlv` 1.2.11), by tests with a tokenizer made for them and by the Sudachi one of the example on 4,602 real notes. With `KhanaDatalevinJvm` it is written and the tests for it are written, and **were not run** (no JDK here).
 
 ## Where "now" lives
 
-The khana is a Datalevin database. There are three ways to reach it:
+The khana is a Datalevin database. There are two ways to reach it. (A third, `KhanaDtlv`, which ran `dtlv exec` and started a process for each operation, was removed; the numbers measured with it are kept in "Measurements", marked `dtlv exec` (removed). Use `KhanaDtlvRepl` with the same `dtlv` file; the files are the same, so nothing has to be migrated.)
 
-| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlvRepl path` | `KhanaDtlv path` |
-|---|---|---|---|
+| | `KhanaDatalevinJvm java jar` (default) | `KhanaDtlvRepl path` |
+|---|---|---|
 | What it is | Datalevin in **one JVM that stays up** (one JVM for each `Hosi`) | Datalevin in **one native `dtlv repl` that stays up** (one process for each `Hosi`) | Datalevin through the `dtlv` command, **one process for each operation** |
-| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 0.1 ms to read, 0.25 ms to write (the first call: about 30 ms to start) | about 25 ms (the first call: about 0.4 s) |
-| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file (tried with 1.2.11) | one `dtlv` file |
-| Write-ahead log | yes (relaxed) | yes (the same) | no |
-| `(max ?x)` and `(min ?x)` | work | work | work with `dtlv` 1.2.11; **do not** with 1.2.10 (see "Limits") |
-| `fulltext` | yes | with a tokenizer | with a tokenizer |
-| Files in | `khana-dtlv/` | `khana-dtlv/` | `khana-dtlv/` |
+| One operation | about 0.6 to 0.9 ms (the first call: 1.3 to 1.6 s to start) | about 0.1 ms to read, 0.25 ms to write (the first call: about 30 ms to start) |
+| What you need | JDK 21 or newer, and the jar (about 93 MB) | one `dtlv` file (tried with 1.2.11) |
+| Write-ahead log | yes (relaxed) | yes (the same) |
+| `(max ?x)` and `(min ?x)` | work | work with `dtlv` 1.2.11; **do not** with 1.2.10 (see "Limits") |
+| `fulltext` | yes | with a tokenizer |
+| Files in | `khana-dtlv/` | `khana-dtlv/` |
 
 The numbers of the JVM and of `dtlv` are from 2026-11-16 and the repl's from 2026-11-22 (another program, `dtlv` 1.2.11): they are not side by side. See "Measurements".
 
 ```haskell
 cfg = defaultConfig { hcKhanaBackend = KhanaDtlvRepl "/usr/local/bin/dtlv" }
-cfg = defaultConfig { hcKhanaBackend = KhanaDtlv "/usr/local/bin/dtlv" }
 cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datalevin-1.2.10-standalone.jar" }
 ```
 
@@ -317,7 +316,6 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datale
 * To switch from one khana to another, just fold the events into the new one. The tests do this in both directions.
 * The Datalevin khanas read the same files, so they must not be open at the same time. Through hosigraph they cannot be: a world is open once at a time (see "One opener at a time" under Limits).
   A program that opens `khana-dtlv/` on its own is not stopped by that, and hosigraph does not check the LMDB lock.
-* `KhanaDtlv` sends the code on standard input to `dtlv exec`. A write is one `transact!`, so "all or none" holds.
 * `KhanaDtlvRepl` starts `dtlv repl` at the first call and keeps it. It sends one form at a time (one call at a time, under a lock) and reads one line back;
   the form prints a string, so what comes back is one line however many newlines the value has. The connection stays open in the repl, so a call does not open and close the database.
   A value with a newline, the word `user> `, a lone parenthesis, a thousand characters or unicode in it comes back whole, and 20,000 facts go through in one write (tested).
@@ -334,7 +332,6 @@ cfg = defaultConfig { hcKhanaBackend = KhanaDatalevinJvm "java" "/path/to/datale
 * `KhanaDatalevinJvm` (and, as above, `KhanaDtlvRepl`) opens the khana with Datalevin's **write-ahead log in the relaxed profile** (small segments, small retention), and writes with `transact-ack!`.
   A write waits for the log once, not for the log and LMDB's own sync as well; measured, one write per transaction is about 3 times faster (batches, `writeMany`, are the same speed).
   If the process dies, the khana may lose its last few writes; the folded seq is in the same transaction as the facts, so the next open sees that the khana is behind the tail log and folds the rest in.
-  `KhanaDtlv` is left as it was: one process per operation, with `transact!`.
 * The schema maps to the Datalevin schema (`:db/valueType`, `:db/cardinality`, `:db/unique`). `TAny` has no type.
 * Your EDN Datalog goes to Datalevin as it is, and `pull` works in `queryCells`.
 
@@ -372,7 +369,7 @@ bump h post = do
 * `writeMany` has no conditions: a later batch may depend on what an earlier one did.
 * The check reads the same "now" that `getEntity` reads, so what you read and what the check sees can only differ
   if somebody wrote in between. That is what `Holds` is for.
-* With `KhanaDtlv`, a read made at the very moment another call writes can fail to open the
+* With `dtlv exec` (removed), a read made at the very moment another call writes could fail to open the
   database. The lock only orders the writers; it does not stop an outside read. (The JVM backend was not tried for this.)
   `KhanaDtlvRepl` asks its one process one thing at a time, so two calls of hosigraph do not meet in two processes; the tests of `writeIf` run on it and pass.
 
@@ -420,7 +417,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 
 **What a call costs** (an item is a `write` of 2 facts, a name and an age; 200 of each):
 
-| | `KhanaDatalevinJvm` | `KhanaDtlv` |
+| | `KhanaDatalevinJvm` | `dtlv exec` (removed) |
 |---|---|---|
 | `write`, one item at a time | 1.05 ms | 24 ms |
 | the same items through `writeMany` (for each item) | 0.06 ms | 0.14 ms |
@@ -429,7 +426,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 | 6 queries (one by one → `queryMany`; each asked once before, so it is not the first) | 2.0 → 1.0 ms | 160 → 30 ms |
 | `stats` | 1.0 ms | 24 ms |
 
-* **Grouping helps `KhanaDtlv` most**, because starting a process is almost all of its time (200 entities: about 180 times faster; 6 queries: about 5 times).
+* **Grouping helps `dtlv exec` (removed) most**, because starting a process is almost all of its time (200 entities: about 180 times faster; 6 queries: about 5 times).
   A JVM call is cheap already (about 50 times; about 2 times).
 * The fsync of the tail log makes almost no difference on this Mac (under 0.1 ms; not part of the run above). hosigraph calls only `fsync(2)`,
   and on macOS that does not wait for the disk write cache. On systems that really wait, the time is higher. It is not measured.
@@ -437,7 +434,7 @@ The numbers are one run on one machine; they say how big a thing is, not how fas
 **`KhanaDtlvRepl`** was measured on **2026-11-22**, on the same Mac, with `dtlv` 1.2.11 and **not by `scripts/bench.hs`**, so it is not in the table above.
 A small program over `openHosiWith` (not in the repository): a world of 1,000 people, then one call at a time through `Hosi`, median of 500 for the repl and of 60 for `dtlv`, `fsync` on.
 
-| | `KhanaDtlvRepl` | `KhanaDtlv` |
+| | `KhanaDtlvRepl` | `dtlv exec` (removed) |
 |---|---|---|
 | `write`, one person at a time | 0.235 ms (0.37 ms without the write-ahead log) | 23.1 ms |
 | `getEntity` | 0.106 ms | 22.4 ms |
@@ -450,7 +447,7 @@ A small program over `openHosiWith` (not in the repository): a world of 1,000 pe
 
 **What a world costs.** A made-up world: 25,000 entities of 4 facts each (name, age, score, tag), so **100,000 events**, written in groups of 500 by `writeMany`:
 
-| | `KhanaDatalevinJvm` | `KhanaDtlv` |
+| | `KhanaDatalevinJvm` | `dtlv exec` (removed) |
 |---|---|---|
 | the writes | 3.1 s | 2.6 s |
 | open, the khana is in step | 1.5 s | 0.1 s |
@@ -462,15 +459,15 @@ A small program over `openHosiWith` (not in the repository): a world of 1,000 pe
 
 * Opening with the JVM takes about 1.4 s even when nothing is to be done: that is the JVM starting.
 * **Real data is much slower to make again than this.** A copy of a real server's data (527,971 events, 54,402 entities, 288 attributes, 53 chunks, 96 MB, 2026-11-07), one run each:
-  with `KhanaDtlv` the khana was made again in **34 s** with the world on the Mac's internal disk (with the world on an external SSD: 71 to 111 s, about 0.13 ms for each event, against 0.02 ms above),
+  with `dtlv exec` (removed) the khana was made again in **34 s** with the world on the Mac's internal disk (with the world on an external SSD: 71 to 111 s, about 0.13 ms for each event, against 0.02 ms above),
   and with the JVM in **7 s** (an open that has to do it: 10 s). The same again when the schema changes.
-  Plan the worst open for `KhanaDtlv` as **events × 0.15 ms** (the slower disk) and for the JVM as **events × 0.02 ms**; use these, not the made-up number.
+  Plan the worst open for `dtlv exec` (removed) as **events × 0.15 ms** (the slower disk) and for the JVM as **events × 0.02 ms**; use these, not the made-up number.
 * **`verify` makes a second khana and compares the two a page at a time** (10,000 facts, whole entities), so it costs a rebuild and a walk through both, and what it holds is a page, not the khanas.
-  On the same real data: `KhanaDtlv` **65 s**, and 165 MB for the largest process (`time -l`; hosigraph is 157 MB of it); the JVM **22 s**, and it passes with `-Xmx256m` (23 s).
+  On the same real data: `dtlv exec` (removed) **65 s**, and 165 MB for the largest process (`time -l`; hosigraph is 157 MB of it); the JVM **22 s**, and it passes with `-Xmx256m` (23 s).
   A JVM given no limit takes up to a quarter of the RAM: 870 MB of it was resident here, and that is the JVM's choice, not what `verify` needs.
   Each page is asked from Datalevin with a count (`seek-datoms` with `n`). Without the count, Datalevin makes every fact after the start before anything is cut (read in its source), and the JVM ran out of 2 GB.
   A page of 50,000 facts held 605 MB in hosigraph, which is why the page is 10,000.
-* The memory of `KhanaDtlv` is the largest of its processes, from `time -l` over the whole run; sampling every 25 ms misses a process that lives for 25 ms (the sampling saw 40 MB, and `time -l` saw 89 MB).
+* The memory of `dtlv exec` (removed) is the largest of its processes, from `time -l` over the whole run; sampling every 25 ms misses a process that lives for 25 ms (the sampling saw 40 MB, and `time -l` saw 89 MB).
   On a made-up world of 100,000 *people* (2026-11-13) one `dtlv` took about 260 MB, and the JVM about 300 MB resident that a smaller heap did not remove. The memory depends on the data.
   The JVM is started with no heap setting.
 * A world of 25,000 entities is **small**. Nothing here was measured above 530,000 events.
@@ -478,10 +475,10 @@ A small program over `openHosiWith` (not in the repository): a world of 1,000 pe
 ## Limits
 
 * `query` does not accept `InRules`, because a `Rule` is a structure and not EDN text. Write the rules inside the query.
-* **`dtlv` 1.2.10 cannot do `(max ?x)` or `(min ?x)`** (`KhanaDtlv`; `KhanaDtlvRepl` runs the same interpreter). In `dtlv exec` 1.2.10, they return the collection of values, not the maximum or the minimum.
+* **`dtlv` 1.2.10 cannot do `(max ?x)` or `(min ?x)`** (`KhanaDtlvRepl` runs the same interpreter as `dtlv exec` did). In `dtlv exec` 1.2.10, they return the collection of values, not the maximum or the minimum.
   They seem to resolve to `clojure.core/max` and `min`. `count`, `sum`, and `avg` are correct, and the same jar on a JVM is correct too.
   So the problem is in the interpreter of the native `dtlv`. hosigraph returns an error and does not read the result.
-  **`dtlv` 1.2.11 does them right** (tried through `KhanaDtlv` and `KhanaDtlvRepl`; the test of the repl asks for both). The canary test, which expects the 1.2.10 answer, fails against 1.2.11: that is how you are told.
+  **`dtlv` 1.2.11 does them right** (tried through `KhanaDtlvRepl`; its test asks for both). The canary test for `dtlv exec` went with it.
 * The query parser refuses aggregates such as `distinct` or `(max 2 ?x)` before they reach Datalevin, so no backend can send them.
 * NaN and ±Infinity have no EDN form, so hosigraph refuses to write them.
 * The order of rows is not guaranteed (a Datalevin answer is a set), **unless the query has `:order-by`** (see "Order and cut"). Sort the rows before you compare them otherwise.

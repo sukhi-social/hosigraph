@@ -4,7 +4,7 @@
 --
 --   HOSIGRAPH_SUDACHI        the sudachi program (sudachi.rs)         -- the tokenizer tests
 --   HOSIGRAPH_SUDACHI_DICT   its dictionary (system_core.dic)         -- (both are needed)
---   HOSIGRAPH_DTLV           the native dtlv                          -- the khana tests, KhanaDtlv and KhanaDtlvRepl
+--   HOSIGRAPH_DTLV           the native dtlv                          -- the khana tests, KhanaDtlvRepl
 --   HOSIGRAPH_DATALEVIN_JAR  the Datalevin standalone jar             -- ... and KhanaDatalevinJvm (HOSIGRAPH_JAVA: java)
 --   HOSIGRAPH_TEST_ONLY      a text: run only the tests whose name has it in it
 --
@@ -63,7 +63,7 @@ main = do
         (Just sx, Just dic) ->
           let spec = SudachiSpec sx dic ModeA
           in tag "[sudachi]" (sudachiTests spec)
-             ++ maybe [] (\exe -> tag "[dtlv+sudachi]" (wordsTests (KhanaDtlv exe) spec) ++ tag "[dtlv-repl+sudachi]" (wordsTests (KhanaDtlvRepl exe) spec)) mexe
+             ++ maybe [] (\exe -> tag "[dtlv-repl+sudachi]" (wordsTests (KhanaDtlvRepl exe) spec)) mexe
              ++ maybe [] (\jar -> tag "[jvm+sudachi]" (wordsTests (KhanaDatalevinJvm java jar) spec)) mjar
         _ -> []
   when (null sudachiRun) $ putStrLn "  (sudachi tests skipped: set HOSIGRAPH_SUDACHI to the sudachi program and HOSIGRAPH_SUDACHI_DICT to its dictionary)"

@@ -109,7 +109,6 @@ config :: Edn -> Either Text HosiConfig
 config c = do
   khana <- case field "khana" c of
     ENil                                   -> Right (hcKhanaBackend defaultConfig)
-    EVec [EKw "dtlv", EStr exe]            -> Right (KhanaDtlv (T.unpack exe))
     EVec [EKw "dtlv-repl", EStr exe]       -> Right (KhanaDtlvRepl (T.unpack exe))
     EVec [EKw "jvm", EStr java, EStr jar]  -> Right (KhanaDatalevinJvm (T.unpack java) (T.unpack jar))
     _                                      -> Left "bad :khana"

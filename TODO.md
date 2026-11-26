@@ -207,6 +207,6 @@ What is not built is using it *while it is still being built*, as the world's ow
   and chunks that stay readable while `clean` or `freeze` retire one (they do not, today: a chunk that goes away halfway makes the reading fail).
 * **The order.** The reading is by write order (newest first). Reading by month (the newest month first, all its chunks) also works and makes each month whole as soon as it is read; see note 10, item 1, of
   `docs/design-notes.md`. Only `eventsBackEach` would change.
-* **Speed.** On the real world nearly all of the time is `dtlv`, one process for each transaction of 2,000 facts (the program's own CPU time was 2.8 s of 107 s). A larger transaction is the lever; `applyBatched`
-  (the rebuild) uses 2,000 too. Not tried.
+* **Speed.** The time was nearly all `dtlv`, one process for each transaction of 2,000 facts (the program's own CPU time was 2.8 s of 107 s on the real world). `KhanaDtlv` (`dtlv exec`) is gone, so a transaction no longer
+  pays for a start: 200,000 facts in 1.8 s through the repl against 4.1 s through `exec` (2,000 a transaction; a larger one was slower through the repl: 2.1 s at 20,000). Not measured on the real world (528,000 events).
 
