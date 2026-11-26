@@ -33,9 +33,11 @@ env:
   DATALEVIN_JAR_SHA256: "0e8aba6d4022e63e9b34eafc39e257d1efa8ec2a920f089836c459e987605513"
 
 jobs:
-  test:
+  # The Haskell side, built once: hosigraph, takka, setu, hosigraph-abi and libhosi.  What it builds is
+  # saved in the cache under this commit, and `test` and `ecto` start from it instead of building again.
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +52,39 @@ jobs:
           path: |
             ${{ steps.setup.outputs.cabal-store }}
             dist-newstyle
-          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-${{ github.sha }}
           restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-
             cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-
+
+      - name: Build
+        run: |
+          cabal update
+          cabal build --enable-tests hosigraph takka setu \
+            hosigraph-abi:lib:hosigraph-abi hosigraph-abi:exe:hosigraph-abi-gen hosigraph-abi:test:spec \
+            hosigraph-abi:flib:hosi
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-${{ github.sha }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-
 
       - uses: actions/setup-java@v4
         with:
@@ -116,3 +148,68 @@ jobs:
           lib=$(find dist-newstyle -type f -name 'libhosi.so*' | head -n 1)
           echo "library: $lib"
           python3 -I hosigraph-abi/test/abi_conformance.py "$lib"
+
+  # ecto_hosi (ecto_hosi/) against the real thing: the libhosi built above, hosigraph-ex's NIF on it, and
+  # Datalevin in a resident JVM.  The adapter's quick run on its in-memory stand-in is ecto-hosi.yml.
+  ecto:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # libhosi has not been run on Linux in CI before (see `abi`).  Let it fail without turning the
+    # whole run red, until it has been seen green once; then take this line out.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.cabal-store }}
+            dist-newstyle
+          key: cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-${{ github.sha }}
+          restore-keys: |
+            cabal-${{ runner.os }}-ghc${{ env.GHC_VERSION }}-${{ hashFiles('hosigraph.cabal', 'takka/takka.cabal', 'setu/setu.cabal', 'hosigraph-abi/hosigraph-abi.cabal') }}-
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - name: Fetch the Datalevin jar
+        run: |
+          jar="$RUNNER_TEMP/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          curl -fsSL -o "$jar" \
+            "https://github.com/datalevin/datalevin/releases/download/${DATALEVIN_VERSION}/datalevin-${DATALEVIN_VERSION}-standalone.jar"
+          echo "${DATALEVIN_JAR_SHA256}  ${jar}" | sha256sum -c -
+          echo "HOSI_JAR=${jar}" >> "$GITHUB_ENV"
+          echo "HOSI_JAVA=${JAVA_HOME}/bin/java" >> "$GITHUB_ENV"
+
+      - name: libhosi and the NIF
+        run: |
+          sudo apt-get update && sudo apt-get install -y patchelf
+          cabal build hosigraph-abi:flib:hosi
+          lib=$(find dist-newstyle -type f -name 'libhosi.so*' | head -n 1)
+          echo "library: $lib"
+          hosigraph-ex/scripts/bundle-libhosi.sh "$lib" "$PWD/hosigraph-ex/priv"
+          cd hosigraph-ex
+          HOSI_BUILD=source HOSI_LIB_DIR="$PWD/priv" HOSI_INCLUDE_DIR="$PWD/../hosigraph-abi/gen/include" mix compile
+
+      - name: ecto_hosi on hosigraph and Datalevin
+        working-directory: ecto_hosi
+        env:
+          HOSI_REAL: "1"
+          HOSI_BUILD: none   # priv/ of hosigraph-ex is already filled in above
+        run: |
+          mix deps.get
+          mix test

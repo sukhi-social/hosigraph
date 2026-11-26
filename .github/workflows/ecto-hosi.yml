@@ -1,0 +1,68 @@
+# The tests of the Ecto adapter (ecto_hosi/), on every change that can touch it.
+#
+# These run against the adapter's in-memory stand-in, so no libhosi and no Datalevin are needed:
+# `HOSI_BUILD=none` makes hosigraph-ex (its `path:` dependency) skip building the NIF.  They check
+# the adapter's own logic (queries, changesets, joins, constraints), not hosigraph itself.
+# The run against the real libhosi + Datalevin is the `ecto` job of test.yml, which builds libhosi.
+#
+# hosigraph-ex/ is watched too, since ecto_hosi/ depends on it by path.
+name: ecto_hosi
+
+on:
+  pull_request:
+    paths:
+      - "ecto_hosi/**"
+      - "hosigraph-ex/**"
+      - ".github/workflows/ecto-hosi.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "ecto_hosi/**"
+      - "hosigraph-ex/**"
+      - ".github/workflows/ecto-hosi.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecto-hosi-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOSI_BUILD: none
+
+jobs:
+  stand-in:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ecto_hosi
+    steps:
+      - uses: actions/checkout@v4
+
+      # mix.exs asks for Elixir ~> 1.18
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ecto_hosi/deps
+            ecto_hosi/_build
+          key: ecto-hosi-${{ runner.os }}-${{ hashFiles('ecto_hosi/mix.lock', 'hosigraph-ex/mix.exs') }}
+          restore-keys: |
+            ecto-hosi-${{ runner.os }}-
+
+      - name: Dependencies
+        run: mix deps.get
+
+      - name: Compile (warnings are errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Test
+        run: mix test
