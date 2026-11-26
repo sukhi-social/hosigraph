@@ -33,8 +33,8 @@
 -- >  :schema {:person/name {:type :string} :person/age {:type :long}}
 -- >  :config {:khana [:jvm "java" "/opt/datalevin-standalone.jar"] :sync true}}
 --
--- @:khana@ is how the khana is run: @[:jvm java jar]@ (a resident JVM, the default), @[:dtlv exe]@ (the native
--- @dtlv@, one process for each operation) or @[:dtlv-repl exe]@ (one resident native @dtlv repl@).  They open the same
+-- @:khana@ is how the khana is run: @[:jvm java jar]@ (a resident JVM, the default), or @[:dtlv-repl exe]@
+-- (one resident native @dtlv repl@).  They open the same
 -- files.  Only the JVM has fulltext through this door (the native khanas have it with a tokenizer, 'Hosigraph.hcTokenizer', which
 -- is not an option here).
 --

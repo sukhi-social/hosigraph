@@ -7,7 +7,7 @@ Japanese words for hosigraph's `fulltext`, from [Sudachi](https://github.com/Wor
 ## What it is for
 
 The `fulltext` of the JVM khana cuts Han, kana and hangul into overlapping pairs of characters. That finds a word of two or more characters, but not one character (猫, 雨), not 受付 when the text says 受け付け, not 描く in 描いた, and it finds 京都 inside 東京都.
-The native khanas (`KhanaDtlv`, `KhanaDtlvRepl`) cannot run that analyzer at all, so they refuse a `fulltext` attribute.
+The native khana (`KhanaDtlvRepl`) cannot run that analyzer at all, so they refuse a `fulltext` attribute.
 
 A morphological analyzer cuts a text into words and gives each word a normal form (食べました → 食べる, 引越し → 引っ越し, ネコ → 猫). `Hosigraph.Mikke.Sudachi` makes a hosigraph `Tokenizer` from one resident `sudachi` process; with it **any khana has `fulltext`**, the native ones too, and Japanese is found by its words.
 
@@ -81,7 +81,7 @@ HOSIGRAPH_DTLV=/path/to/dtlv  cabal test hosi-mikke
 ```
 
 `HOSIGRAPH_DATALEVIN_JAR` (and `HOSIGRAPH_JAVA`) adds the JVM khana. `HOSIGRAPH_TEST_ONLY=text` runs the tests whose name has that text in it. What is not set is skipped, and the run says so; the one test that needs nothing (`wordsOfAnalysis`, the rules of what a word is) always runs.
-Tried with `KhanaDtlv` and `KhanaDtlvRepl` (`dtlv` 1.2.11), sudachi.rs 0.7.0 and SudachiDict 20261015 `core`. **With `KhanaDatalevinJvm` the tests are written and were not run** (no JDK here); whether its default analyzer takes the `<attribute>.words` attributes as the native one does is not known.
+Tried with `KhanaDtlvRepl` (`dtlv` 1.2.11), sudachi.rs 0.7.0 and SudachiDict 20261015 `core`. **With `KhanaDatalevinJvm` the tests are written and were not run** (no JDK here); whether its default analyzer takes the `<attribute>.words` attributes as the native one does is not known.
 
 ## What is left
 

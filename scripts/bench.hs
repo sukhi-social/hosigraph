@@ -36,7 +36,7 @@ main = do
   hSetBuffering stdout LineBuffering
   args <- getArgs
   (be, needle, rest) <- case args of
-    ("dtlv" : exe : r)      -> pure (KhanaDtlv exe, exe, r)
+    ("dtlv" : exe : r)      -> pure (KhanaDtlvRepl exe, exe, r)
     ("jvm" : java : jar : r) -> pure (KhanaDatalevinJvm java jar, jar, r)
     _ -> ioError (userError "usage: hosigraph-bench dtlv DTLV [ENTITIES] | jvm JAVA JAR [ENTITIES]")
   let n = case rest of (x : _) -> read x; _ -> 25000 :: Int

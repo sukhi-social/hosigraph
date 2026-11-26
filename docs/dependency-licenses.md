@@ -110,7 +110,7 @@ I did not confirm that. `hsc2hs` is a build tool that nothing depends on. Even i
 
 | what | licence | how hosigraph uses it |
 |---|---|---|
-| Datalevin 1.2.10 | EPL-2.0 (upstream `LICENSE`) | `KhanaDtlv`: starts the `dtlv` executable. `KhanaDtlvRepl`: starts `dtlv repl` and keeps it. `KhanaDatalevinJvm`: starts `java -jar` on the standalone jar. Talks over standard input/output. |
+| Datalevin 1.2.10 | EPL-2.0 (upstream `LICENSE`) | `KhanaDtlvRepl`: starts `dtlv repl` and keeps it. `KhanaDatalevinJvm`: starts `java -jar` on the standalone jar. Talks over standard input/output. |
 | JDK 21 or newer | Depends on the build. CI uses Eclipse Temurin (GPL-2.0 with Classpath Exception). | Only `java` is started. |
 
 `example/hosi-mikke` (an example, not a part of the package) starts the `sudachi` program of sudachi.rs and reads a SudachiDict dictionary; their licences, and what was not worked out, are in its [README](../example/hosi-mikke/README.md#licences).

@@ -2,27 +2,22 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables #-}
 -- |
 -- Module      : Hosigraph.Khana.Dtlv
--- Description : A khana kept in a Datalevin database, reached through the @dtlv@ command-line tool.
+-- Description : A khana kept in a Datalevin database, reached through a resident @dtlv repl@ or a resident JVM.
 --
--- Datalevin ships a native command, @dtlv@.  @dtlv exec@ reads Clojure code from standard
--- input, runs it against Datalevin, and prints the value of every form it evaluated.  This
--- module uses exactly that, one process per operation:
+-- Datalevin ships a native command, @dtlv@.  Its @repl@ reads Clojure code from standard input and stays up
+-- ("Hosigraph.Khana.Repl"), and the same code can go to a resident JVM that runs the Datalevin standalone jar
+-- ("Hosigraph.Khana.Sidecar"): a 'Runner' decides.  (@dtlv exec@, one process for each operation, is not used any more.)
+-- One operation is a body in a form like
 --
--- > (let [c (get-conn "<dir>" <schema>)]
+-- > (let [c (conn! "<dir>" <schema> <opts>)]
 -- >   (try [:ok (binding [*print-namespace-maps* false] (pr-str (do <body>)))]
--- >        (catch Exception e [:err (str (ex-message e))])
--- >        (finally (close c))))
+-- >        (catch Exception e [:err (str (ex-message e))])))
 --
 -- * The answer is one EDN vector on the last line: @[:ok "<what the body returned>"]@ or
 --   @[:err "<message>"]@.  Because the body's value is turned into text /inside/ the @try@,
---   lazy results (a pull, say) are read before the connection is closed.
--- * A write is one @transact!@, so it keeps the "all of it goes in, or none of it" promise.
--- * With the native @dtlv@ there is no long-lived process and nothing to shut down: 'Dtlv' is
---   just a path, a directory and a schema.  (A start costs a couple of hundred milliseconds.)
--- * The same bodies can instead go to a resident JVM that runs the Datalevin standalone jar
---   ("Hosigraph.Khana.Sidecar"): a 'Runner' decides.  The JVM keeps the connection open, so an
---   operation costs well under a millisecond, and it does not share @dtlv exec@'s habit of
---   resolving the aggregates @max@ / @min@ / @distinct@ to @clojure.core@'s.
+--   lazy results (a pull, say) are read before anything is let go of.
+-- * A write is one transaction, so it keeps the "all of it goes in, or none of it" promise.
+-- * The connection stays open between operations and is let go of by 'closeDtlv'.
 --
 -- This module does not depend on "Hosigraph.Khana"; it only knows facts, schemas and queries.
 module Hosigraph.Khana.Dtlv
@@ -38,11 +33,8 @@ module Hosigraph.Khana.Dtlv
   , ednStr, ednKw, ednVal, schemaEdn, tameEdn
   ) where
 
-import           Control.Concurrent (forkIO)
-import           Control.Concurrent.MVar
 import           Control.Exception
 import           Control.Monad
-import qualified Data.ByteString as B
 import           Data.Char (isAlpha, isAlphaNum, ord)
 import           Data.Containers.ListUtils (nubOrd)
 import qualified Data.Map.Strict as M
@@ -51,14 +43,9 @@ import           Data.IORef
 import qualified Data.Set as S
 import           Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
-import qualified Data.Text.Encoding.Error as TE
 import           Numeric (showHex)
 import           System.Directory (createDirectoryIfMissing, doesFileExist, makeAbsolute)
-import           System.Exit (ExitCode(..))
 import           System.FilePath ((</>))
-import           System.IO (hClose)
-import           System.Process
 
 import           Takka.Edn
 import           Takka.Syntax (Cell(..), FindShape(..), Input(..), Pulled(..), Query(..), parseQuery)
@@ -75,8 +62,7 @@ instance Exception DtlvError
 
 -- | Who runs the code we send.
 data Runner
-  = Native FilePath         -- ^ the @dtlv@ executable: one process per operation
-  | Resident Sidecar        -- ^ a JVM that stays up (shared by every database that uses it)
+  = Resident Sidecar        -- ^ a JVM that stays up (shared by every database that uses it)
   | NativeRepl DtlvRepl     -- ^ the native @dtlv repl@, one process that stays up (shared by every database that uses it)
 
 -- | A Datalevin database: who runs it, the directory, and the schema it is opened with.
@@ -131,11 +117,9 @@ attachDtlv runner dir schema = do
   pure (Dtlv runner absDir schema Nothing)
 
 -- | Let go of the database.  With a resident JVM the connection is closed (so the directory can be
--- moved or removed); the JVM itself stays up for the other databases.  With the native @dtlv@
--- nothing stays open between operations.
+-- moved or removed); the JVM itself stays up for the other databases.  The same for the repl.
 closeDtlv :: Dtlv -> IO ()
 closeDtlv d = case dtlvRunner d of
-  Native _     -> pure ()
   Resident sc  -> void (sidecarRequestIfRunning sc ("{:op :drop :dir " <> ednStr (T.pack (dtlvDir d)) <> "}"))
                     `catch` \(_ :: SidecarError) -> pure ()
   NativeRepl r -> void (replRequestIfRunning r ("(do (drop! " <> ednStr (T.pack (dtlvDir d)) <> ") :dropped)"))
@@ -243,18 +227,11 @@ dtlvRetractRanges d ranges extra = do
 -- bytes of what was taken out are not in it.  It is a copy of one snapshot, with no replay.  The destination is not
 -- opened or changed afterwards: that is for the caller.
 --
--- Native: @dtlv -d DIR -c copy NEW@.  Resident: @(copy (db c) NEW true)@.  The native @dtlv@ says \"Copy error: ...\" and
--- still exits with 0 (when the destination is not empty, say), so the exit code is not believed: the words are looked
--- for, and the copy must hold a @data.mdb@.  A failure is a 'DtlvError'.
+-- It is @(copy (db c) NEW true)@.  The copy must hold a @data.mdb@.  A failure is a 'DtlvError'.
 dtlvCompactTo :: Dtlv -> FilePath -> IO ()
 dtlvCompactTo d dst = do
   absDst <- makeAbsolute dst
   case dtlvRunner d of
-    Native exe -> do
-      (code, out, err) <- runBytes exe ["-d", dtlvDir d, "-c", "copy", absDst] B.empty
-      let said = TE.decodeUtf8With TE.lenientDecode (out <> err)
-      when (code /= ExitSuccess || "Copy error" `T.isInfixOf` said) $
-        bad ("compact copy: " ++ T.unpack (T.take 400 said))
     Resident _   -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
     NativeRepl _ -> void (run d ("(copy (db c) " <> ednStr (T.pack absDst) <> " true) nil"))
   made <- doesFileExist (absDst </> "data.mdb")
@@ -659,33 +636,22 @@ pulled e = case e of
 -- ---------------------------------------------------------------------------
 -- Running dtlv
 
--- | Is the @data@ of 'runWith' evaluated?  Under the native @dtlv@ and the resident @dtlv repl@ it is written into the
+-- | Is the @data@ of 'runWith' evaluated?  Under the resident @dtlv repl@ it is written into the
 -- code; the resident JVM reads it as data.
 dataIsEvaluated :: Dtlv -> Bool
 dataIsEvaluated d = case dtlvRunner d of
   Resident _ -> False
   _          -> True
 
--- | The code for one operation.  Under @dtlv exec@ it opens the database and closes it again; under the resident
--- @dtlv repl@ ('NativeRepl') the connection is kept (@conn!@ finds it, 'Hosigraph.Khana.Repl.setup' made it) and let go of
+-- | The code for one operation, for the resident @dtlv repl@ ('NativeRepl'): the connection is kept (@conn!@ finds it, 'Hosigraph.Khana.Repl.setup' made it) and let go of
 -- by 'closeDtlv'.
 script :: Dtlv -> Maybe Text -> Text -> Text
-script d dat body = T.unlines $
-  [ "(let [c (" <> opener <> " " <> ednStr (T.pack (dtlvDir d)) <> " " <> schemaEdn (dtlvSchema d) <> openOpts <> ")"
+script d dat body = T.unlines
+  [ "(let [c (conn! " <> ednStr (T.pack (dtlvDir d)) <> " " <> schemaEdn (dtlvSchema d) <> " " <> walOpts <> ")"
     <> maybe "" (\x -> " data " <> x) dat <> "]"
-  , "  (try [:ok (binding [*print-namespace-maps* false] (pr-str (do " <> body <> ")))]" ]
-  ++ case dtlvRunner d of
-       NativeRepl _ -> [ "       (catch Exception e [:err (str (ex-message e))])))" ]
-       _            -> [ "       (catch Exception e [:err (str (ex-message e))])"
-                       , "       (finally (close c))))" ]
-  where
-    opener = case dtlvRunner d of
-      NativeRepl _ -> "conn!"
-      _            -> "get-conn" :: Text
-    -- the resident repl opens the khana as the resident JVM does: with the write-ahead log ('walOpts')
-    openOpts = case dtlvRunner d of
-      NativeRepl _ -> " " <> walOpts
-      _            -> ""
+  , "  (try [:ok (binding [*print-namespace-maps* false] (pr-str (do " <> body <> ")))]"
+  , "       (catch Exception e [:err (str (ex-message e))])))" ]
+  -- the repl opens the khana as the resident JVM does: with the write-ahead log ('walOpts')
 
 -- | How the resident JVM opens a khana: with Datalevin's write-ahead log, in its /relaxed/ durability profile.
 --
@@ -698,23 +664,20 @@ script d dat body = T.unlines $
 -- @snapshots\/@) until the khana is made a new file; without it they stay in @data.mdb@ until LMDB happens to reuse the page.
 -- 'dtlvCompactTo' copies neither, so @clean@ still leaves them nowhere.
 --
--- The resident JVM and the resident @dtlv repl@ get this.  The native @dtlv exec@ is one process per operation and is left as it was.
+-- The resident JVM and the resident @dtlv repl@ both get this.
 walOpts :: Text
 walOpts = "{:wal? true :wal-durability-profile :relaxed :wal-segment-max-bytes 4194304 :wal-retention-bytes 8388608 :wal-retention-ms 60000}"
 
 -- | The function that applies a transaction and comes back when it is done.  @transact-ack!@ does the same as
--- @transact!@ and does not build the report we throw away.  (Resident only; @dtlv exec@ keeps @transact!@.)
+-- @transact!@ and does not build the report we throw away.
 transactFn :: Dtlv -> Text
-transactFn d = case dtlvRunner d of
-  Resident _   -> "transact-ack!"
-  Native _     -> "transact!"
-  NativeRepl _ -> "transact-ack!"
+transactFn _ = "transact-ack!"
 
 -- | Run a body with the connection @c@ in scope; return the text of its value.
 run :: Dtlv -> Text -> IO Text
 run d = runWith d Nothing
 
--- | Like 'run', with some EDN data the body sees as @data@.  (Under the native @dtlv@ it is written
+-- | Like 'run', with some EDN data the body sees as @data@.  (Under the resident @dtlv repl@ it is written
 -- into the code; with the resident JVM it travels as data, so a big one is not compiled.)
 runWith :: Dtlv -> Maybe Text -> Text -> IO Text
 runWith = runWithC False
@@ -722,19 +685,11 @@ runWith = runWithC False
 -- | 'runWith' for a body whose text is the same at every call (what changes travels as @data@).  The resident JVM
 -- compiles such a body once and keeps the function; Clojure's @eval@ makes new classes at every call, and that was most
 -- of what a small call cost (1.5 ms against 0.05 ms for the same work in a function compiled before).  The native
--- @dtlv@ runs a script and has nothing to keep, so it ignores the flag.
+-- @dtlv repl@ has nothing to keep, so it ignores the flag.
 runWithC :: Bool -> Dtlv -> Maybe Text -> Text -> IO Text
 runWithC cached d dat body = case dtlvRunner d of
-  Native exe   -> runNative exe d dat body
   Resident sc  -> runResident cached sc d dat body
   NativeRepl r -> runRepl r d dat body
-
-runNative :: FilePath -> Dtlv -> Maybe Text -> Text -> IO Text
-runNative exe d dat body = do
-  (code, out, err) <- runBytes exe ["exec"] (TE.encodeUtf8 (script d dat body))
-  let outT = TE.decodeUtf8With TE.lenientDecode out
-      errT = TE.decodeUtf8With TE.lenientDecode err
-  scriptReply ("exit " ++ show (code :: ExitCode)) outT errT
 
 -- | What a 'script' printed (its last line) as the value, or as the error it caught.
 scriptReply :: String -> Text -> Text -> IO Text
@@ -799,24 +754,6 @@ value = either bad pure . ednToValue
 
 bad :: String -> IO a
 bad = throwIO . DtlvError
-
--- | Run a process with bytes on standard input; collect standard output and standard error.
--- (Both are drained in their own threads, and the input is written meanwhile, so a chatty
--- child cannot make us wait forever.)
-runBytes :: FilePath -> [String] -> B.ByteString -> IO (ExitCode, B.ByteString, B.ByteString)
-runBytes exe args input = do
-  (Just hin, Just hout, Just herr, ph) <-
-    createProcess (proc exe args) { std_in = CreatePipe, std_out = CreatePipe, std_err = CreatePipe }
-  outV <- newEmptyMVar
-  errV <- newEmptyMVar
-  let drain h v = void . forkIO $ (B.hGetContents h `catch` \(_ :: IOException) -> pure B.empty) >>= putMVar v
-  drain hout outV
-  drain herr errV
-  (B.hPut hin input >> hClose hin) `catch` \(_ :: IOException) -> pure ()    -- the child may leave early
-  out  <- takeMVar outV
-  err  <- takeMVar errV
-  code <- waitForProcess ph
-  pure (code, out, err)
 
 -- ---------------------------------------------------------------------------
 -- EDN we write

@@ -45,6 +45,7 @@ import           Takka.Syntax (Amount(..), Binding(..), Clause(..), Dir(..), Pul
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
 import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana, newKhanaRuntime, closeKhanaRuntime, openKhana, applyFacts, khanaDatoms, khanaDatomPage, compareKhanas)
 import           Takka.Types (Datom(..))
+import           Hosigraph.Khana.Repl (newDtlvRepl, stopDtlvRepl)
 import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
 import           Hosigraph.Mphf
@@ -112,20 +113,17 @@ runTests = do
   mjava <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_JAVA"
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
-      nativeRun = case mexe of
-        Just exe -> tag "[dtlv]" (hosiTests (KhanaDtlv exe) ++ formatHosiTests (KhanaDtlv exe) ++ dtlvTests (KhanaDtlv exe) ++ wordsTests (KhanaDtlv exe) ++ nativeTests exe)
-        Nothing  -> []
       replRun = case mexe of
-        Just exe -> tag "[dtlv-repl]" (hosiTests (KhanaDtlvRepl exe) ++ formatHosiTests (KhanaDtlvRepl exe) ++ dtlvTests (KhanaDtlvRepl exe) ++ wordsTests (KhanaDtlvRepl exe) ++ replTests exe)
+        Just exe -> tag "[dtlv-repl]" (hosiTests (KhanaDtlvRepl exe) ++ formatHosiTests (KhanaDtlvRepl exe) ++ dtlvTests (KhanaDtlvRepl exe) ++ wordsTests (KhanaDtlvRepl exe) ++ nativeTests exe ++ replTests exe)
         Nothing  -> []
       jvmRun = case mjar of
         Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ wordsTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
         Nothing  -> []
       mixedRun = case (mexe, mjar) of
-        (Just exe, Just jar) -> tag "[dtlv+jvm]" (mixedTests exe java jar)
+        (Just exe, Just jar) -> tag "[dtlv-repl+jvm]" (mixedTests exe java jar)
         _                    -> []
-      dtlvRun = nativeRun ++ replRun ++ jvmRun ++ mixedRun
-  when (null nativeRun) $ putStrLn "  (dtlv tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
+      dtlvRun = replRun ++ jvmRun ++ mixedRun
+  when (null replRun) $ putStrLn "  (dtlv repl tests skipped: set HOSIGRAPH_DTLV to the path of the dtlv executable)"
   when (null jvmRun) $ putStrLn "  (jvm tests skipped: set HOSIGRAPH_DATALEVIN_JAR to the Datalevin standalone jar, and HOSIGRAPH_JAVA to java)"
   -- HOSIGRAPH_TEST_ONLY=text runs only the tests whose name has that text in it (for trying one thing; a full run is the one that counts)
   only <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_TEST_ONLY"
@@ -213,7 +211,7 @@ worldLockTests =
       Ev.closeEvents ev3)
 
   , ("open: a khana program that is not there is BackendMissing, found before the world is touched", withTmp $ \dir -> do
-      r <- try (openHosiWith defaultConfig { hcKhanaBackend = KhanaDtlv "/no/such/dtlv" } (dir </> "w") schema) :: IO (Either HosiError Hosi)
+      r <- try (openHosiWith defaultConfig { hcKhanaBackend = KhanaDtlvRepl "/no/such/dtlv" } (dir </> "w") schema) :: IO (Either HosiError Hosi)
       check "BackendMissing" (case r of Left (BackendMissing _) -> True; _ -> False)
       checkEq "...and no directory was made" False =<< doesDirectoryExist (dir </> "w"))
   ]
@@ -3484,20 +3482,22 @@ dtlvTests be =
         checkEq "verify" [] =<< verify h)
   ]
 
--- | Only the native `dtlv`.
+-- | Only the resident native `dtlv` (what needs the executable itself: its dump, its mark in the khana's file).
 nativeTests :: FilePath -> [Test]
 nativeTests exe =
   [ ("a khana from before the schema mark was kept is trusted by nobody: it is made again once at open, and then kept", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
-      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
-          kdir = dir </> khanaDirName (KhanaDtlv exe)
+      let cfg = (backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }
+          kdir = dir </> khanaDirName (KhanaDtlvRepl exe)
       h <- openHosiWith cfg dir schema
       a <- person h "Frege" 70
       closeHosi h
       -- as if a build that kept no mark had made this khana: take the mark out, and leave a file to see whether the khana is replaced
-      d <- openDtlv (Native exe) kdir (khanaSchema schema)
+      r <- newDtlvRepl exe
+      d <- openDtlv (NativeRepl r) kdir (khanaSchema schema)
       dtlvTransact d [DRetract metaEntity schemaMarkAttr (VStr (schemaMark schema))]
       closeDtlv d
+      stopDtlvRepl r
       writeFile (kdir </> "the-old-khana") "x"
       h2 <- openHosiWith cfg dir schema
       check "no mark: the khana was made again" . not =<< doesFileExist (kdir </> "the-old-khana")
@@ -3511,12 +3511,12 @@ nativeTests exe =
 
   , ("a schema that is refused at open is not written into the old khana: it holds what it held, types and datoms", withTmp $ \dir0 -> do
       (_, clock) <- newClock nov11
-      let cfg = (backendCfg (KhanaDtlv exe)) { hcClock = clock }
+      let cfg = (backendCfg (KhanaDtlvRepl exe)) { hcClock = clock }
           schemaLong = M.insert "person/name" (attr TLong) schema      -- the names are strings: a number it cannot be
       -- once with the events sealed (the sealed fold refuses), once with them in the log (the log's fold refuses)
       forM_ [True, False] $ \sealed -> do
         let dir  = dir0 </> show sealed
-            kdir = dir </> khanaDirName (KhanaDtlv exe)
+            kdir = dir </> khanaDirName (KhanaDtlvRepl exe)
             -- everything the khana holds (its catalog of types, and its datoms), as `dtlv dump` writes it
             catalog = do out <- readProcess exe ["-d", kdir, "dump", "-g"] ""
                          pure (sort (lines out))
@@ -3531,98 +3531,12 @@ nativeTests exe =
         check (what "the open was refused") (either (\e -> case e of SchemaRefused _ -> True; _ -> False) (const False) r)
         checkEq (what "the khana is as it was") before =<< catalog)
 
-  , ("a missing dtlv is found before anything is touched", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      r <- try (openHosiWith ((backendCfg (KhanaDtlv "/no/such/dtlv")) { hcClock = clock }) dir schema) :: IO (Either HosiError Hosi)
-      check "a missing dtlv is BackendMissing" (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
-      checkEq "...and no database directory was made" False =<< doesDirectoryExist (dir </> "events"))
-
-  , ("a batch costs one dtlv process, however many items are in it", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      let counter = dir </> "calls"
-          wrapper = dir </> "dtlv-counting.sh"
-          cfg = (backendCfg (KhanaDtlv wrapper)) { hcClock = clock }
-      writeFile wrapper ("#!/bin/sh\necho x >> " ++ show counter ++ "\nexec " ++ show exe ++ " \"$@\"\n")
-      callProcess "chmod" ["+x", wrapper]
-      let calls = (do s <- readFile counter; let n = length (lines s) in n `seq` pure n)    -- counted now, not when somebody looks
-                    `catch` \(_ :: IOException) -> pure (0 :: Int)
-      h <- openHosiWith cfg (dir </> "db") schema
-      a <- person h "p0" 20
-      closeHosi h
-      copyDir (dir </> "db" </> "khana-dtlv") (dir </> "saved")
-      h1 <- openHosiWith cfg (dir </> "db") schema
-      ids <- forM [1 .. 5 :: Integer] (\i -> person h1 (T.pack ("p" ++ show i)) (20 + i))
-      n0 <- calls
-      _ <- getEntities h1 (a : ids)
-      n1 <- calls
-      checkEq "six entities: one process" 1 (n1 - n0)
-      _ <- queryMany h1 [ (t, []) | t <- diffQueries ]
-      n2 <- calls
-      checkEq "six queries: one process" 1 (n2 - n1)
-      _ <- stats h1
-      n3 <- calls
-      checkEq "stats: one process" 1 (n3 - n2)
-      _ <- writeMany h1 [ [Create (Tmp 1) "person/name" (Lit (VStr (T.pack ("q" ++ show i)))), Create (Tmp 1) "person/age" (Lit (VInt i))] | i <- [1 .. 5] ]
-      n4 <- calls
-      checkEq "five batches written together: one process" 1 (n4 - n3)
-      closeHosi h1
-      removePathForcibly (dir </> "db" </> "khana-dtlv")
-      renameDirectory (dir </> "saved") (dir </> "db" </> "khana-dtlv")     -- the khana knows only p0; five batches are in the tail
-      m0 <- calls
-      h2 <- openHosiWith cfg (dir </> "db") schema
-      m1 <- calls
-      checkEq "open and catch up on five batches: look at the bookkeeping, start, one transaction" 3 (m1 - m0)
-      checkEq "verify" [] =<< verify h2
-      closeHosi h2)
-
-  , ("clean: when the compacted copy cannot be made, or is not the khana, the khana is folded again from the events, and the report says so", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      let empty = dir </> "empty-db"
-          -- a dtlv that, asked to copy, either says "Copy error" and exits with 0 (as the real one does), or copies an empty database
-          wrapper how = dir </> ("dtlv-" ++ how ++ ".sh")
-          script how = "#!/bin/sh\nif [ \"$4\" = copy ]; then\n" ++ (case how of
-            "refuses" -> "  echo 'Copy error: no room on this disk (a test)'; exit 0\n"
-            _         -> "  exec " ++ show exe ++ " -d " ++ show empty ++ " -c copy \"$5\"\n") ++ "fi\nexec " ++ show exe ++ " \"$@\"\n"
-          one how = do
-            let db = dir </> how
-                count i = markerCount (BC.pack (marker i)) db
-            writeFile (wrapper how) (script how)
-            callProcess "chmod" ["+x", wrapper how]
-            h <- openHosiWith ((backendCfg (KhanaDtlv (wrapper how))) { hcClock = clock }) db schema
-            [a, b] <- forM [1, 2] $ \i -> person h (T.pack (marker i)) (fromIntegral i)
-            _ <- seal h
-            _ <- erase h [EraseIds [b]]
-            rep <- clean h defaultCleanOptions
-            checkEq (how ++ ": cleaned, and by folding again") (True, True) (crKhanaCleaned rep, crKhanaRebuilt rep)
-            checkEq (how ++ ": the erased marker is in no file, the other is") (0, True) =<< ((,) <$> count 2 <*> ((> 0) <$> count 1))
-            checkEq (how ++ ": nothing is left lying about") False =<< doesDirectoryExist (db </> "khana-dtlv.new")
-            checkEq (how ++ ": a is there, b is not") [Just [VInt 1], Nothing] =<< mapM (ageOf h) [a, b]
-            checkEq (how ++ ": verify clean") [] =<< verify h
-            again <- clean h defaultCleanOptions
-            checkEq (how ++ ": it is clean now: the next clean has nothing to do") (False, False) (crKhanaCleaned again, crKhanaRebuilt again)
-            closeHosi h
-      one "refuses"
-      one "copies-nothing")
-
-  , ("canary: (max ?x) / (min ?x) in :find do not work through `dtlv exec` 1.2.10 (if this fails, it was fixed upstream: update docs/guide.md)", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      withHosiCfg ((backendCfg (KhanaDtlv exe)) { hcClock = clock }) dir $ \h -> do
-        _ <- person h "Frege" 70
-        _ <- person h "Peirce" 75
-        r <- try (query h "[:find (max ?a) . :where [?e :person/age ?a]]" []) :: IO (Either SomeException [[Value]])
-        check "max is still answered with the whole collection, which we cannot read as a number" (either (const True) (const False) r)
-        checkEq "avg works" [[VDouble 72.5]] =<< query h "[:find (avg ?a) . :where [?e :person/age ?a]]" [])
-
-  , ("fulltext: the native dtlv cannot run the analyzer, and says so before anything is made", withTmp $ \dir -> do
-      r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlv exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
-             :: IO (Either HosiError Hosi)
-      check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
   ]
 
 -- | Only the resident native @dtlv repl@ ('KhanaDtlvRepl').
 replTests :: FilePath -> [Test]
 replTests exe =
-  -- what the JVM runs and the one-process dtlv does not (the write queue and the regions), run on the repl as it is
+  -- what the JVM runs (the write queue and the regions), run on the repl as it is
   writeQueueTests (KhanaDtlvRepl exe) ++
   regionsTests (KhanaDtlvRepl exe) ++
   [ ("the repl stays up: a hundred operations cost no more processes than the first few", withTmp $ \dir -> do
@@ -3727,25 +3641,10 @@ replTests exe =
       check "a missing dtlv is BackendMissing" (either (\e -> case e of BackendMissing _ -> True; _ -> False) (const False) r)
       checkEq "...and no database directory was made" False =<< doesDirectoryExist (dir </> "events"))
 
-  , ("fulltext: refused like the one-process dtlv, before anything is made", withTmp $ \dir -> do
+  , ("fulltext: the native dtlv cannot run the analyzer, and says so before anything is made", withTmp $ \dir -> do
       r <- try (openHosiWith (defaultConfig { hcKhanaBackend = KhanaDtlvRepl exe }) (dir </> "w") (M.fromList [("note/body", fulltext (attr TString))]))
              :: IO (Either HosiError Hosi)
       check "refused as a schema" (case r of Left (SchemaRefused m) -> "KhanaDatalevinJvm" `isInfixOf` m; _ -> False))
-
-  , ("one khana-dtlv/, two ways in: written through the repl, read through dtlv, and back", withTmp $ \dir -> do
-      (_, clock) <- newClock nov11
-      let open be = openHosiWith ((backendCfg be) { hcClock = clock }) dir schema
-      h1 <- open (KhanaDtlvRepl exe)
-      a <- person h1 "Frege" 70
-      closeHosi h1
-      h2 <- open (KhanaDtlv exe)
-      checkEq "dtlv reads what the repl wrote" (Just [VInt 70]) =<< ageOf h2 a
-      b <- person h2 "Peirce" 75
-      closeHosi h2
-      h3 <- open (KhanaDtlvRepl exe)
-      checkEq "the repl reads what dtlv wrote" (Just [VInt 75]) =<< ageOf h3 b
-      checkEq "verify" [] =<< verify h3
-      closeHosi h3)
 
   , ("max and min in :find work through the repl (the 1.2.11 interpreter)", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
@@ -4033,18 +3932,18 @@ jvmTests java jar =
 -- | The two ways of reaching Datalevin look at the same files.
 mixedTests :: FilePath -> FilePath -> FilePath -> [Test]
 mixedTests exe java jar =
-  [ ("one khana-dtlv/, two ways in: written through the JVM, read through dtlv, and back", withTmp $ \dir -> do
+  [ ("one khana-dtlv/, two ways in: written through the JVM, read through the repl, and back", withTmp $ \dir -> do
       (_, clock) <- newClock nov11
       let open be = openHosiWith ((backendCfg be) { hcClock = clock }) dir schema
       h1 <- open (KhanaDatalevinJvm java jar)
       a <- person h1 "Frege" 70
       closeHosi h1
-      h2 <- open (KhanaDtlv exe)
-      checkEq "dtlv reads what the JVM wrote" (Just [VInt 70]) =<< ageOf h2 a
+      h2 <- open (KhanaDtlvRepl exe)
+      checkEq "the repl reads what the JVM wrote" (Just [VInt 70]) =<< ageOf h2 a
       b <- person h2 "Peirce" 75
       closeHosi h2
       h3 <- open (KhanaDatalevinJvm java jar)
-      checkEq "the JVM reads what dtlv wrote" (Just [VInt 75]) =<< ageOf h3 b
+      checkEq "the JVM reads what the repl wrote" (Just [VInt 75]) =<< ageOf h3 b
       checkEq "verify" [] =<< verify h3
       closeHosi h3)
   ]

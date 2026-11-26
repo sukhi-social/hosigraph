@@ -153,7 +153,7 @@ class Gated:
             # waits for the gate (at most a minute, in case nobody ever opens it), then fails
             f.write(f'#!/bin/sh\ni=0\nwhile [ ! -e "{self.gate}" ] && [ $i -lt 3000 ]; do sleep 0.02; i=$((i+1)); done\nexit 1\n')
         os.chmod(self.exe, os.stat(self.exe).st_mode | stat.S_IXUSR)
-        self.uri = ('{:dir "%s" :config {:khana [:dtlv "%s"]}}' % (os.path.join(self.dir, "db"), self.exe)).encode()
+        self.uri = ('{:dir "%s" :config {:khana [:dtlv-repl "%s"]}}' % (os.path.join(self.dir, "db"), self.exe)).encode()
 
     def open(self):
         c = call(LIB.hosi_open, self.uri, None)
