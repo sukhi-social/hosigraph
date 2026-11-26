@@ -7,13 +7,14 @@ You keep `Repo`, schemas, changesets and `preload`, and you also get **Datalog w
 the **history** of any row, and **real erasure**. It has no SQL, joins or migrations, and its transactions are not SQL's (below).
 日本語: [README.ja.md](README.ja.md)
 
-> 0.1, not on Hex. Tested on Linux aarch64 only.
+> 0.2, not on Hex. Tested on Linux aarch64 only.
 
 ## Install
 
 ```elixir
 # mix.exs
 {:ecto_hosi, github: "sukhi-social/hosigraph", sparse: "ecto_hosi"}
+# or pinned to a release: ..., sparse: "ecto_hosi", tag: "ecto-hosi-v0.2.0"
 ```
 
 You also need:
@@ -53,6 +54,20 @@ end
 
 Add the Repo to your supervision tree. Rows are stored as facts (`[1 :"user/name" "Ada"]`); the
 hosigraph schema is derived from your Ecto schemas at start-up.
+
+**Keywords, and pairs as tuples.** Two more rules for a schema, for what Datalog reads naturally:
+
+```elixir
+hosi_keyword :state, ["open", "closed"]            # a :string field for Ecto; the store holds :open
+hosi_unique [:account_id, :note_id], tuple: true   # the pair is hosigraph's own tuple
+```
+
+`hosi_keyword` takes a closed list: another string raises `ArgumentError` before anything is written or asked,
+and `where: t.state == "open"` still compares the string the app has. `Repo.datalog/1` speaks the store's form, so write
+`:open` there (`[?t :ticket/state :open]`). `tuple: true` is for a plain combination (no `lower:`, no `where:`)
+whose fields are always set: a tuple's nil is a value, and SQL's NULL is not, so a write that leaves one nil raises
+`ArgumentError`. The pair is found by its value (`[?e :link/uq-link_a_b_index [1 2]]`), and a rule that must keep SQL's
+NULL stays a plain `hosi_unique`, as before.
 
 **Works as in Ecto:** `insert` `update` (+`optimistic_lock`) `delete` `insert_all` `get` `get_by` `all` `one`
 `exists?` `aggregate(:count)` `preload`, `unique_constraint`, `update_all` and `delete_all` (one schema, the same

@@ -182,3 +182,82 @@ end
 defmodule Ecto.Hosi.Test.Joiner do
   use Ecto.Repo, otp_app: :ecto_hosi, adapter: Ecto.Adapters.Hosi
 end
+
+defmodule Ecto.Hosi.Test.Ticket do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+  import Ecto.Changeset
+
+  # Elixir sees "open", hosigraph keeps :open
+  hosi_keyword :state, ["open", "pending", "closed"]
+  hosi_unique :slug
+
+  schema "ticket" do
+    field(:title, :string)
+    field(:slug, :string)
+    field(:state, :string, default: "open")
+  end
+
+  def changeset(ticket, attrs),
+    do:
+      ticket
+      |> cast(attrs, [:title, :slug, :state])
+      |> validate_inclusion(:state, ["open", "pending", "closed"])
+      |> unique_constraint(:slug)
+end
+
+defmodule Ecto.Hosi.Test.Link do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+  import Ecto.Changeset
+
+  # the pair is hosigraph's own tuple, not a JSON text in a derived attribute
+  hosi_unique [:a, :b], tuple: true, name: "link_a_b_index"
+
+  schema "link" do
+    field(:a, :integer)
+    field(:b, :integer)
+    field(:note, :string)
+  end
+
+  def changeset(link, attrs) do
+    link
+    |> cast(attrs, [:a, :b, :note])
+    |> unique_constraint(:a, name: :link_a_b_index)
+  end
+end
+
+# not given to the Repo: schemas that must be refused
+defmodule Ecto.Hosi.Test.BadKeyword do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+
+  hosi_keyword :n, ["a", "b"]
+
+  schema "bad_keyword" do
+    field(:n, :integer)
+  end
+end
+
+defmodule Ecto.Hosi.Test.BadKeywordName do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+
+  hosi_keyword :n, ["fine", "not fine/at all"]
+
+  schema "bad_keyword_name" do
+    field(:n, :string)
+  end
+end
+
+defmodule Ecto.Hosi.Test.BadTuple do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+
+  hosi_unique [:a, :b], tuple: true, lower: [:b]
+
+  schema "bad_tuple" do
+    field(:a, :string)
+    field(:b, :string)
+  end
+end

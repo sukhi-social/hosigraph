@@ -120,7 +120,7 @@ defmodule Ecto.Adapters.Hosi do
     end
   end
 
-  @shared_meta [:backend, :conn, :attrs, :derived, :refs, :append_only, :names, :schemas, :precheck_unique]
+  @shared_meta [:backend, :conn, :attrs, :derived, :keywords, :refs, :append_only, :names, :schemas, :precheck_unique]
 
   @impl Ecto.Adapter
   def ensure_all_started(_config, _type), do: {:ok, []}
@@ -171,6 +171,7 @@ defmodule Ecto.Adapters.Hosi do
       conn: name,
       attrs: attrs,
       derived: derived,
+      keywords: Ecto.Hosi.Kw.build(Keyword.get(config, :schemas, [])),
       refs: Ecto.Hosi.Cascade.build(Keyword.get(config, :schemas, [])),
       append_only: Ecto.Hosi.Cascade.append_only(Keyword.get(config, :schemas, [])),
       names: Ecto.Hosi.Derived.names(derived),
@@ -227,7 +228,9 @@ defmodule Ecto.Adapters.Hosi do
 
     case Conflict.find(meta, source, attrs, on_conflict) do
       {:conflict, id} -> upsert_existing(meta, source, id, attrs, on_conflict, returning)
-      :none -> insert_new(meta, source, Derived.extend(meta, source, nil, attrs), on_conflict, returning)
+      :none ->
+        Derived.check_new!(meta, source, attrs)
+        insert_new(meta, source, Derived.extend(meta, source, nil, attrs), on_conflict, returning)
     end
   end
 
@@ -381,6 +384,7 @@ defmodule Ecto.Adapters.Hosi do
   end
 
   defp create_ops(meta, source, attrs, n) do
+    Derived.check_new!(meta, source, attrs)
     attrs = Derived.extend(meta, source, nil, attrs)
 
     [[:create, [:tmp, n], Attr.marker(source), true]] ++
@@ -684,16 +688,55 @@ defmodule Ecto.Adapters.Hosi do
   defp check_unique(%{precheck_unique: false}, _attrs, _self_id), do: []
 
   defp check_unique(meta, attrs, self_id) do
-    for {attr, v} <- attrs,
-        match?(%{^attr => %{unique: _}}, meta.attrs),
-        taken?(meta, attr, v, self_id) do
-      {:unique, cname(meta, attr)}
+    plain =
+      for {attr, v} <- attrs,
+          match?(%{^attr => %{unique: _}}, meta.attrs),
+          taken?(meta, attr, v, self_id) do
+        {:unique, cname(meta, attr)}
+      end
+
+    plain ++ tuple_violations(meta, attrs, self_id)
+  end
+
+  # A `hosi_unique [...], tuple: true` rule is hosigraph's own tuple: ask for the pair as one value.
+  # The parts a write does not touch are read from the row (an update); a part that is not known
+  # (a ref to a row of the same batch) leaves the question to hosigraph's refusal.
+  defp tuple_violations(meta, attrs, self_id) do
+    for spec <- native_rules(meta, attrs),
+        vals = tuple_values(meta, spec, attrs, self_id),
+        vals != nil,
+        taken?(meta, spec.attr, vals, self_id) do
+      {:unique, cname(meta, spec.attr)}
     end
+  end
+
+  # the `tuple: true` rules of the row these attributes belong to, that the write touches
+  defp native_rules(meta, attrs) do
+    sources = attrs |> Enum.map(fn {a, _} -> a |> Attr.split() |> elem(0) end) |> Enum.uniq()
+
+    for source <- sources,
+        spec <- Map.get(meta.derived, source, []),
+        spec.native,
+        Enum.any?(spec.attrs, &List.keymember?(attrs, &1, 0)),
+        do: spec
+  end
+
+  defp tuple_values(meta, spec, attrs, self_id) do
+    given = Map.new(attrs)
+
+    entity =
+      if self_id && Enum.any?(spec.attrs, &(not Map.has_key?(given, &1))),
+        do: read_entity(meta, self_id),
+        else: %{}
+
+    vals = Enum.map(spec.attrs, fn a -> if Map.has_key?(given, a), do: given[a], else: Backend.first(entity, a) end)
+    if Enum.any?(vals, &is_nil/1), do: nil, else: vals
   end
 
   defp cname(meta, attr), do: Map.get(meta.names, attr) || Attr.constraint_name(attr)
 
   defp taken?(meta, attr, value, self_id) do
+    value = Ecto.Hosi.Kw.to_store(Backend.keywords(meta), attr, value)
     req = %{q: "[:find ?e :in $ ?v :where [?e #{Attr.kw(attr)} ?v]]", inputs: [[:scalar, value]]}
     rows = meta |> Backend.query(req) |> Backend.ok!()
     Enum.any?(rows, fn [e] -> e != self_id end)
@@ -701,6 +744,8 @@ defmodule Ecto.Adapters.Hosi do
 
   defp rejected(attrs, meta, message) do
     uniques = for {attr, _} <- attrs, match?(%{^attr => %{unique: _}}, meta.attrs), do: attr
+    # a tuple the khana keeps is never in the write, but it is what hosigraph names when it refuses
+    uniques = uniques ++ for(spec <- native_rules(meta, attrs), do: spec.attr)
     named = Enum.filter(uniques, &mentions?(message, &1))
 
     case {named, uniques} do

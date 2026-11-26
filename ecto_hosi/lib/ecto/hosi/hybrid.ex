@@ -106,7 +106,7 @@ defmodule Ecto.Hosi.Hybrid do
 
   defp base(meta, bindings, conjuncts, params) do
     sources = Map.new(bindings, &{&1.ix, &1.source})
-    st = %{n: 0, inputs: [], params: params, span: length(bindings), sources: sources}
+    st = %{n: 0, inputs: [], params: params, span: length(bindings), sources: sources, kw: Backend.keywords(meta)}
 
     {clauses, st} =
       Enum.reduce(conjuncts, {[], st}, fn c, {acc, st} ->
@@ -193,7 +193,7 @@ defmodule Ecto.Hosi.Hybrid do
           {["[(= 0 1)]"], st}
 
         vs ->
-          {var, st} = input(:coll, vs, st)
+          {var, st} = input(:coll, store(st, ix, f, vs), st)
 
           if f == :id,
             do: {["[(= ?e#{ix} #{var})]"], st},
@@ -245,7 +245,7 @@ defmodule Ecto.Hosi.Hybrid do
   end
 
   defp field_vs_value(:==, ix, f, v, st) when f != :id and not is_nil(v) do
-    {var, st} = input(:scalar, v, st)
+    {var, st} = input(:scalar, store(st, ix, f, v), st)
     {["[?e#{ix} #{Attr.kw(attr(ix, f, st))} #{var}]"], st}
   end
 
@@ -253,9 +253,13 @@ defmodule Ecto.Hosi.Hybrid do
 
   defp field_vs_value(op, ix, f, v, st) do
     {lv, clauses, st} = field_var(ix, f, st)
-    {var, st} = input(:scalar, v, st)
+    {var, st} = input(:scalar, store(st, ix, f, v), st)
     {clauses ++ ["[(#{@cmp_text[op]} #{lv} #{var})]"], st}
   end
+
+  # a `hosi_keyword` field is compared as the keyword hosigraph keeps (a string for Elixir)
+  defp store(_st, _ix, :id, v), do: v
+  defp store(st, ix, f, v), do: Ecto.Hosi.Kw.to_store(st.kw, attr(ix, f, st), v)
 
   defp field_var(ix, :id, st), do: {"?e#{ix}", [], st}
 
