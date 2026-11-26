@@ -13,7 +13,7 @@ the **history** of any row, and **real erasure**. It has no SQL, joins or migrat
 
 ```elixir
 # mix.exs
-{:ecto_hosi, github: "sukhi-social/ecto_hosi"}
+{:ecto_hosi, github: "sukhi-social/hosigraph", sparse: "ecto_hosi"}
 ```
 
 You also need:

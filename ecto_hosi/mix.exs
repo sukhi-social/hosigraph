@@ -2,7 +2,7 @@ defmodule EctoHosi.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/sukhi-social/ecto_hosi"
+  @source_url "https://github.com/sukhi-social/hosigraph/tree/main/ecto_hosi"
 
   def project do
     [
@@ -34,11 +34,12 @@ defmodule EctoHosi.MixProject do
     ]
   end
 
-  # `HOSI_PATH=/path/to/hosigraph/hosigraph-ex mix test` works against a checkout.
+  # In the hosigraph monorepo this is the sibling `../hosigraph-ex`.
+  # `HOSI_PATH=/elsewhere/hosigraph-ex` overrides it.
   # The tests run against an in-memory stand-in, so `HOSI_BUILD=none mix test` needs no libhosi.
   defp hosi_dep do
     case System.get_env("HOSI_PATH") do
-      nil -> {:hosi, github: "sukhi-social/hosigraph", sparse: "hosigraph-ex"}
+      nil -> {:hosi, path: "../hosigraph-ex"}
       path -> {:hosi, path: path}
     end
   end
