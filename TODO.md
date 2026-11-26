@@ -80,6 +80,34 @@ A reader who knows SQL has no map from "I would make this table, this index, thi
   * What is left of the Sudachi one (more of the real-post check, the program's version in the mark) is in the README of `example/hosi-mikke`.
 * **Tuples.** Not checked at open: a tuple of an attribute that is not in the schema, or of itself (Datalevin refuses `many` itself, when the schema is made). A pull of a tuple attribute was not tried.
 
+## What sukhi's use of `ecto_hosi` asks of hosigraph
+
+Written 2026-11-26, from putting `hosi_keyword` (a string field kept as a keyword) and `hosi_unique … tuple: true` (a combination kept as a tuple) into `ecto_hosi`, and those into sukhi's `Boost`, `Reaction` and `Note.visibility`.
+Both ride on what hosigraph has today, so **nothing here blocks them**. Each item says what was seen and what was only read or guessed. "On the jar" means the Datalevin 1.2.10 standalone jar run by itself, not through hosigraph.
+
+* **A keyword attribute takes a bare string.** Seen through `hosigraph-ex` and the JVM khana: a `create` of `"closed"` (a string, no colon) on an attribute whose type is `keyword` was accepted and read back as `:closed`.
+  The guide says only that a string that starts with `:` is a keyword (the C door's JSON). Open: is it meant? Then say so in the guide and test it; if not, refuse a string where the schema says keyword.
+  `ecto_hosi` does not lean on it: it makes the keyword itself and checks the value against a list of its own.
+* **A refusal of a unique value, as a kind.** `WriteRejected` carries Datalevin's text (`Cannot add #datalevin/Datom [e :link/uq-… [1 2]] because of unique constraint: <holder>`), and `ecto_hosi` finds which attribute it was by looking for the attribute's name in it.
+  That works (seen on 1.2.10 with the JVM khana; the message of a native `dtlv` was not looked at), but each host would have to do the same. Open: a constructor, or fields on `WriteRejected`, for "this attribute, held by this entity", read out in one place.
+  Related to "The khana backend that fails, as a kind of error", above.
+* **`unique` that is not `identity`, on a tuple.** The guide and the tests use `identity (tuple …)`. `ecto_hosi` writes `unique: :value` on a tuple through the C door, and it was seen to work on 1.2.10 (long and long, ref and ref, ref and ref and string):
+  a second equal pair is refused, and `[?e :attr [a b]]` finds the pair. hosigraph's own tests have no `uniqueValue (tuple …)`. Add one, and say in the guide whether the two differ for a pair that must be "held once" (not looked at).
+* **A tuple that is not made while a part is missing (SQL's NULL).** A tuple holds `[a nil]`, and two entities with the same `a` and no `b` are the same pair (the guide says so). So `ecto_hosi` refuses a write that leaves a field of a `tuple: true` rule nil, and keeps the rules that need SQL's NULL as a JSON text in an attribute of their own, as before
+  (in sukhi: `custom_emojis (shortcode, domain)`, where a local emoji has no domain, and `notifications (account, from_account, type, note)`, where the note is optional).
+  Not looked at: whether Datalevin can leave a tuple out while a part is nil. If it cannot, there is nothing to do here.
+* **Types the khana cannot hold: instant, uuid, bytes, bigdec, idoc.** On the jar all of them write and read, and an instant given as `#inst` text is read. None of them is reachable through hosigraph: its `Value` has five constructors (the value tags are 0 to 4), its `ValueType` seven, and `Takka.Edn` reads no tagged literal (`#inst`, `#uuid`). What each would cost, as far as it was looked at:
+  * **a new value tag** in `putValue` and `getValueBody`, which the tail log and the chunks share, for instant, uuid, bytes and bigdec. A file with the new tag cannot be read by an older build (0.2 promises the other way: that what older builds wrote is read), and `Takka.Edn` has to learn the tagged literals;
+  * **an instant is milliseconds** (`java.util.Date`; `.123` was kept), where sukhi keeps microseconds in a long (the `_usec` fields of at least ten schemas), and `highestIn` takes a long as its order part. An instant as an order wants "an order part that is not a long" (above) first;
+  * **idoc needs no new tag if it is JSON.** `:db/valueType :db.type/idoc` with `:db/idocFormat :json` took the JSON text that `ecto_hosi` already writes for its maps and lists, and `idoc-match` found inside it (the keys of a JSON document are strings: `{"shortcode" "inu"}`). A schema type could keep the value a `VStr`.
+    Seen on the jar: what is read back is a parsed structure with string keys, which `Takka.Edn` does not read as a value (it reads scalars, and a vector as a tuple); `[?e :attr ?v]` is an error for an idoc (`:db/noindex true` is its default since 1.2.8: read by entity or pull, or search with `idoc-match`); a new value replaces the whole document;
+  * **nobody asks for these now.** sukhi keeps times as longs, and keeps its maps as JSON text that it never searches inside. They are written down so that whoever asks next has the cost in front of them.
+* **`:db/isComponent`** is not passed (`Khana/Dtlv.hs` passes `valueType`, `cardinality`, `unique`, `tupleAttrs` and `fulltext`). On the jar it works: retracting the parent takes its components, and a ref shared with other entities stays.
+  *(A guess:)* it would do little here. The events are the truth, and a cascade done by the khana is not an event, so a khana and one folded again from the events would differ. `ecto_hosi` does the cascade itself and writes the deletes. What it could still give is a `pull` that goes into components. Do nothing until a host asks.
+* **A world written before its schema changed.** Not tried. `ecto_hosi` now gives a `hosi_keyword` field the type `keyword` where it was `string`, and a `tuple: true` rule a tuple attribute where it had a JSON text; the old facts stay in the events.
+  To try before anyone with data they care about switches: does a world with `"closed"` as a string open under `keyword` (the guide says `SchemaRefused` for "a type that clashes with the data"), and what does a fold do with the facts of an attribute that the schema no longer names?
+  (sukhi's `docs/STORE.md` says nothing is carried over from the earlier stores, so it may not matter yet.)
+
 ## Not built, no plan
 
 Distribution and sync, metrics and capacity forecasts, anonymous metrics, JSON-LD import, thaw and compression of cold chunks, merging of cold chunks, a timer inside hosigraph, compression of chunk values (a general compressor on top of chunk version 2 did not make it smaller),
