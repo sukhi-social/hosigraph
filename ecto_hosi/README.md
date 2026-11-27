@@ -93,6 +93,11 @@ and points to `Repo.datalog/1`.
   hosigraph's own `unique` guards the race. `{:unsafe_fragment, ..}` and `{:constraint, ..}` targets, and an `on_conflict`
   query with a `where`, raise. `:nothing` also skips a taken `hosi_unique` value.
 * `not` means "no such fact": `where: not (u.age > 30)` also returns rows with no age.
+* **An id may be your own Ecto type** (or `Ecto.ParameterizedType`) over `:id`, so the app can see another number than the
+  store holds. Declare it as `@primary_key {:id, MyId, read_after_writes: true}` and put the same type on every field that
+  points there (`belongs_to .., type: MyId`). What goes past the types sees the store's numbers: a field that misses the
+  type, a schemaless `from "table"` filtered by an id, `Repo.datalog/1`, `Repo.history/1` and `Repo.erase/1`. A schemaless
+  filter like that finds no rows, without an error.
 * No `stream`. `order_by`/`limit` cut in Elixir; use `Repo.highest/4` for "newest N".
 
 **Added to your Repo:**

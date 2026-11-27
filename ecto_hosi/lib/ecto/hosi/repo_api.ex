@@ -55,6 +55,7 @@ defmodule Ecto.Hosi.RepoApi do
     meta = meta(repo)
     source = schema.__schema__(:source)
     attr = Attr.tuple(source, key, order)
+    id_type = schema.__schema__(:type, :id)
     key_type = schema.__schema__(:type, key)
     order_type = schema.__schema__(:type, order)
 
@@ -63,13 +64,13 @@ defmodule Ecto.Hosi.RepoApi do
     opts =
       case opts[:after] do
         nil -> []
-        %{at: at, id: id} -> [after: %{val: dump1(order_type, at), id: id}]
+        %{at: at, id: id} -> [after: %{val: dump1(order_type, at), id: dump1(id_type, id)}]
       end
 
     places = meta.backend.highest_in(meta.conn, attr, keys, limit, opts) |> Backend.ok!()
 
     for %{key: k, val: v, id: id} <- places do
-      %{id: id, key: load1(key_type, k), at: load1(order_type, v)}
+      %{id: load1(id_type, id), key: load1(key_type, k), at: load1(order_type, v)}
     end
   end
 
