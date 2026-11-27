@@ -159,7 +159,7 @@ defmodule Ecto.Hosi.Schema do
     Code.ensure_compiled!(mod)
     source = mod.__schema__(:source)
 
-    unless mod.__schema__(:primary_key) == [:id] and mod.__schema__(:type, :id) == :id do
+    unless mod.__schema__(:primary_key) == [:id] and Ecto.Type.type(mod.__schema__(:type, :id)) == :id do
       raise ArgumentError,
             "#{inspect(mod)}: Ecto.Adapters.Hosi needs an integer primary key named :id " <>
               "(it is the hosigraph entity id)"

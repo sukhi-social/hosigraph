@@ -48,6 +48,10 @@ hosigraph にテーブルはないので、各行に目印の属性 `:"user/ecto
   代わりに `Repo.write_batch/2`(下)で、複数行を全部成功か全部失敗で書けます。
   関連つきの `Repo.insert` は、親と子を順に書きます(まとめては失敗しません)。
 * **`not` は「そういう事実がない」です。** `where: not (u.age > 30)` は、年齢の事実がない行も拾います(SQL は `NULL` の行を拾いません)。`!=` `<` などは、事実があることが必要で、SQL と同じです。
+* **id には、`:id` の上に作った自分の型**(`Ecto.ParameterizedType` でも)が使えます。アプリに見える番号と、ストアが持つ番号を変えられます。
+  主キーは `@primary_key {:id, MyId, read_after_writes: true}`、指す側の列にも同じ型を付けます(`belongs_to .., type: MyId`)。
+  型を通らないところはストアの番号を見ます: 型を付け忘れた列、表名の文字列で書く `from "table"` を id で絞ったとき、`Repo.datalog/1`、
+  `Repo.history/1`、`Repo.erase/1`。表名で絞ると、エラーにならず 0 件になります。
 * `update_all` / `delete_all` / `stream` はありません。マイグレーションもありません(hosigraph のスキーマは Ecto のスキーマから、Repo の起動時に作ります)。
 
 ## Repo に足される関数

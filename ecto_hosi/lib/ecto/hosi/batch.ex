@@ -105,14 +105,14 @@ defmodule Ecto.Hosi.Batch do
       ],
       conds: [],
       finish: fn report ->
-        id = Backend.temp_id(report, step.n)
+        made = fn field, n -> load(adapter, schema, field, Backend.temp_id(report, n)) end
 
         struct =
           Enum.reduce(refs, struct, fn {field, name}, acc ->
-            Map.put(acc, field, Backend.temp_id(report, by_name[name].n))
+            Map.put(acc, field, made.(field, by_name[name].n))
           end)
 
-        %{struct | id: id} |> Ecto.put_meta(state: :loaded)
+        %{struct | id: made.(:id, step.n)} |> Ecto.put_meta(state: :loaded)
       end
     }
   end
@@ -123,7 +123,7 @@ defmodule Ecto.Hosi.Batch do
     cs = changeset!(step)
     schema = cs.data.__struct__
     source = schema.__schema__(:source)
-    id = cs.data.id
+    id = dump(adapter, schema, :id, cs.data.id)
     Ecto.Hosi.Cascade.append_only!(meta, source)
 
     is_integer(id) ||
@@ -184,8 +184,9 @@ defmodule Ecto.Hosi.Batch do
 
   ## ------------------------------------------------------------ delete
 
-  defp compile(%{kind: :delete} = step, meta, _adapter, _by_name) do
-    %{__struct__: schema, id: id} = struct = step.subject
+  defp compile(%{kind: :delete} = step, meta, adapter, _by_name) do
+    %{__struct__: schema, id: app_id} = struct = step.subject
+    id = dump(adapter, schema, :id, app_id)
     source = schema.__schema__(:source)
     marker = Attr.marker(source)
     Ecto.Hosi.Cascade.append_only!(meta, source)
@@ -229,6 +230,18 @@ defmodule Ecto.Hosi.Batch do
 
       _ ->
         raise ArgumentError, "cannot dump #{inspect(value)} as #{inspect(type)} (field #{field})"
+    end
+  end
+
+  defp load(adapter, schema, field, value) do
+    type = schema.__schema__(:type, field)
+
+    case Ecto.Type.adapter_load(adapter, type, value) do
+      {:ok, loaded} ->
+        loaded
+
+      _ ->
+        raise ArgumentError, "cannot load #{inspect(value)} as #{inspect(type)} (field #{field})"
     end
   end
 

@@ -261,3 +261,37 @@ defmodule Ecto.Hosi.Test.BadTuple do
     field(:b, :string)
   end
 end
+
+# An id type of the app's own: the Repo holds `id + 1000`, the app sees `id`.
+defmodule Ecto.Hosi.Test.Shifted do
+  use Ecto.Type
+
+  def shift, do: 1000
+  def type, do: :id
+  def cast(v), do: Ecto.Type.cast(:integer, v)
+  def load(v), do: {:ok, v - shift()}
+  def dump(v) when is_integer(v), do: {:ok, v + shift()}
+  def dump(_), do: :error
+end
+
+defmodule Ecto.Hosi.Test.Crate do
+  use Ecto.Schema
+
+  @primary_key {:id, Ecto.Hosi.Test.Shifted, read_after_writes: true}
+  schema "crate" do
+    field(:label, :string)
+  end
+end
+
+defmodule Ecto.Hosi.Test.Parcel do
+  use Ecto.Schema
+  use Ecto.Hosi.Schema
+
+  hosi_tuple :crate_id, :rank
+
+  @primary_key {:id, Ecto.Hosi.Test.Shifted, read_after_writes: true}
+  schema "parcel" do
+    field(:rank, :integer)
+    belongs_to(:crate, Ecto.Hosi.Test.Crate, type: Ecto.Hosi.Test.Shifted)
+  end
+end
