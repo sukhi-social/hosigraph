@@ -4,12 +4,20 @@ defmodule Ecto.Hosi.Batch do
   # all of it or none. New rows are named `[:tmp, n]` inside the batch, so a child can point at a
   # parent that does not exist yet (`refs: [post_id: :post]`).
 
-  alias Ecto.Hosi.{Attr, Backend}
+  alias Ecto.Hosi.{Attr, Backend, Blame, Schema}
 
-  def run(repo, steps, _opts) do
-    meta = Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
+  def run(repo, steps, opts) do
+    meta = repo.get_dynamic_repo() |> Ecto.Adapter.lookup_meta() |> Backend.with_timeout(opts)
     adapter = repo.__adapter__()
     steps = steps |> Enum.with_index(1) |> Enum.map(fn {s, n} -> normalize(s, n) end)
+    names = Enum.map(steps, & &1.name)
+
+    with [twice | _] <- names -- Enum.uniq(names) do
+      raise ArgumentError,
+            "write_batch: two steps are named #{inspect(twice)}; each step needs its own name, " <>
+              "or its result would be lost"
+    end
+
     by_name = Map.new(steps, &{&1.name, &1})
 
     try do
@@ -24,13 +32,14 @@ defmodule Ecto.Hosi.Batch do
 
         case Backend.write(meta, ops, opts) do
           {:ok, report} ->
-            {:ok, Map.new(compiled, &{&1.name, &1.finish.(report)})}
+            temps = Backend.temp_ids(report)
+            {:ok, Map.new(compiled, &{&1.name, &1.finish.(temps)})}
 
-          {:error, {_, :conflict, _}} ->
-            {:error, :batch, :stale}
+          {:error, {_, :conflict, msg}} ->
+            {:error, Blame.conflict(meta, compiled, msg), :stale}
 
           {:error, {_, :"write-rejected", msg}} ->
-            {:error, :batch, {:rejected, msg}}
+            {:error, Blame.rejected(meta, compiled, msg), {:rejected, msg}}
 
           {:error, reason} ->
             raise Ecto.Hosi.Error, reason: reason
@@ -57,6 +66,7 @@ defmodule Ecto.Hosi.Batch do
     cs = changeset!(step)
     schema = cs.data.__struct__
     source = schema.__schema__(:source)
+    Schema.listed!(meta, source, schema)
     refs = Keyword.get(step.opts, :refs, [])
     struct = autogenerate(schema, :autogenerate, Ecto.Changeset.apply_changes(cs))
     tmp = [:tmp, step.n]
@@ -104,8 +114,8 @@ defmodule Ecto.Hosi.Batch do
         [:create, tmp, Attr.marker(source), true] | for({a, v} <- facts, do: [:create, tmp, a, v])
       ],
       conds: [],
-      finish: fn report ->
-        made = fn field, n -> load(adapter, schema, field, Backend.temp_id(report, n)) end
+      finish: fn temps ->
+        made = fn field, n -> load(adapter, schema, field, Backend.temp_id(temps, n)) end
 
         struct =
           Enum.reduce(refs, struct, fn {field, name}, acc ->
@@ -123,6 +133,7 @@ defmodule Ecto.Hosi.Batch do
     cs = changeset!(step)
     schema = cs.data.__struct__
     source = schema.__schema__(:source)
+    Schema.listed!(meta, source, schema)
     id = dump(adapter, schema, :id, cs.data.id)
     Ecto.Hosi.Cascade.append_only!(meta, source)
 
@@ -176,7 +187,7 @@ defmodule Ecto.Hosi.Batch do
       name: step.name,
       ops: Enum.reverse(ops),
       conds: conds,
-      finish: fn _report ->
+      finish: fn _temps ->
         cs.data |> struct(changes) |> Ecto.put_meta(state: :loaded)
       end
     }
@@ -186,8 +197,9 @@ defmodule Ecto.Hosi.Batch do
 
   defp compile(%{kind: :delete} = step, meta, adapter, _by_name) do
     %{__struct__: schema, id: app_id} = struct = step.subject
-    id = dump(adapter, schema, :id, app_id)
     source = schema.__schema__(:source)
+    Schema.listed!(meta, source, schema)
+    id = dump(adapter, schema, :id, app_id)
     marker = Attr.marker(source)
     Ecto.Hosi.Cascade.append_only!(meta, source)
 
@@ -203,13 +215,14 @@ defmodule Ecto.Hosi.Batch do
       case Ecto.Hosi.Cascade.plan(meta, source, [{id, entity}]) do
         {:ok, ops, conds} -> {ops, conds}
         {:restrict, name} -> throw({:batch_error, step.name, {:foreign_key, name}})
+        {:other_facts, found} -> throw({:batch_error, step.name, {:other_facts, found}})
       end
 
     %{
       name: step.name,
       ops: ops,
       conds: conds,
-      finish: fn _report -> Ecto.put_meta(struct, state: :deleted) end
+      finish: fn _temps -> Ecto.put_meta(struct, state: :deleted) end
     }
   end
 

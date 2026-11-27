@@ -36,6 +36,7 @@ defmodule Ecto.Hosi.Test.Post do
   import Ecto.Changeset
 
   hosi_tuple :user_id, :inserted_at
+  hosi_ref :user_id, to: Ecto.Hosi.Test.User, on_delete: :keep
 
   schema "post" do
     field(:title, :string)
@@ -288,10 +289,30 @@ defmodule Ecto.Hosi.Test.Parcel do
   use Ecto.Hosi.Schema
 
   hosi_tuple :crate_id, :rank
+  hosi_ref :crate_id, to: Ecto.Hosi.Test.Crate, on_delete: :keep
 
   @primary_key {:id, Ecto.Hosi.Test.Shifted, read_after_writes: true}
   schema "parcel" do
     field(:rank, :integer)
     belongs_to(:crate, Ecto.Hosi.Test.Crate, type: Ecto.Hosi.Test.Shifted)
+  end
+end
+
+# not in the test Repo's `:schemas`
+defmodule Ecto.Hosi.Test.Unlisted do
+  use Ecto.Schema
+
+  schema "unlisted" do
+    field(:name, :string)
+  end
+end
+
+# a narrower look at the rows of "user", with no rules of its own
+defmodule Ecto.Hosi.Test.UserName do
+  use Ecto.Schema
+
+  schema "user" do
+    field(:name, :string)
+    field(:email, :string)
   end
 end

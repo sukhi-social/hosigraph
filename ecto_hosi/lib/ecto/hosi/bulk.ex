@@ -13,18 +13,19 @@ defmodule Ecto.Hosi.Bulk do
     Ecto.Hosi.Cascade.append_only!(meta, source)
 
     {ops, conds} =
-      Enum.reduce(rows, {[], []}, fn {id, entity}, {ops, conds} ->
-        {o, c} = Update.ops(meta, source, id, entity, query.updates, params, raw)
-        {ops ++ o, conds ++ c}
+      rows
+      |> Enum.map(fn {id, entity} ->
+        Update.ops(meta, source, id, entity, query.updates, params, raw)
       end)
+      |> Enum.unzip()
 
-    write!(meta, ops, conds)
+    write!(meta, Enum.concat(ops), Enum.concat(conds))
 
     # `returning`: the rows as they are after the update
     after_rows =
       if query.select && rows != [] do
         ids = Enum.map(rows, &elem(&1, 0))
-        entities = meta |> Backend.get_entities(ids) |> Backend.ok!()
+        entities = Backend.read_back(fn -> Backend.get_entities(meta, ids) end) |> Backend.ok!()
         Enum.zip(ids, entities)
       else
         rows
@@ -50,6 +51,11 @@ defmodule Ecto.Hosi.Bulk do
           {:restrict, name} ->
             raise Ecto.Hosi.Error,
               message: "delete_all on #{source} violates the foreign key #{name}: rows still point at it"
+
+          {:other_facts, found} ->
+            raise Ecto.Hosi.Error,
+              reason: {:other_facts, found},
+              message: Ecto.Hosi.Cascade.other_facts_message(found)
         end
     end
 

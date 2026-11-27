@@ -23,12 +23,14 @@ defmodule Ecto.Hosi.Conflict do
     targets!(targets)
 
     if q.wheres != [] do
-      raise ArgumentError, "Ecto.Adapters.Hosi does not support a where in an on_conflict query"
+      raise ArgumentError,
+            "Ecto.Adapters.Hosi does not support a where in an on_conflict query (ecto_hosi's limit)"
     end
   end
 
   def check!(other) do
-    raise ArgumentError, "Ecto.Adapters.Hosi cannot handle on_conflict: #{inspect(other)}"
+    raise ArgumentError,
+          "Ecto.Adapters.Hosi cannot handle on_conflict: #{inspect(other)} (ecto_hosi's limit)"
   end
 
   defp targets!(targets) when is_list(targets) do
@@ -43,7 +45,8 @@ defmodule Ecto.Hosi.Conflict do
   defp targets!(other) do
     raise ArgumentError,
           "Ecto.Adapters.Hosi supports conflict_target: [fields] and " <>
-            "{:unsafe_fragment, \"(col, lower(col)) WHERE col IS NULL\"}, got: #{inspect(other)}"
+            "{:unsafe_fragment, \"(col, lower(col)) WHERE col IS NULL\"} (ecto_hosi's limit), " <>
+            "got: #{inspect(other)}"
   end
 
   ## ---- `{:unsafe_fragment, "(a, lower(b)) WHERE c IS NULL AND d = 'x'"}`: an expression or
@@ -58,7 +61,8 @@ defmodule Ecto.Hosi.Conflict do
       _ ->
         raise ArgumentError,
               "Ecto.Adapters.Hosi cannot read the conflict_target #{inspect(text)}: " <>
-                "columns and lower(column), then WHERE column IS [NOT] NULL / column = literal"
+                "columns and lower(column), then WHERE column IS [NOT] NULL / column = literal " <>
+                "(ecto_hosi's limit)"
     end
   end
 

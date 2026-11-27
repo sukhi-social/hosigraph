@@ -29,15 +29,16 @@ defmodule Ecto.Hosi.Update do
           old = Backend.first(entity, attr) || 0
 
           unless is_number(old) and is_number(by) do
-            raise ArgumentError, "Ecto.Adapters.Hosi can inc only numbers (field #{field})"
+            raise ArgumentError,
+                  "Ecto.Adapters.Hosi can inc only numbers (field #{field}; ecto_hosi's limit)"
           end
 
           {attr, old + by}
 
         {other, field, _} ->
           raise ArgumentError,
-                "Ecto.Adapters.Hosi does not support `#{other}:` in update (field #{field}); " <>
-                  "use set: or inc:"
+                "Ecto.Adapters.Hosi does not support `#{other}:` in update (field #{field}; " <>
+                  "ecto_hosi's limit); use set: or inc:"
       end)
 
     sets = Ecto.Hosi.Derived.extend(meta, source, id, sets, fn -> entity end)
@@ -95,7 +96,7 @@ defmodule Ecto.Hosi.Update do
 
   defp value(other, _id, _entity, _source, _params) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)} in an update; " <>
-            "use a literal, a ^parameter or a field of the same row"
+          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)} in an update " <>
+            "(ecto_hosi's limit); use a literal, a ^parameter or a field of the same row"
   end
 end

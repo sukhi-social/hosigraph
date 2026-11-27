@@ -58,6 +58,10 @@ defmodule Ecto.Hosi.Schema do
 
   A row with a nil in one of the fields is never in conflict (SQL's NULLs are distinct). The store
   keeps a derived attribute for each such rule, so the guard is hosigraph's own, race included.
+
+  That derived attribute is kept by the adapter: a **direct write** (`Hosi.write/3`, or another
+  program) changes the fields without it, so it passes such a rule by. A bare `hosi_unique :field`
+  and `tuple: true` are hosigraph's own and hold for every write: prefer them where they can say it.
   """
   defmacro hosi_unique(fields, opts \\ []) do
     quote do
@@ -91,8 +95,9 @@ defmodule Ecto.Hosi.Schema do
       hosi_ref :account_id, to: "accounts", on_delete: :cascade
 
     * `:to` – the parent's table name, or its schema module
-    * `:on_delete` – `:cascade` (delete this row too), `:nilify` (set the key to nil), or
-      `:restrict` / `:none` (refuse the delete; `foreign_key_constraint/3` turns it into an error)
+    * `:on_delete` – `:cascade` (delete this row too), `:nilify` (set the key to nil),
+      `:restrict` / `:none` (refuse the delete; `foreign_key_constraint/3` turns it into an error),
+      or `:keep` (leave the key pointing at what is gone)
     * `:name` – the constraint name (default `source_field_fkey`)
 
   hosigraph has no foreign keys, so the adapter does this on every delete (`Repo.delete`,
@@ -152,7 +157,29 @@ defmodule Ecto.Hosi.Schema do
   `belongs_to` foreign keys become `:ref` attributes; the primary key is the entity id and has no attribute.
   """
   def build(schemas) do
-    Enum.reduce(schemas, %{}, fn mod, acc -> Map.merge(acc, build_one(mod)) end)
+    Enum.reduce(schemas, %{}, fn mod, acc -> Map.merge(acc, build_one(mod), &keep_unique/3) end)
+  end
+
+  # Two schemas of one source declare the same attribute: a unique rule of either one holds.
+  defp keep_unique(_attr, %{unique: unique}, later), do: Map.put(later, :unique, unique)
+  defp keep_unique(_attr, _earlier, later), do: later
+
+  @doc """
+  Raise unless writes through `schema` as `source` may go on: its rules and types are the ones the
+  Repo was started with only if it is one of the Repo's `:schemas`. (`nil`, a write by name with no
+  schema, is let through.)
+  """
+  def listed!(_meta, _source, nil), do: :ok
+
+  def listed!(meta, source, schema) do
+    if MapSet.member?(meta.listed, {source, schema}) do
+      :ok
+    else
+      raise ArgumentError,
+            "Ecto.Adapters.Hosi will not write through #{inspect(schema)} as #{inspect(source)}: " <>
+              "it is not in the Repo's :schemas, so its types and rules (unique values, delete " <>
+              "rules) would not apply. Add it to :schemas. (ecto_hosi's limit, not hosigraph's)"
+    end
   end
 
   defp build_one(mod) do
@@ -162,7 +189,7 @@ defmodule Ecto.Hosi.Schema do
     unless mod.__schema__(:primary_key) == [:id] and Ecto.Type.type(mod.__schema__(:type, :id)) == :id do
       raise ArgumentError,
             "#{inspect(mod)}: Ecto.Adapters.Hosi needs an integer primary key named :id " <>
-              "(it is the hosigraph entity id)"
+              "(it is the hosigraph entity id: hosigraph's limit)"
     end
 
     fks =

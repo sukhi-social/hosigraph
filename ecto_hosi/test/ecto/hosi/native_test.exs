@@ -106,7 +106,7 @@ defmodule Ecto.Hosi.NativeTest do
       ada = Repo.insert!(%User{name: "Ada", email: "a@x"})
       Repo.delete!(ada)
 
-      assert {:error, :batch, :stale} =
+      assert {:error, :old, :stale} =
                Repo.write_batch(
                  insert: {:new, User.changeset(%User{}, %{name: "New", email: "n@x"})},
                  update: {:old, User.changeset(ada, %{name: "Ghost"})}

@@ -75,7 +75,8 @@ defmodule Ecto.Hosi.Eval do
 
   def eval({agg, _, args} = e, _env, _ctx) when agg in @aggs and is_list(args) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi: the aggregate #{Macro.to_string(e)} is not valid here"
+          "Ecto.Adapters.Hosi: the aggregate #{Macro.to_string(e)} is not valid here " <>
+            "(ecto_hosi's limit)"
   end
 
   def eval(v, _env, _ctx)
@@ -84,7 +85,7 @@ defmodule Ecto.Hosi.Eval do
 
   def eval(other, _env, _ctx) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)}; " <>
+          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)} (ecto_hosi's limit); " <>
             "use Repo.datalog/1 for it"
   end
 
@@ -222,8 +223,8 @@ defmodule Ecto.Hosi.Eval do
 
   defp unsupported_fragment(text) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi cannot evaluate the fragment #{inspect(text)}; " <>
-            "use Repo.datalog/1 for it"
+          "Ecto.Adapters.Hosi cannot evaluate the fragment #{inspect(text)} " <>
+            "(ecto_hosi's limit); use Repo.datalog/1 for it"
   end
 
   # A map is kept as JSON text; `->>` reads one key as text.

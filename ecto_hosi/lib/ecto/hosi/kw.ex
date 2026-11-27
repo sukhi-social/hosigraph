@@ -67,8 +67,8 @@ defmodule Ecto.Hosi.Kw do
 
       _ ->
         raise ArgumentError,
-              "#{inspect(v)} is not one of the values of #{inspect(attr)} (hosi_keyword): " <>
-                inspect(Map.keys(names))
+              "#{inspect(v)} is not one of the values of #{inspect(attr)} (hosi_keyword, " <>
+                "ecto_hosi's limit): " <> inspect(Map.keys(names))
     end
   end
 

@@ -2,25 +2,65 @@ defmodule Ecto.Hosi.RepoApi do
   @moduledoc false
   # What `Ecto.Adapters.Hosi.__before_compile__/1` adds to a Repo.
 
-  alias Ecto.Hosi.{Attr, Backend, Query}
+  alias Ecto.Hosi.{Attr, Backend, Check, Query}
 
   defp meta(repo), do: Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
 
   def datalog(repo, %Query{} = query, opts), do: datalog(repo, Query.to_request(query), opts)
 
-  def datalog(repo, %{q: _} = request, _opts) do
+  def datalog(repo, %{q: _} = request, opts) do
     meta = meta(repo)
+    if Keyword.get(opts, :check, true), do: Check.request!(meta, request)
     meta |> Backend.query(request) |> Backend.ok!()
   end
 
-  def history(repo, id) do
+  def history(repo, struct_or_id) do
+    id = entity_id(struct_or_id)
     meta = meta(repo)
     meta.backend.history(meta.conn, id) |> Backend.ok!()
   end
 
-  def erase(repo, erasures) do
+  defp entity_id(id) when is_integer(id), do: id
+
+  # a struct's id as the store holds it (the schema's id may be a custom type)
+  defp entity_id(%schema{id: id} = struct) when not is_nil(id) do
+    if function_exported?(schema, :__schema__, 2),
+      do: dump1(schema.__schema__(:type, :id), id),
+      else: not_an_entity!(struct)
+  end
+
+  defp entity_id(other), do: not_an_entity!(other)
+
+  defp not_an_entity!(other) do
+    raise ArgumentError,
+          "Repo.history/1 takes a struct or its integer id (as hosigraph keeps it), " <>
+            "got: #{inspect(other)}"
+  end
+
+  def erase(repo, erasures, opts) do
+    unless is_list(erasures) and Enum.all?(erasures, &match?([kind | _] when is_atom(kind), &1)) do
+      raise ArgumentError,
+            "Repo.erase takes a list of erasures, each a tagged list: [[:ids, [id]]], " <>
+              "[[:range, first, last]], [[:\"owned-by\", attributes, owners]] and the others of " <>
+              "hosigraph's erase. Got: #{inspect(erasures)}"
+    end
+
+    meta = repo |> meta() |> Backend.with_timeout(opts)
+    timeout = Backend.timeout(meta)
+
+    fn -> meta.backend.erase(meta.conn, erasures, timeout: timeout) end
+    |> then(&Backend.waited(timeout, &1))
+    |> Backend.ok!()
+  end
+
+  # no write of facts, but it can run long: it waits for the end unless told otherwise
+  def clean(repo, opts) do
     meta = meta(repo)
-    meta.backend.erase(meta.conn, erasures) |> Backend.ok!()
+    opts = Keyword.put_new(opts, :timeout, :infinity)
+
+    fn -> meta.backend.clean(meta.conn, opts) end
+    |> then(&Backend.waited(opts[:timeout], &1))
+    |> Backend.ok!()
   end
 
   def highest(repo, schema, field, limit, opts) do

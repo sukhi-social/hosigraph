@@ -24,5 +24,5 @@ Application.put_env(:ecto_hosi, Ecto.Hosi.Test.Repo, config)
 
 # tests that look inside the stand-in only run on it; tests that need hosigraph's (missing) rules input
 # can be left out with `--exclude needs_rules_door`
-ExUnit.configure(exclude: if(real?, do: [:fake_only], else: []))
+ExUnit.configure(exclude: if(real?, do: [:fake_only], else: [:real_only]))
 ExUnit.start()

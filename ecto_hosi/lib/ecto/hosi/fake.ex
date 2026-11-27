@@ -16,7 +16,7 @@ defmodule Ecto.Hosi.Fake do
   def stop(conn), do: GenServer.stop(conn)
 
   def write(conn, ops, opts \\ []),
-    do: GenServer.call(conn, {:write, ops, Keyword.get(opts, :when, [])})
+    do: GenServer.call(conn, {:write, ops, Keyword.get(opts, :when, [])}, wait(opts))
 
   def get_entities(conn, ids), do: GenServer.call(conn, {:get_entities, ids})
   def query_many(conn, queries), do: GenServer.call(conn, {:query_many, queries})
@@ -28,7 +28,14 @@ defmodule Ecto.Hosi.Fake do
     do: GenServer.call(conn, {:highest, attr, limit, opts})
 
   def history(conn, id), do: GenServer.call(conn, {:history, id})
-  def erase(conn, erasures), do: GenServer.call(conn, {:erase, erasures})
+  def erase(conn, erasures, opts \\ []),
+    do: GenServer.call(conn, {:erase, erasures}, wait(opts))
+
+  @doc "Nothing is on a disk here: the report of a hosigraph with nothing left to clean."
+  def clean(conn, opts \\ []), do: GenServer.call(conn, :clean, wait(opts))
+
+  defp wait(opts), do: Keyword.get(opts, :timeout, 5_000)
+
   @doc "The opening arguments and all facts, for assertions in tests."
   def dump(conn), do: GenServer.call(conn, :dump)
 
@@ -114,6 +121,11 @@ defmodule Ecto.Hosi.Fake do
     {:reply, {:ok, %{erased: length(ids)}}, %{st | facts: facts}}
   end
 
+  def handle_call(:clean, _from, st) do
+    report = %{rewritten: [], skipped: [], "records-left": 0, "khana-cleaned": false, "khana-rebuilt": false}
+    {:reply, {:ok, report}, st}
+  end
+
   def handle_call(:dump, _from, st), do: {:reply, %{open: st.open, facts: st.facts}, st}
 
   ## ---- conditions
@@ -128,7 +140,8 @@ defmodule Ecto.Hosi.Fake do
 
     if failed == [],
       do: :ok,
-      else: {:error, {:app, :conflict, "conditions failed: " <> inspect(failed)}}
+      # the failed conditions as EDN, as hosigraph says them
+      else: {:error, {:app, :conflict, Hosi.Edn.encode(failed)}}
   end
 
   ## ---- ops (all or nothing: a copy is changed and kept only if every op is good)
@@ -237,7 +250,8 @@ defmodule Ecto.Hosi.Fake do
   defp unique_error(attr, v, first, second) do
     # the words of Datalevin 1.2.10, as hosigraph passes them on
     {:app, :"write-rejected",
-     "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}
+     "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{Hosi.Edn.encode(v)}] " <>
+       "because of unique constraint: #{first}"}
   end
 
   defp check_unique_values(facts, schema) do
@@ -263,10 +277,7 @@ defmodule Ecto.Hosi.Fake do
         :ok
 
       {attr, v, first, second} ->
-        # the words of Datalevin 1.2.10, as hosigraph passes them on
-        {:error,
-         {:app, :"write-rejected",
-          "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}}
+        {:error, unique_error(attr, v, first, second)}
     end
   end
 

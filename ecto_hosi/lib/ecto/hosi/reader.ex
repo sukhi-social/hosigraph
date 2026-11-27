@@ -37,6 +37,32 @@ defmodule Ecto.Hosi.Reader do
     end
   end
 
+  @doc "Raise for a query with a subquery anywhere in it, naming a Datalog query to start from."
+  def no_subquery!(%Ecto.Query{} = query) do
+    if subquery?(Map.from_struct(query)) do
+      source = start_source(query.from.source)
+
+      raise ArgumentError,
+            "Ecto.Adapters.Hosi does not support a subquery in Ecto queries (ecto_hosi's limit; " <>
+              "Datalog says it in one query). Start from the rows of #{inspect(source)} and add " <>
+              ~s|clauses: Repo.datalog(%{q: "[:find ?e :where [?e #{Attr.kw(Attr.marker(source))} true]]", inputs: []})|
+    end
+
+    :ok
+  end
+
+  defp subquery?(%Ecto.SubQuery{}), do: true
+  defp subquery?(%_{} = struct), do: subquery?(Map.from_struct(struct))
+  defp subquery?(map) when is_map(map), do: map |> Map.values() |> subquery?()
+  defp subquery?(list) when is_list(list), do: Enum.any?(list, &subquery?/1)
+  defp subquery?(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> subquery?()
+  defp subquery?(_), do: false
+
+  # the source whose rows the (innermost) query is about
+  defp start_source({source, _}) when is_binary(source), do: source
+  defp start_source(%Ecto.SubQuery{query: query}), do: start_source(query.from.source)
+  defp start_source(_), do: "source"
+
   def all(meta, %Ecto.Query{} = query, params) do
     params = Types.normalize_params(params)
 
@@ -118,7 +144,8 @@ defmodule Ecto.Hosi.Reader do
   end
 
   defp unsupported(what, hint) do
-    raise ArgumentError, "Ecto.Adapters.Hosi does not support #{what} in Ecto queries; #{hint}"
+    raise ArgumentError,
+          "Ecto.Adapters.Hosi does not support #{what} in Ecto queries (ecto_hosi's limit); #{hint}"
   end
 
   ## ---------------------------------------------------------------- where

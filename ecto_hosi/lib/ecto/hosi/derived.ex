@@ -57,8 +57,9 @@ defmodule Ecto.Hosi.Derived do
 
   @doc "`%{source => [spec]}` for these schema modules; only sources that have a rule."
   def build(schemas) do
-    for mod <- schemas, specs = specs(mod), specs != [], into: %{} do
-      {mod.__schema__(:source), specs}
+    for mod <- schemas, specs = specs(mod), specs != [], reduce: %{} do
+      acc ->
+        Map.update(acc, mod.__schema__(:source), specs, &Enum.uniq_by(&1 ++ specs, fn s -> s.attr end))
     end
   end
 
@@ -113,7 +114,8 @@ defmodule Ecto.Hosi.Derived do
     if missing != [] do
       raise ArgumentError,
             "#{spec.name}: hosi_unique #{inspect(spec.fields)}, tuple: true needs every field set, " <>
-              "but #{inspect(missing)} would be nil (a tuple's nil is a value, SQL's NULL is not)"
+              "but #{inspect(missing)} would be nil (a tuple's nil is a value, SQL's NULL is not: " <>
+              "hosigraph's limit)"
     end
   end
 

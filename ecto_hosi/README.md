@@ -100,12 +100,40 @@ and points to `Repo.datalog/1`.
   filter like that finds no rows, without an error.
 * No `stream`. `order_by`/`limit` cut in Elixir; use `Repo.highest/4` for "newest N".
 
+**Said, not done halfway or silently:**
+* A Repo whose database cannot be opened (a wrong jar path, a lock another process holds) does not start, and the
+  log says why. (If the first query is still unanswered after 2 minutes, it starts, with a warning.)
+* A write through a schema that is not in `:schemas`, or under another source, raises: its types and rules would
+  not apply. A second schema of one source has to be listed too. A write by name with no schema
+  (`insert_all("name", ..)`) is not checked.
+* A delete removes every fact of a record. So a record that also holds facts that are not the schema's (another
+  schema's `other/..`, or a plain name) is not deleted: `delete` and `delete_all` raise, `write_batch` answers
+  `{:error, step, {:other_facts, %{id: .., source: .., attributes: ..}}}`. If those facts are meant to go, retract
+  them with `Hosi.write/2` first.
+* `write_batch` names the refused step (`{:error, name, :stale | {:rejected, message}}`; the name is `:batch` when
+  hosigraph's answer does not tell), and refuses two steps with one name.
+* `Repo.datalog` raises for a misspelt attribute (no schema declares it, no record has it, and it looks like a
+  slip) and for a string where a keyword is kept. `check: false` sends the query as it is.
+* A `belongs_to` with no delete rule is warned about at start. Say it with `hosi_ref .., on_delete:` `:cascade`,
+  `:nilify`, `:restrict` or `:keep` (leave the key as it is).
+
+**Timeouts.** A write (`insert`, `update`, `delete`, `insert_all`, `update_all`, `delete_all`, `write_batch`, a
+`Multi` that is one write, `erase`) waits `timeout:`, or else the Repo's `:timeout` (Ecto's default, 15 s). In a
+transaction that runs step by step, give `timeout:` to each call. When it runs out, `Ecto.Hosi.Error` says the result
+is unknown: hosigraph goes on with the write. Reads, also those a write makes first, still give up after
+hosigraph-ex's 5 s.
+
+**Direct writes and unique rules.** A `hosi_unique` over several fields, or with `lower:` or `where:`, is kept by
+the adapter, so a direct write (`Hosi.write`) passes it by. A single `hosi_unique` field and `tuple: true` are
+hosigraph's own and hold for every write: prefer them.
+
 **Added to your Repo:**
 
 ```elixir
-Repo.history(id)                      # every event of that entity
+Repo.history(post)                    # every event of that entity (a struct, or its id)
 Repo.highest(Post, :inserted_at, 20)  # newest first -> {structs, last}; next page: after: last
 Repo.erase([[:ids, [id]]])            # really delete (account removal)
+Repo.clean()                          # let the erased bytes leave the disk; again while :"records-left" > 0
 Repo.write_batch(
   insert: {:user, user_changeset},
   insert: {:post, post_changeset, refs: [user_id: :user]}   # may point at a parent not yet written
@@ -134,7 +162,8 @@ Details: [docs/rules-input-contract.md](docs/rules-input-contract.md).
 ## Config keys
 
 `:dir` (hosigraph directory), `:schemas`, `:open` (extra open options, e.g. Datalevin), `:precheck_unique`
-(default `true`), `:hosi` (module that talks to hosigraph, default `Hosi`).
+(default `true`), `:timeout` (how long a write waits, default 15000), `:hosi` (module that talks to hosigraph,
+default `Hosi`; one of your own takes `write/3`, `erase/3` and `clean/2` with their options).
 
 ## Testing your app
 

@@ -11,12 +11,57 @@ defmodule Ecto.Hosi.Backend do
 
     if Ecto.Hosi.Tx.active?(meta) do
       Ecto.Hosi.Tx.before_write(meta, ops)
-      result = meta.backend.write(meta.conn, ops, opts)
+      result = send_write(meta, ops, opts)
       with {:ok, report} <- result, do: Ecto.Hosi.Tx.after_write(meta, report)
       result
     else
-      meta.backend.write(meta.conn, ops, opts)
+      send_write(meta, ops, opts)
     end
+  end
+
+  @doc "`meta` with the `timeout:` of one Repo call, if it has one, in place of the Repo's."
+  def with_timeout(meta, opts) do
+    case Keyword.get(opts, :timeout) do
+      nil -> meta
+      timeout -> Map.put(meta, :timeout, timeout)
+    end
+  end
+
+  def timeout(meta), do: Map.get(meta, :timeout, 15_000)
+
+  @doc "One write to hosigraph, waited for as long as `timeout/1` says."
+  def send_write(meta, ops, opts \\ []) do
+    timeout = timeout(meta)
+
+    waited(timeout, fn ->
+      meta.backend.write(meta.conn, ops, Keyword.put(opts, :timeout, timeout))
+    end)
+  end
+
+  @doc """
+  `fun`, a call that changes the database. When the wait for it runs out, hosigraph goes on with
+  it: the error says that nobody knows yet whether it will be saved.
+  """
+  def waited(timeout, fun) do
+    fun.()
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} ->
+      raise Ecto.Hosi.Error,
+        reason: :timeout,
+        message:
+          "hosigraph did not answer the write within #{timeout} ms. The result is unknown: " <>
+            "hosigraph goes on with it, so it may still take effect, also inside a transaction, " <>
+            "which then cannot take it back. Look before you try again, or give a longer timeout:."
+  end
+
+  @doc "`fun`, reading back what a write has just saved."
+  def read_back(fun) do
+    fun.()
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} ->
+      raise Ecto.Hosi.Error,
+        reason: :timeout,
+        message: "the write was saved, but reading it back timed out. Do not write it again."
   end
 
   def get_entities(meta, ids) do
@@ -40,15 +85,26 @@ defmodule Ecto.Hosi.Backend do
   def ok!({:ok, value}), do: value
   def ok!({:error, reason}), do: raise(Ecto.Hosi.Error, reason: reason)
 
-  @doc "The real id a `[:tmp, n]` became, from the report of a write."
-  def temp_id(report, n) do
-    temps = Map.get(report, :temps) || []
+  @doc """
+  `%{n => id}`: the real id each `[:tmp, n]` became, from the report of a write. Made once for a
+  write, so that finding the ids of many new rows does not walk the whole report for each one.
+  """
+  def temp_ids(report) do
+    (Map.get(report, :temps) || [])
+    |> Enum.flat_map(fn
+      [n, id] -> [{n, id}]
+      {n, id} -> [{n, id}]
+      _ -> []
+    end)
+    |> Map.new()
+  end
 
-    Enum.find_value(temps, fn
-      [^n, id] -> id
-      {^n, id} -> id
-      _ -> nil
-    end) || raise Ecto.Hosi.Error, message: "hosigraph did not report an id for [:tmp, #{n}]"
+  @doc "The real id `[:tmp, n]` became, from `temp_ids/1`."
+  def temp_id(temps, n) do
+    case temps do
+      %{^n => id} when not is_nil(id) -> id
+      _ -> raise Ecto.Hosi.Error, message: "hosigraph did not report an id for [:tmp, #{n}]"
+    end
   end
 
   @doc "A value as an op writes it: ids of other entities are `[:ref, id]` for `:ref` attributes."

@@ -516,7 +516,7 @@ defmodule Ecto.Hosi.Hybrid do
 
   defp unsupported(what) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi does not support #{what} in Ecto queries; " <>
+          "Ecto.Adapters.Hosi does not support #{what} in Ecto queries (ecto_hosi's limit); " <>
             "write it as a Datalog query with Repo.datalog/1"
   end
 end

@@ -52,7 +52,30 @@ hosigraph にテーブルはないので、各行に目印の属性 `:"user/ecto
   主キーは `@primary_key {:id, MyId, read_after_writes: true}`、指す側の列にも同じ型を付けます(`belongs_to .., type: MyId`)。
   型を通らないところはストアの番号を見ます: 型を付け忘れた列、表名の文字列で書く `from "table"` を id で絞ったとき、`Repo.datalog/1`、
   `Repo.history/1`、`Repo.erase/1`。表名で絞ると、エラーにならず 0 件になります。
-* `update_all` / `delete_all` / `stream` はありません。マイグレーションもありません(hosigraph のスキーマは Ecto のスキーマから、Repo の起動時に作ります)。
+* `stream` はありません。マイグレーションもありません(hosigraph のスキーマは Ecto のスキーマから、Repo の起動時に作ります)。
+
+## だまって通さないこと
+
+* データベースを開けないとき(jar のパス違い、別のプロセスがロックを持っている、など)、Repo は起動せず、理由がログに出ます。
+  (最初の問い合わせに 2 分たっても答えがないときは、警告を出して起動します。)
+* `:schemas` にないスキーマ(または別の source)からの書き込みは例外です。型とルールが効かないからです。
+  同じ source を使う 2 つ目のスキーマも、`:schemas` に入れてください。スキーマなしの `insert_all("名前", ..)` は調べません。
+* 削除は、その行の事実をすべて消します。そのため、スキーマのものではない事実(別のスキーマの `other/..` や、`/` のない名前)を
+  持つ行は消しません。`delete` と `delete_all` は例外、`write_batch` は `{:error, ステップ名, {:other_facts, %{..}}}` です。
+  消してよい事実なら、先に `Hosi.write/2` で取り消してください。
+* `write_batch` は、断られたステップの名前を返します(hosigraph の答えから分からないときは `:batch`)。同じ名前のステップ 2 つは断ります。
+* `Repo.datalog` は、属性名の打ち間違い(どのスキーマにも宣言がなく、どの行も持たず、打ち間違いに見えるもの)と、
+  キーワードの属性に文字列を書いた場合に、例外を出します。`check: false` でそのまま送ります。
+* 削除時のルールがない `belongs_to` は、起動時に警告します。`hosi_ref .., on_delete:` に
+  `:cascade` `:nilify` `:restrict` `:keep`(キーをそのまま残す)のどれかを書いてください。
+
+**タイムアウト。** 書き込み(`insert` `update` `delete` `insert_all` `update_all` `delete_all` `write_batch`、1回の書き込みになる
+`Multi`、`erase`)は、呼び出しの `timeout:`、なければ Repo の `:timeout`(Ecto の既定の 15 秒)まで待ちます。1歩ずつ進む
+トランザクションでは、`timeout:` を各呼び出しに付けてください。時間切れの `Ecto.Hosi.Error` は「結果は分からない」という
+意味です。hosigraph は書き込みを続けています。読み込み(書き込みの前の読み込みも)は、5 秒のままです。
+
+**直接の書き込みと unique。** 複数の列の `hosi_unique` や、`lower:` `where:` つきのものは、アダプターが守っています。
+`Hosi.write` で直接書くと素通りします。1 列の `hosi_unique` と `tuple: true` は hosigraph 自身のルールなので、そちらを選んでください。
 
 ## Repo に足される関数
 
@@ -77,9 +100,10 @@ me = 1
 MyApp.Repo.datalog(datalog find: [b], where: [reachable(^me, b)], rules: MyApp.Rules)
 #=> [[2], [3], [4]]
 
-Repo.history(id)                      # そのエンティティの全イベント
+Repo.history(post)                    # そのエンティティの全イベント(構造体か id)
 Repo.highest(Post, :inserted_at, 20)  # 新しい順のページ。{structs, last}、次は after: last
 Repo.erase([[:ids, [id]]])            # 本当に消す(退会など)
+Repo.clean()                          # 消した分をディスクからも消す。:"records-left" が 0 より大きい間はもう一度
 
 Repo.write_batch(                     # 全部成功か全部失敗の1回の書き込み
   insert: {:user, user_changeset},
@@ -114,6 +138,7 @@ Repo の起動時に、アダプターが VM の `SIGCHLD` を既定に戻しま
 | `:schemas` | hosigraph に置く Ecto スキーマ |
 | `:open` | hosigraph を開くときの追加オプション |
 | `:precheck_unique` | 既定 `true`。`hosi_unique` の値が使われていないか、書く前に問い合わせる |
+| `:timeout` | 書き込みを待つ時間(ミリ秒)。既定 15000 |
 | `:hosi` | hosigraph と話すモジュール(既定 `Hosi`)。アプリのテストでは `hosi: Ecto.Hosi.Fake` にすると、libhosi なしでメモリ上で動く |
 
 ## テスト

@@ -46,7 +46,7 @@ defmodule Ecto.Hosi.Types do
       other ->
         raise ArgumentError,
               "Ecto.Adapters.Hosi does not support the Ecto type #{inspect(ecto_type)} " <>
-                "(primitive #{inspect(other)}) yet"
+                "(primitive #{inspect(other)}) yet (ecto_hosi's limit)"
     end
   end
 

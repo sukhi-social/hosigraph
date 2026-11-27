@@ -29,7 +29,7 @@ defmodule Ecto.Hosi.StaticMulti do
       defoverridable transaction: 2
 
       def transaction(%Ecto.Multi{} = multi, opts) do
-        case Ecto.Hosi.StaticMulti.run(__MODULE__, multi) do
+        case Ecto.Hosi.StaticMulti.run(__MODULE__, multi, opts) do
           :not_static -> super(multi, opts)
           result -> result
         end
@@ -40,13 +40,13 @@ defmodule Ecto.Hosi.StaticMulti do
   end
 
   @doc "`:not_static`, or the result `Repo.transaction/2` returns for the multi."
-  def run(repo, %Ecto.Multi{} = multi) do
+  def run(repo, %Ecto.Multi{} = multi, opts \\ []) do
     meta = Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
 
     with true <- hosi?(meta),
          false <- Ecto.Hosi.Tx.active?(meta),
          {:ok, steps} <- plan(multi) do
-      case Ecto.Hosi.Batch.run(repo, steps, []) do
+      case Ecto.Hosi.Batch.run(repo, steps, opts) do
         {:ok, values} ->
           {:ok, values}
 
@@ -60,6 +60,15 @@ defmodule Ecto.Hosi.StaticMulti do
         {:error, name, {:rejected, msg}} ->
           raise Ecto.Hosi.Error,
             message: "hosigraph refused step #{inspect(name)}: #{msg}"
+
+        {:error, name, {:foreign_key, key}} ->
+          raise Ecto.Hosi.Error,
+            message: "step #{inspect(name)} violates the foreign key #{key}: rows still point at it"
+
+        {:error, name, {:other_facts, found}} ->
+          raise Ecto.Hosi.Error,
+            reason: {:other_facts, found},
+            message: "step #{inspect(name)}: " <> Ecto.Hosi.Cascade.other_facts_message(found)
       end
     else
       _ -> :not_static

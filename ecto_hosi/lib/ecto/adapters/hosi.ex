@@ -33,17 +33,24 @@ defmodule Ecto.Adapters.Hosi do
       transactions do not fit it. Use `c:write_batch/2` for all-or-nothing writes of several rows.
     * `Repo.insert` of a changeset with associations writes parent and children one after
       the other (not atomically).
-    * `update_all` / `delete_all` / `stream` are not supported.
+    * `stream` is not supported.
     * No migrations: the hosigraph schema is derived from your Ecto schemas when the Repo starts.
+    * **Only the Repo's `:schemas` write**, so that their types and rules apply.
+    * **A delete removes every fact of a record**, so it is refused when the record also holds facts
+      that are not the schema's.
+    * **A write waits `timeout:`** (or the Repo's `:timeout`, 15 s). When that runs out the result is
+      unknown: hosigraph goes on with the write.
 
   ## Functions added to your Repo
 
-    * `datalog(query, opts \\\\ [])` – a Datalog query (`Ecto.Hosi.Query.datalog/1`), with rules
-    * `history(id)` – every event of one entity
+    * `datalog(query, opts \\\\ [])` – a Datalog query (`Ecto.Hosi.Query.datalog/1`), with rules;
+      misspelt attributes and strings for keywords raise (`check: false` to skip that)
+    * `history(struct_or_id)` – every event of one entity
     * `highest_in(schema, {key, order}, keys, limit, opts \\\\ [])` – the newest rows of some keys, by a
       `hosi_tuple key, order` index of the schema (one seek per key)
     * `highest(schema, field, limit, opts \\\\ [])` – newest-first pages, e.g. a timeline
-    * `erase(erasures)` – really remove (right to be forgotten)
+    * `erase(erasures, opts \\\\ [])` – really remove (right to be forgotten)
+    * `clean(opts \\\\ [])` – let what was erased leave the disk
     * `write_batch(steps, opts \\\\ [])` – several inserts/updates/deletes, all or nothing
 
   ## Pointing hosigraph at Datalevin
@@ -67,6 +74,7 @@ defmodule Ecto.Adapters.Hosi do
     * `:schemas` – Ecto schema modules kept here
     * `:open` – more options for opening hosigraph (merged with `dir` and `schema`)
     * `:hosi` – the module that talks to hosigraph (default `Hosi`; a test double works too)
+    * `:timeout` – how long a write waits, in ms (default 15000)
     * `:precheck_unique` – default `true`: before writing a `hosi_unique` field, ask whether the value
       is taken, so the changeset error is exact. Set `false` to rely on hosigraph's own `unique`
       alone (one query less per write; the error is then worked out from hosigraph's message)
@@ -80,6 +88,8 @@ defmodule Ecto.Adapters.Hosi do
 
   alias Ecto.Hosi.{Attr, Backend, Bulk, Conflict, Derived, Reader, Schema, Tx, Types}
 
+  require Logger
+
   ## ------------------------------------------------------------ Ecto.Adapter
 
   @impl Ecto.Adapter
@@ -87,11 +97,15 @@ defmodule Ecto.Adapters.Hosi do
     quote do
       use Ecto.Hosi.StaticMulti
 
-      @doc "Run a Datalog query (see `Ecto.Hosi.Query.datalog/1`). Returns the rows, a set: in no particular order."
+      @doc """
+      Run a Datalog query (see `Ecto.Hosi.Query.datalog/1`). Returns the rows, a set: in no
+      particular order. A misspelt attribute, or a string where a keyword is kept, raises;
+      `check: false` sends the query as it is.
+      """
       def datalog(query, opts \\ []), do: Ecto.Hosi.RepoApi.datalog(__MODULE__, query, opts)
 
-      @doc "Every event of one entity, oldest first."
-      def history(id), do: Ecto.Hosi.RepoApi.history(__MODULE__, id)
+      @doc "Every event of one entity (a struct, or its integer id), oldest first."
+      def history(struct_or_id), do: Ecto.Hosi.RepoApi.history(__MODULE__, struct_or_id)
 
       @doc """
       The facts of `field` from the high end: `{structs, last_place}`.
@@ -103,8 +117,15 @@ defmodule Ecto.Adapters.Hosi do
       def highest(schema, field, limit, opts \\ []),
         do: Ecto.Hosi.RepoApi.highest(__MODULE__, schema, field, limit, opts)
 
-      @doc "Really remove entities, as hosigraph's `erase` does."
-      def erase(erasures), do: Ecto.Hosi.RepoApi.erase(__MODULE__, erasures)
+      @doc "Really remove entities, as hosigraph's `erase` does: `erase([[:ids, [id]]])`."
+      def erase(erasures, opts \\ []), do: Ecto.Hosi.RepoApi.erase(__MODULE__, erasures, opts)
+
+      @doc """
+      Let what `erase` took out leave the disk, as hosigraph's `clean` does. Returns its report;
+      while `:"records-left"` is above 0, call it again. Waits as long as it takes unless
+      `timeout:` says otherwise; `max_chunks:` limits one call.
+      """
+      def clean(opts \\ []), do: Ecto.Hosi.RepoApi.clean(__MODULE__, opts)
 
       @doc """
       Several writes in one atomic batch:
@@ -120,7 +141,7 @@ defmodule Ecto.Adapters.Hosi do
     end
   end
 
-  @shared_meta [:backend, :conn, :attrs, :derived, :keywords, :refs, :append_only, :names, :schemas, :precheck_unique]
+  @shared_meta [:backend, :conn, :attrs, :declared, :derived, :keywords, :refs, :append_only, :names, :schemas, :listed, :precheck_unique]
 
   @impl Ecto.Adapter
   def ensure_all_started(_config, _type), do: {:ok, []}
@@ -128,8 +149,12 @@ defmodule Ecto.Adapters.Hosi do
   @impl Ecto.Adapter
   def init(config) do
     case Keyword.get(config, :join) do
-      nil -> init_own(config)
-      other -> join(other)
+      nil ->
+        init_own(config)
+
+      other ->
+        {:ok, child, meta} = join(other)
+        {:ok, child, Map.put(meta, :timeout, Keyword.get(config, :timeout, 15_000))}
     end
   end
 
@@ -147,8 +172,10 @@ defmodule Ecto.Adapters.Hosi do
     repo = Keyword.fetch!(config, :repo)
     backend = Keyword.get(config, :hosi, Hosi)
     if backend == Hosi, do: wait_for_children!()
-    attrs = Schema.build(Keyword.get(config, :schemas, []))
-    derived = Ecto.Hosi.Derived.build(Keyword.get(config, :schemas, []))
+    schemas = Keyword.get(config, :schemas, [])
+    attrs = Schema.build(schemas)
+    derived = Ecto.Hosi.Derived.build(schemas)
+    warn_undeclared(schemas)
     name = Keyword.get(config, :conn_name, Module.concat(repo, Conn))
 
     open =
@@ -171,15 +198,29 @@ defmodule Ecto.Adapters.Hosi do
       conn: name,
       attrs: attrs,
       derived: derived,
-      keywords: Ecto.Hosi.Kw.build(Keyword.get(config, :schemas, [])),
-      refs: Ecto.Hosi.Cascade.build(Keyword.get(config, :schemas, [])),
-      append_only: Ecto.Hosi.Cascade.append_only(Keyword.get(config, :schemas, [])),
+      declared: for({attr, spec} <- open.schema, is_atom(attr), into: %{}, do: {attr, spec}),
+      keywords: Ecto.Hosi.Kw.build(schemas),
+      refs: Ecto.Hosi.Cascade.build(schemas),
+      append_only: Ecto.Hosi.Cascade.append_only(schemas),
       names: Ecto.Hosi.Derived.names(derived),
-      schemas: Map.new(Keyword.get(config, :schemas, []), &{&1.__schema__(:source), &1}),
-      precheck_unique: Keyword.get(config, :precheck_unique, true)
+      schemas: Map.new(schemas, &{&1.__schema__(:source), &1}),
+      listed: MapSet.new(schemas, &{&1.__schema__(:source), &1}),
+      precheck_unique: Keyword.get(config, :precheck_unique, true),
+      timeout: Keyword.get(config, :timeout, 15_000)
     }
 
     {:ok, child_spec, meta}
+  end
+
+  defp warn_undeclared(schemas) do
+    for {mod, key, parent} <- Ecto.Hosi.Cascade.undeclared(schemas) do
+      Logger.warning(
+        "ecto_hosi: #{inspect(mod)}.#{key} belongs_to #{inspect(parent)} and has no delete rule, " <>
+          "so deleting a #{inspect(parent)} leaves it pointing at nothing. In #{inspect(mod)} " <>
+          "(use Ecto.Hosi.Schema) say what should happen: hosi_ref #{inspect(key)}, " <>
+          "to: #{inspect(parent)}, on_delete: :cascade, :nilify, :restrict or :keep"
+      )
+    end
   end
 
   @impl Ecto.Adapter
@@ -200,18 +241,28 @@ defmodule Ecto.Adapters.Hosi do
   def prepare(op, query) when op in [:all, :update_all, :delete_all], do: {:nocache, {op, query}}
 
   @impl Ecto.Adapter.Queryable
-  def execute(meta, _query_meta, {:nocache, {:all, query}}, params, _opts),
-    do: Reader.all(meta, query, params)
+  def execute(meta, _query_meta, {:nocache, {:all, query}}, params, _opts) do
+    Reader.no_subquery!(query)
+    Reader.all(meta, query, params)
+  end
 
-  def execute(meta, _query_meta, {:nocache, {:update_all, query}}, params, _opts),
-    do: Bulk.update_all(meta, query, params)
+  def execute(meta, _query_meta, {:nocache, {:update_all, query}}, params, opts),
+    do: meta |> writing(query, opts) |> Bulk.update_all(query, params)
 
-  def execute(meta, _query_meta, {:nocache, {:delete_all, query}}, params, _opts),
-    do: Bulk.delete_all(meta, query, params)
+  def execute(meta, _query_meta, {:nocache, {:delete_all, query}}, params, opts),
+    do: meta |> writing(query, opts) |> Bulk.delete_all(query, params)
+
+  # the meta for a query that writes, once the query may
+  defp writing(meta, query, opts) do
+    Reader.no_subquery!(query)
+    with {source, schema} <- query.from.source, do: Schema.listed!(meta, source, schema)
+    Backend.with_timeout(meta, opts)
+  end
 
   @impl Ecto.Adapter.Queryable
   def stream(_meta, _query_meta, _query, _params, _opts) do
-    raise ArgumentError, "Ecto.Adapters.Hosi does not support stream/2"
+    raise ArgumentError,
+          "Ecto.Adapters.Hosi does not support stream/2 (ecto_hosi's limit, not hosigraph's)"
   end
 
   ## ------------------------------------------------------------ Ecto.Adapter.Schema
@@ -222,7 +273,9 @@ defmodule Ecto.Adapters.Hosi do
   def autogenerate(:binary_id), do: Ecto.UUID.bingenerate()
 
   @impl Ecto.Adapter.Schema
-  def insert(meta, %{source: source}, fields, on_conflict, returning, _opts) do
+  def insert(meta, %{source: source} = into, fields, on_conflict, returning, opts) do
+    Schema.listed!(meta, source, into[:schema])
+    meta = Backend.with_timeout(meta, opts)
     Conflict.check!(on_conflict)
     attrs = field_attrs(source, fields)
 
@@ -263,7 +316,8 @@ defmodule Ecto.Adapters.Hosi do
 
         case Backend.write(meta, ops) do
           {:ok, report} ->
-            {:ok, returning_values(meta, source, Backend.temp_id(report, 1), returning)}
+            id = report |> Backend.temp_ids() |> Backend.temp_id(1)
+            {:ok, returning_values(meta, source, id, returning)}
 
           {:error, {_, :"write-rejected", msg}} ->
             if nothing?, do: {:ok, []}, else: {:invalid, rejected(attrs, meta, msg)}
@@ -286,12 +340,15 @@ defmodule Ecto.Adapters.Hosi do
         on_conflict,
         returning,
         placeholders,
-        _opts
+        opts
       ) do
+    Schema.listed!(meta, source, schema)
+    meta = Backend.with_timeout(meta, opts)
     Conflict.check!(on_conflict)
 
     unless placeholders in [nil, []] do
-      raise ArgumentError, "Ecto.Adapters.Hosi does not support insert_all placeholders"
+      raise ArgumentError,
+            "Ecto.Adapters.Hosi does not support insert_all placeholders (ecto_hosi's limit)"
     end
 
     # `insert_all("table", rows)` has no schema, so Ecto dumped nothing: dump by the type of the
@@ -300,7 +357,8 @@ defmodule Ecto.Adapters.Hosi do
     rows_attrs = Enum.map(rows, &field_attrs(source, &1))
 
     for attrs <- rows_attrs, v <- Keyword.values(attrs), is_tuple(v) do
-      raise ArgumentError, "Ecto.Adapters.Hosi insert_all takes plain values only"
+      raise ArgumentError,
+            "Ecto.Adapters.Hosi insert_all takes plain values only (ecto_hosi's limit)"
     end
 
     if Conflict.raise?(on_conflict) do
@@ -321,11 +379,12 @@ defmodule Ecto.Adapters.Hosi do
     else
       case Backend.write(meta, ops) do
         {:ok, report} ->
-          ids = for n <- 1..length(rows_attrs), do: Backend.temp_id(report, n)
+          temps = Backend.temp_ids(report)
+          ids = for n <- 1..length(rows_attrs), do: Backend.temp_id(temps, n)
           {length(ids), insert_all_returning(meta, source, ids, returning)}
 
         {:error, {_, :"write-rejected", msg}} ->
-          raise Ecto.Hosi.Error, message: "insert_all was rejected: " <> msg
+          raise Ecto.Hosi.Error, message: "insert_all was rejected by hosigraph: " <> msg
 
         {:error, reason} ->
           raise Ecto.Hosi.Error, reason: reason
@@ -406,7 +465,7 @@ defmodule Ecto.Adapters.Hosi do
           else
             raise ArgumentError,
                   "Ecto.Adapters.Hosi: on_conflict cannot affect a row a second time " <>
-                    "(two rows of the insert_all have the same conflict_target)"
+                    "(two rows of the insert_all have the same conflict_target; ecto_hosi's limit)"
           end
         else
           seen = if key, do: Map.put(seen, key, true), else: seen
@@ -426,22 +485,28 @@ defmodule Ecto.Adapters.Hosi do
         do: %{},
         else: meta |> Backend.get_entities(olds) |> Backend.ok!() |> then(&Map.new(Enum.zip(olds, &1)))
 
-    {ops, conds, ids, _n} =
-      Enum.reduce(actions, {[], [], [], 0}, fn
-        {:skip, _}, acc ->
-          acc
+    # `{ops, conds, id}` of each row that writes; joined once, as appending row by row would copy
+    # the whole write for each of them
+    {parts, _n} =
+      Enum.flat_map_reduce(actions, 0, fn
+        {:skip, _}, n ->
+          {[], n}
 
-        :skip, acc ->
-          acc
+        :skip, n ->
+          {[], n}
 
-        {:new, attrs}, {ops, conds, ids, n} ->
+        {:new, attrs}, n ->
           n = n + 1
-          {ops ++ create_ops(meta, source, attrs, n), conds, ids ++ [{:new, n}], n}
+          {[{create_ops(meta, source, attrs, n), [], {:new, n}}], n}
 
-        {:old, id, attrs}, {ops, conds, ids, n} ->
+        {:old, id, attrs}, n ->
           {o, c} = Conflict.ops(meta, source, id, Map.fetch!(entities, id), attrs, on_conflict)
-          {ops ++ o, conds ++ c, ids ++ [{:old, id}], n}
+          {[{o, c, {:old, id}}], n}
       end)
+
+    ops = Enum.flat_map(parts, &elem(&1, 0))
+    conds = Enum.flat_map(parts, &elem(&1, 1))
+    ids = Enum.map(parts, &elem(&1, 2))
 
     if ids == [] do
       {0, nil}
@@ -450,9 +515,11 @@ defmodule Ecto.Adapters.Hosi do
 
       case Backend.write(meta, ops, opts) do
         {:ok, report} ->
+          temps = Backend.temp_ids(report)
+
           real =
             Enum.map(ids, fn
-              {:new, n} -> Backend.temp_id(report, n)
+              {:new, n} -> Backend.temp_id(temps, n)
               {:old, id} -> id
             end)
 
@@ -462,7 +529,7 @@ defmodule Ecto.Adapters.Hosi do
           raise Ecto.Hosi.Error, message: "a row changed while insert_all ran; try again"
 
         {:error, {_, :"write-rejected", msg}} ->
-          raise Ecto.Hosi.Error, message: "insert_all was rejected: " <> msg
+          raise Ecto.Hosi.Error, message: "insert_all was rejected by hosigraph: " <> msg
 
         {:error, reason} ->
           raise Ecto.Hosi.Error, reason: reason
@@ -480,7 +547,9 @@ defmodule Ecto.Adapters.Hosi do
   defp planned_new(_meta, _source, attrs, _on_conflict), do: {:new, attrs}
 
   @impl Ecto.Adapter.Schema
-  def update(meta, %{source: source}, fields, filters, returning, _opts) do
+  def update(meta, %{source: source} = row, fields, filters, returning, opts) do
+    Schema.listed!(meta, source, row[:schema])
+    meta = Backend.with_timeout(meta, opts)
     Ecto.Hosi.Cascade.append_only!(meta, source)
     {id, locks} = split_filters(filters)
     marker = Attr.marker(source)
@@ -520,7 +589,9 @@ defmodule Ecto.Adapters.Hosi do
   end
 
   @impl Ecto.Adapter.Schema
-  def delete(meta, %{source: source}, filters, _returning, _opts) do
+  def delete(meta, %{source: source} = row, filters, _returning, opts) do
+    Schema.listed!(meta, source, row[:schema])
+    meta = Backend.with_timeout(meta, opts)
     {id, locks} = split_filters(filters)
     marker = Attr.marker(source)
     entity = read_entity(meta, id)
@@ -534,6 +605,11 @@ defmodule Ecto.Adapters.Hosi do
 
         {:restrict, name} ->
           {:invalid, [foreign_key: name]}
+
+        {:other_facts, found} ->
+          raise Ecto.Hosi.Error,
+            reason: {:other_facts, found},
+            message: Ecto.Hosi.Cascade.other_facts_message(found)
       end
     else
       {:error, :stale}
@@ -544,7 +620,7 @@ defmodule Ecto.Adapters.Hosi do
   # Not SQL transactions; see Ecto.Hosi.Tx for what they are and are not.
 
   @impl Ecto.Adapter.Transaction
-  def transaction(meta, _opts, fun), do: Tx.run(meta, fun)
+  def transaction(meta, opts, fun), do: meta |> Backend.with_timeout(opts) |> Tx.run(fun)
 
   @impl Ecto.Adapter.Transaction
   def in_transaction?(meta), do: Tx.active?(meta)
@@ -602,7 +678,8 @@ defmodule Ecto.Adapters.Hosi do
     for {field, value} <- fields, keep_nil? or not is_nil(value) do
       if field == :id do
         raise ArgumentError,
-              "Ecto.Adapters.Hosi cannot insert or change an id: hosigraph makes them"
+              "Ecto.Adapters.Hosi cannot insert or change an id: hosigraph makes them " <>
+                "(ecto_hosi's limit)"
       end
 
       {Attr.attr(source, field), value}
@@ -617,7 +694,9 @@ defmodule Ecto.Adapters.Hosi do
         {id, locks}
 
       _ ->
-        raise ArgumentError, "Ecto.Adapters.Hosi needs the integer :id to update or delete a row"
+        raise ArgumentError,
+              "Ecto.Adapters.Hosi needs the integer :id to update or delete a row " <>
+                "(hosigraph's ids are integers)"
     end
   end
 
@@ -657,7 +736,7 @@ defmodule Ecto.Adapters.Hosi do
   defp returning_values(_meta, _source, _id, []), do: []
 
   defp returning_values(meta, source, id, returning) do
-    entity = read_entity(meta, id)
+    entity = Backend.read_back(fn -> read_entity(meta, id) end)
 
     for field <- returning do
       if field == :id,
@@ -670,7 +749,7 @@ defmodule Ecto.Adapters.Hosi do
   defp insert_all_returning(_meta, _source, ids, [:id]), do: Enum.map(ids, &[&1])
 
   defp insert_all_returning(meta, source, ids, returning) do
-    entities = Backend.get_entities(meta, ids) |> Backend.ok!()
+    entities = Backend.read_back(fn -> Backend.get_entities(meta, ids) end) |> Backend.ok!()
 
     for {id, entity} <- Enum.zip(ids, entities) do
       for field <- returning do

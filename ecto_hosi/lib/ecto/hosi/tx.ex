@@ -134,7 +134,7 @@ defmodule Ecto.Hosi.Tx do
       ops = deletes ++ creates
 
       if ops != [] do
-        case meta.backend.write(meta.conn, ops, []) do
+        case Backend.send_write(meta, ops) do
           {:ok, _} -> :ok
           {:error, reason} -> raise Ecto.Hosi.Error, reason: reason
         end
