@@ -13,6 +13,9 @@ Hosi.write(db, [[:create, 5, :"post/likes", 4]], when: [[:holds, 5, :"post/likes
 Hosi.stop(db)
 ```
 
+`write`, `write_many`, `erase` and `clean` take `timeout:` (ms or `:infinity`; 5000 if left out). When it runs out the
+call exits, and the write goes on without the caller.
+
 ## Getting libhosi
 
 `mix compile` puts the NIF and `libhosi` into `priv/` one of two ways (`support/hosi_build.ex`):
