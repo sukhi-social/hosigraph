@@ -12,9 +12,11 @@
 -- Bodies are UTF-8 EDN (T-12).  A request is @{:op :write :args {...}}@, an answer is
 -- @{:ok ...}@ or @{:error :kind :message "..."}@.
 --
--- [value]   @42@, @1.5@, @"text"@, @true@, @:keyword@ (hosigraph's own 'Value': an integer is
---           64 bits, a float is finite); a vector of those, with @nil@ for a missing part, is a tuple
---           (what a @:tuple@ attribute holds: read, and asked for, never written).
+-- [value]   @42@, @1.5@, @"text"@, @true@, @:keyword@, @#uuid "01a21aec-c46b-7226-b63c-5ab791b7584a"@
+--           (hosigraph's own 'Value': an integer is 64 bits, a float is finite); a vector of those, with
+--           @nil@ for a missing part, is a tuple (what a @:tuple@ attribute holds: read, and asked for,
+--           never written).  A query that compares with an attribute of type @:uuid@ must say that its
+--           value is a UUID, in the text or in an input: a string is not read as one there.
 -- [ref]     an entity: @1234@ (one that exists), or @[:tmp 1]@ (one this batch makes; the answer
 --           of @write@ says which id it got).
 -- [val]     what an event holds: a value, or @[:ref ref]@ (the id of another entity).
@@ -132,7 +134,11 @@ api = Api
 -- entity does not have yet.  (It is read, and asked for by a query or a condition; it is never written, so 'tyVal'
 -- has none.)
 tyValue :: Ty
-tyValue = TUnion [TInt, TDouble, TStr, TBool, TKw, TVec (TOpt (TUnion [TInt, TDouble, TStr, TBool, TKw]))]
+tyValue = TUnion (tyScalars ++ [TVec (TOpt (TUnion tyScalars))])
+
+-- | The values that are not tuples.
+tyScalars :: [Ty]
+tyScalars = [TInt, TDouble, TStr, TBool, TKw, TUuid]
 
 -- | An existing entity, or one the batch makes.
 tyRef :: Ty
@@ -140,7 +146,7 @@ tyRef = TUnion [TInt, TTag [Variant "tmp" [TInt]]]
 
 -- | What an event holds: a value, or the id of another entity.
 tyVal :: Ty
-tyVal = TUnion [TInt, TDouble, TStr, TBool, TKw, TTag [Variant "ref" [tyRef]]]
+tyVal = TUnion (tyScalars ++ [TTag [Variant "ref" [tyRef]]])
 
 tyOp :: Ty
 tyOp = TTag
@@ -168,7 +174,7 @@ tyInput = TTag
 -- | A cell of a row: a value, or a pulled tree (the tree is not described further).  A tuple whose first part is the
 -- keyword @:pull@ cannot be told from a pull by its look.
 tyCell :: Ty
-tyCell = TUnion [TInt, TDouble, TStr, TBool, TKw, TTag [Variant "pull" [TAny]], TVec (TOpt (TUnion [TInt, TDouble, TStr, TBool, TKw]))]
+tyCell = TUnion (tyScalars ++ [TTag [Variant "pull" [TAny]], TVec (TOpt (TUnion tyScalars))])
 
 tyQuery :: Ty
 tyQuery = TMap [Field "q" TStr, Field "inputs" (TOpt (TVec tyInput))]
@@ -256,7 +262,7 @@ openTy = TMap
   ]
   where
     attrSchema = TMap
-      [ Field "type"   (TOpt (TEnum ["any", "string", "long", "double", "boolean", "keyword", "ref"]))
+      [ Field "type"   (TOpt (TEnum ["any", "string", "long", "double", "boolean", "keyword", "ref", "uuid"]))
       , Field "card"   (TOpt (TEnum ["one", "many"]))
       , Field "unique" (TOpt (TEnum ["identity", "value"]))
       , Field "tuple"  (TOpt (TVec TKw))

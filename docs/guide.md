@@ -226,6 +226,26 @@ page2 <- highestIn h "note/by+at" keys (Just (place (last page1))) 20   -- the 2
 * **Through the C door** it is `highest-in`: `{:op :highest-in :args {:attr :note/by+at :keys ["u1" "u7"] :limit 20 :after {:val 1700000000000 :id 5678}}}`, and the answer is `[{:key "u7" :val 1700000000000 :id 5678} ...]`; give the last one's `:val` and `:id` as `:after`. In Elixir, `Hosi.highest_in(db, :"note/by+at", ["u1", "u7"], 20, after: place)`.
   Only the shape of the call was tested there, on a small world; the times above are the Haskell call's.
 
+### UUIDs: `TUuid`
+
+```haskell
+schema = M.fromList [ ("doc/uuid", identity (attr TUuid)) ]
+write h [ Create (Tmp 1) "doc/uuid" (Lit (VUuid 0x01a21aecc46b7226 0xb63c5ab791b7584a)) ]
+-- [:find ?e :where [?e :doc/uuid #uuid "01a21aec-c46b-7226-b63c-5ab791b7584a"]]
+```
+
+A UUID is a value, `VUuid` (128 bits, the high half first), and `TUuid` is the type of an attribute that holds one (Datalevin's `:db.type/uuid`).
+Values sort as their bytes do, so UUIDv7 values sort by time. hosigraph does not make UUIDs: the host does. The internal id stays the 64-bit integer.
+
+* **A `TUuid` attribute takes a UUID and nothing else**, and a UUID goes into no other typed attribute (an attribute with no type takes it). A batch that breaks this is a
+  `WriteRejected` before anything is logged, for `Create` and for `Delete`; in `writeMany` only that batch. A condition of `writeIf` with a value of the wrong kind is a `BadArgument`.
+  The check is hosigraph's own because the khana's is not enough: with Datalevin 1.2.10 (JVM), one retraction of a string from a uuid attribute made every later write fail
+  until the database was opened again.
+* **A query says that it means a UUID:** `#uuid "..."` in its text, or `InScalar (VUuid ..)` as an input. A string is not read as one there; the query fails or finds nothing.
+* **Text:** `uuidText` and `parseUuid` (`Takka.Types`). Read in either case, written in lower case.
+* **Through the C door:** `#uuid "..."` in EDN; `{"type":"uuid","value":"..."}` in JSON, where a plain string is also read as one for an attribute that `open` declared as `uuid`. In Elixir, `{:uuid, "..."}`.
+* **The files:** a world that holds a UUID cannot be opened by 0.2 or older (see "The files" below). A world without one is byte for byte what it was.
+
 ### Tuples: `tuple`
 
 ```haskell
@@ -519,13 +539,16 @@ The reason for this size: "local, one process" can be promised now. S3 brings fa
 
 | File | What is promised |
 |---|---|
-| `events/manifest` | `hosi-manifest/1` and `/2` are read by every 0.1.x and 0.2.x. A format this code does not know is refused (`Corrupt`), and nothing is touched. |
-| `events/chunks/*/chunk.hosi` | `HOSICHK1`, **versions 1 and 2**, are both read (a world that began before 0.1 has version 1). New chunks are version 2. A later layout will have a new version number, not a changed meaning. |
+| `events/manifest` | `hosi-manifest/1` and `/2` are read by every 0.1.x and 0.2.x. `/3` (a world into whose chunks a UUID was ever sealed; it stays `/3`) is read from the release that has UUIDs. A format this code does not know is refused (`Corrupt`), and nothing is touched. |
+| `events/chunks/*/chunk.hosi` | `HOSICHK1`, **versions 1 and 2**, are both read (a world that began before 0.1 has version 1). New chunks are version 2, and **version 3** if they hold a UUID (the same layout, with value tag 6). A later layout will have a new version number, not a changed meaning. |
 | `filter.bin`, `mphf.idx` | Version 1 of each. A chunk may have no `filter.bin` (it is read without it) or no `mphf.idx` (a cold chunk). |
 | `events/erase/*.bin` | `HOSIERS1`. |
-| `events/tail.log` | Records of `length:4  crc32:4  payload`, with **no header**. The first four bytes `HOSI` are reserved: no record of this format starts that way (read as a length, it would be 1.1 GiB), so a later format may begin with a mark that starts with them. 0.1.x and 0.2.x **refuse** such a file (`Corrupt`) and do not cut it. A **torn end** (a crash in the middle of an append: the last record is short, or does not match its CRC) is cut at the open. A bad record with a **whole record after it** is not a torn end but damage: the open is refused (`Corrupt`, with the byte where the bad record begins), and the file is not cut. To open anyway, keep a copy and cut `tail.log` at that byte (what follows is lost). A damaged *last* record cannot be told from a torn one, and is cut. |
+| `events/tail.log` | Records of `length:4  crc32:4  payload`, with **no header** while no record holds a UUID. A log that may hold one begins with the 8 bytes `HOSITL2\n` (put there, by writing a new file and renaming it, before the first such record is appended); the records after the mark are the same. The first four bytes `HOSI` are reserved: no record starts that way (read as a length, it would be 1.1 GiB). Any mark that this code does not know is **refused** (`Corrupt`) and not cut, and 0.1.x and 0.2.x refuse the UUID mark the same way. A **torn end** (a crash in the middle of an append: the last record is short, or does not match its CRC) is cut at the open. A bad record with a **whole record after it** is not a torn end but damage: the open is refused (`Corrupt`, with the byte where the bad record begins), and the file is not cut. To open anyway, keep a copy and cut `tail.log` at that byte (what follows is lost). A damaged *last* record cannot be told from a torn one, and is cut. |
 | `khana-dtlv/` | **Nothing.** It is derived. A khana that is missing, behind, or made under another schema is made again from the events. |
 | `events/access.json`, `events/lock` | Nothing. A hint, and a lock; both may be missing. |
+
+**A world that holds a UUID cannot go back to 0.2 or older.** Their open stops with `Corrupt` (at the log's mark, or at `hosi-manifest/3`) and touches nothing (tried with the build from before UUIDs: an unsealed UUID, a sealed one, and a sealed one with later writes).
+A world that never held one is written as before, and the build from before UUIDs opens it (tried).
 
 A test holds this. `test/fixtures/world-0.1.0/` is a small world that 0.1.0 wrote (made by `spec --make-fixture DIR`), with chunks of both versions, a cold chunk, an erase record, and a tail that is not sealed.
 Every build opens it, and must show the events listed in `expected.txt`, and (with each khana) answer for each person as `expected.txt` says.
@@ -891,8 +914,10 @@ a way of writing the same requests and answers at the door; nothing else changes
 * **1 and 1.0.** If `open` named the attribute, its schema type decides: `:double` makes `3` a double, `:long` and `:ref` accept a string of digits.
   For an attribute the schema does not name, a number written with a fraction or an exponent is a double and a whole number is an integer.
   An answer always writes a double with a fraction (`3.0`).
+* **UUIDs** are `{"type":"uuid","value":"01a21aec-c46b-7226-b63c-5ab791b7584a"}`, in requests and in answers. If `open` declared the attribute as `uuid`, a write or a condition may give a plain string;
+  a query's inputs have no attribute to go by and say it in full.
 * **Saying the type yourself.** `{"type":"double","value":1}` is the double 1.0, whatever the schema says and whatever the language can write. The types are the
-  names `open` uses: `double`, `long` (a number or a string of digits), `string` (so `":x"` needs no escape) and `keyword`. It is read wherever a value or a number
+  names `open` uses: `double`, `long` (a number or a string of digits), `string` (so `":x"` needs no escape), `keyword` and `uuid`. It is read wherever a value or a number
   may stand, and not where an object is a map of its own, so a map with a `"type"` and a `"value"` key is still a map there. What you wrote is not changed by the schema:
   a `long` given to a `:double` attribute is a `long`, and hosigraph's own check says so.
 * **Big ids.** An integer is a number. JavaScript rounds a number past 2^53, and ids are past it (an id holds its creation time), so `--ids-as-strings` writes every

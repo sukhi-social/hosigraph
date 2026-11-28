@@ -49,6 +49,7 @@ validateAt base ty0 e0 = go (reverse base) ty0 e0
         | otherwise       -> ok
       (TStr, EStr _)      -> ok
       (TKw, EKw _)        -> ok
+      (TUuid, EUuid _ _)  -> ok
       (TOpt _, ENil)      -> ok
       (TOpt t, _)         -> go rp t e
       (TVec t, EVec xs)   -> mapM_ (\(i, x) -> go (PIdx i : rp) t x) (zip [0 ..] xs)
@@ -110,6 +111,7 @@ shallow ty e = case (ty, e) of
   (TDouble, EFloat _) -> True
   (TStr, EStr _)     -> True
   (TKw, EKw _)       -> True
+  (TUuid, EUuid _ _) -> True
   (TVec _, EVec _)   -> True
   (TMap _, EMap _)   -> True
   (TDict _, EMap _)  -> True
@@ -136,6 +138,7 @@ tyName ty = case ty of
   TDouble -> "float"
   TStr    -> "string"
   TKw     -> "keyword"
+  TUuid   -> "uuid"
   TAny    -> "anything"
   TVec _  -> "vector"
   TMap _  -> "map"
@@ -158,6 +161,7 @@ describe e = case e of
   EList _  -> "list"
   EMap _   -> "map"
   ESet _   -> "set"
+  EUuid _ _ -> "uuid"
 
 -- | @at [:args :ops 3]: expected integer, got string@; with an empty path, the message alone.
 renderTyError :: TyError -> Text

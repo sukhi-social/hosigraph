@@ -440,7 +440,8 @@ sealNow k = do
     let mf' = mf { mfGeneration = mfGeneration mf + 1
                  , mfSealedSeq  = maximum (map evSeq evs)
                  , mfNextChunk  = mfNextChunk mf + length entries
-                 , mfChunks     = mfChunks mf ++ entries }
+                 , mfChunks     = mfChunks mf ++ entries
+                 , mfUuid       = mfUuid mf || any hasUuid evs }     -- in the same swap that lists the chunks
     writeManifest (xDir k) mf'
     writeIORef (xManifest k) mf'
     resetTail (xTail k) []

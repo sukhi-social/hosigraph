@@ -18,6 +18,8 @@
 -- >              version 2 writes every number as a variable-length one ('putVar', 1-10 bytes):
 -- >              run   = (id - first id) count payloadBytes  { attrIdx (seq - first seq) value }*
 -- >              value = tag, then an integer as zigzag, a text as length and bytes, @5 dictIdx@ for the dictionary
+-- >              version 3 is version 2 with UUIDs in it (tag 6, 16 bytes).  A chunk is version 3 only if it
+-- >              holds one, so that a build from before UUIDs refuses it; every other chunk is version 2
 -- >   footer   one line per block (offset, runs, events, first id, last id) + totals
 -- >   trailer  footer offset, magic
 -- >
@@ -122,7 +124,8 @@ writeChunk = writeChunkVersion 2
 -- | 'writeChunk' for a chosen format version: 2 is the current one (variable-length numbers and
 -- the value dictionary), and 1 is the oldest (fixed-width numbers, no dictionary).
 -- Version 1 is here to make old-format chunks for tests and for measuring, and for
--- nothing else; any other number is a 'BadArgument'.
+-- nothing else; any other number is a 'BadArgument'.  Events that hold a UUID are written as
+-- version 3 (version 2 with a mark that older builds refuse); version 1 does not take them.
 writeChunkVersion :: Word32 -> FilePath -> Int -> Kind -> Month -> [Event] -> IO ChunkInfo
 writeChunkVersion = writeChunkWith True
 
@@ -137,8 +140,11 @@ writeChunkWith :: Bool -> Word32 -> FilePath -> Int -> Kind -> Month -> [Event] 
 writeChunkWith withMphf version dir blockEvents kind month@(yr, mo) events0 = do
   when (null events0) $ throwIO (BadArgument "writeChunk: no events")
   when (version `notElem` [1, 2]) $ throwIO (BadArgument ("writeChunk: no such chunk version " ++ show version))
+  let uuids = any hasUuid events0
+  when (uuids && version < 2) $ throwIO (BadArgument "writeChunk: version 1 has no UUIDs")
   createDirectoryIfMissing True dir
-  let events = sortOn (\e -> (evId e, evAttr e, evSeq e)) events0
+  let written = if uuids then 3 else version                     -- the number in the header
+      events  = sortOn (\e -> (evId e, evAttr e, evSeq e)) events0
       attrs  = M.fromList (zip (M.keys (M.fromList [ (evAttr e, ()) | e <- events ])) [0 :: Word32 ..])
       runsL  = groupRuns events
       -- Values are told apart by their bytes, not by (==): 0.0 and -0.0 are equal but not the same value.
@@ -156,7 +162,7 @@ writeChunkWith withMphf version dir blockEvents kind month@(yr, mo) events0 = do
       baseSeq = minimum (map evSeq events)
       header0 = headerBytes 0
       headerBytes bodyStart = build $
-        put magicData <> putU32 version <> putU8 (fromIntegral (fromEnum kind))
+        put magicData <> putU32 written <> putU8 (fromIntegral (fromEnum kind))
           <> putU32 (fromIntegral yr) <> putU8 (fromIntegral mo) <> putU64 bodyStart
           <> putU32 (fromIntegral (M.size attrs)) <> mconcat [ putText a | Keyword a <- M.keys attrs ]
           <> (if v2 then putU32 (fromIntegral (length dictL)) <> mconcat (map valueB dictL) else mempty)
@@ -247,6 +253,7 @@ putValue2 v = case v of
   VBool b         -> putU8 3 <> putU8 (if b then 1 else 0)
   VKw (Keyword t) -> putU8 4 <> putVarText t
   VTuple _        -> error "putValue: a tuple is made by the khana and never written (Hosigraph.Events.validate refuses it)"
+  VUuid hi lo     -> putU8 6 <> putU64 hi <> putU64 lo
 
 getValueBody2 :: Word8 -> Get Value
 getValueBody2 tag = case tag of
@@ -255,6 +262,7 @@ getValueBody2 tag = case tag of
   2 -> VStr <$> getVarText
   3 -> VBool . (/= 0) <$> getU8
   4 -> VKw . Keyword <$> getVarText
+  6 -> VUuid <$> getU64 <*> getU64
   _ -> failGet ("unknown value tag " ++ show tag)
 
 -- | Cut the runs into blocks of about @target@ events (a run is never split).
@@ -363,7 +371,7 @@ openChunkReaderWith src = do
       m <- getRaw 8
       when (m /= magicData) (failGet "bad chunk magic")
       v <- getU32
-      when (v < 1 || v > 2) (failGet ("unsupported chunk version " ++ show v))
+      when (v < 1 || v > 3) (failGet ("unsupported chunk version " ++ show v))
       k <- getU8
       when (k > 1) (failGet "bad kind")
       y <- getU32

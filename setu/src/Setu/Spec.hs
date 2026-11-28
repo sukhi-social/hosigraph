@@ -55,6 +55,7 @@ data Ty
   | TDouble                 -- ^ a finite float (an integer is not a float here)
   | TStr
   | TKw                     -- ^ any keyword
+  | TUuid                   -- ^ @#uuid "..."@
   | TAny                    -- ^ any EDN; the library does not look inside
   | TVec Ty                 -- ^ a vector whose every element has this shape
   | TMap [Field]            -- ^ a map whose keys are keywords

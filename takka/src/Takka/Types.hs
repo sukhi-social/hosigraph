@@ -6,6 +6,7 @@
 module Takka.Types
   ( -- * Names and values
     Keyword(..), kw, EntityId, Value(..), renderValue, valueTypeName
+  , uuidText, parseUuid
     -- * Datoms
   , Datom(..)
     -- * Schema
@@ -16,11 +17,14 @@ module Takka.Types
   ) where
 
 import           Control.Exception (Exception)
+import           Data.Bits (shiftL, shiftR, (.&.), (.|.))
+import           Data.Char (digitToInt, intToDigit, isHexDigit)
 import           Data.Int (Int64)
 import           Data.Map.Strict (Map)
 import           Data.String (IsString(..))
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Data.Word (Word64)
 
 -- | An EDN-style keyword such as @:person/name@.  The leading colon is not stored.
 -- Any text is allowed, so full IRIs can be attribute names (handy for JSON-LD).
@@ -49,7 +53,31 @@ data Value
     -- ^ What a composite tuple attribute ('tuple') holds: its parts, in order, @Nothing@ for a part the entity does
     --   not have yet.  The khana makes it; it is read and it can be an input of a query, but it is never written
     --   (a write of one is refused), and a tuple does not hold a tuple.
+  | VUuid   !Word64 !Word64
+    -- ^ A UUID: its 128 bits, the high half first, so that the order of the values is the order of the bytes (and, for
+    --   UUIDv7, the order of the times they were made).  Written as text by 'uuidText' and read by 'parseUuid'.
   deriving (Eq, Ord, Show)
+
+-- | The usual text of a UUID, in lower case: @01a21aec-c46b-7226-b63c-5ab791b7584a@.
+uuidText :: Word64 -> Word64 -> Text
+uuidText hi lo =
+  let hex n w = [ intToDigit (fromIntegral ((w `shiftR` (4 * i)) .&. 15)) | i <- [n - 1, n - 2 .. 0] ]
+      s = hex 16 hi ++ hex 16 lo
+      (a, r1) = splitAt 8 s
+      (b, r2) = splitAt 4 r1
+      (c, r3) = splitAt 4 r2
+      (d, e)  = splitAt 4 r3
+  in T.pack (a ++ "-" ++ b ++ "-" ++ c ++ "-" ++ d ++ "-" ++ e)
+
+-- | Read the usual text of a UUID (8-4-4-4-12 hexadecimal digits, in either case), and nothing else: no braces, no
+-- @urn:uuid:@, no missing hyphens.
+parseUuid :: Text -> Maybe (Word64, Word64)
+parseUuid t = case T.splitOn "-" t of
+  [a, b, c, d, e]
+    | map T.length [a, b, c, d, e] == [8, 4, 4, 4, 12], all (T.all isHexDigit) [a, b, c, d, e]
+    -> Just (word (a <> b <> c), word (d <> e))
+  _ -> Nothing
+  where word = T.foldl' (\n ch -> (n `shiftL` 4) .|. fromIntegral (digitToInt ch)) (0 :: Word64)
 
 renderValue :: Value -> Text
 renderValue v = case v of
@@ -59,11 +87,12 @@ renderValue v = case v of
   VBool b   -> if b then "true" else "false"
   VKw k     -> T.pack (show k)
   VTuple xs -> "[" <> T.unwords (map (maybe "nil" renderValue) xs) <> "]"
+  VUuid a b -> "#uuid \"" <> uuidText a b <> "\""
 
 valueTypeName :: Value -> String
 valueTypeName v = case v of
   VInt _ -> "long"; VDouble _ -> "double"; VStr _ -> "string"
-  VBool _ -> "boolean"; VKw _ -> "keyword"; VTuple _ -> "tuple"
+  VBool _ -> "boolean"; VKw _ -> "keyword"; VTuple _ -> "tuple"; VUuid _ _ -> "uuid"
 
 -- | One fact: entity, attribute, value.
 data Datom = Datom
@@ -75,7 +104,7 @@ data Datom = Datom
 -- ---------------------------------------------------------------------------
 -- Schema (schema-on-write: attributes you never declare get 'defaultAttrSchema')
 
-data ValueType = TAny | TString | TLong | TDouble | TBool | TKeyword | TRef
+data ValueType = TAny | TString | TLong | TDouble | TBool | TKeyword | TRef | TUuid
   deriving (Eq, Show, Enum, Bounded)
 
 data Cardinality = One | Many deriving (Eq, Show)

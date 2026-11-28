@@ -54,6 +54,22 @@ defmodule Hosi.EdnTest do
     end
   end
 
+  test "a UUID is {:uuid, text}, written and read in lower case" do
+    text = "01a21aec-c46b-7226-b63c-5ab791b7584a"
+    assert Edn.encode([{:uuid, String.upcase(text)}]) == ~s([#uuid "#{text}"])
+    assert Edn.decode(~s(#uuid "#{String.upcase(text)}")) == {:ok, {:uuid, text}}
+    assert Edn.decode(~s([#uuid"#{text}" 1])) == {:ok, [{:uuid, text}, 1]}
+
+    for bad <- ["nope", "01a21aec-c46b-7226-b63c-5ab791b7584", "01a21aecc46b7226b63c5ab791b7584a"] do
+      assert_raise ArgumentError, fn -> Edn.encode({:uuid, bad}) end
+      assert {:error, _} = Edn.decode(~s(#uuid "#{bad}"))
+    end
+
+    for bad <- ["#uuid", "#uuid 5", "#uuidx \"#{text}\""] do
+      assert {:error, _} = Edn.decode(bad), "for #{inspect(bad)}"
+    end
+  end
+
   test "a term written is the term read" do
     t = %{"s" => %{b: []}, a: [1, -2, "x y", nil, true, 3.25, :"k/v"]}
     assert Edn.decode(Edn.encode(t)) == {:ok, t}

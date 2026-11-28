@@ -793,6 +793,30 @@ jsonTests =
       checkEq "an error" "{\"error\":\"conflict\",\"message\":\"say \\\"x\\\"\"}"
         (answers plain "write" "{:error :conflict :message \"say \\\"x\\\"\"}"))
 
+  , ("json: a UUID is {\"type\":\"uuid\",...}, or a plain string where the schema says the attribute is a :uuid; an answer writes it in full", do
+      let uuids = JsonOptions False (M.fromList [ (K.Keyword "a/u", K.defaultAttrSchema { K.asType = K.TUuid }) ])
+          t = "01a21aec-c46b-7226-b63c-5ab791b7584a"
+          lit = "#uuid \"" <> t <> "\""
+          wrapped = "{\"type\":\"uuid\",\"value\":\"" <> t <> "\"}"
+          write ops = "{\"op\":\"write\",\"args\":{\"ops\":[" <> ops <> "]}}"
+      readsAs uuids (write ("[\"create\",1,\"a/u\",\"" <> T.toUpper t <> "\"],[\"delete\",1,\"a/u\"," <> wrapped <> "],[\"create\",1,\"a/s\",\"" <> t <> "\"]"))
+        ("{:op :write :args {:ops [[:create 1 :a/u " <> lit <> "] [:delete 1 :a/u " <> lit <> "] [:create 1 :a/s \"" <> t <> "\"]]}}")
+      readsAs uuids ("{\"op\":\"write\",\"args\":{\"ops\":[],\"when\":[[\"holds\",1,\"a/u\",\"" <> t <> "\"]]}}")
+        ("{:op :write :args {:ops [] :when [[:holds 1 :a/u " <> lit <> "]]}}")
+      -- a query has no attribute to go by: it says what it means
+      readsAs uuids ("{\"op\":\"query-many\",\"args\":{\"queries\":[{\"q\":\"x\",\"inputs\":[[\"scalar\"," <> wrapped <> "],[\"scalar\",\"" <> t <> "\"]]}]}}")
+        ("{:op :query-many :args {:queries [{:q \"x\" :inputs [[:scalar " <> lit <> "] [:scalar \"" <> t <> "\"]]}]}}")
+      refusedWith uuids (write "[\"create\",1,\"a/u\",\"nope\"]") "not a UUID"
+      refusedWith plain (write "[\"create\",1,\"a/x\",{\"type\":\"uuid\",\"value\":3}]") "uuid"
+      checkEq "history" ("{\"ok\":[{\"seq\":1,\"kind\":\"create\",\"id\":9,\"attr\":\"a/u\",\"val\":" <> wrapped <> "}]}")
+        (answers plain "history" ("{:ok [{:seq 1 :kind :create :id 9 :attr :a/u :val " <> lit <> "}]}"))
+      checkEq "entities" ("{\"ok\":[{\"a/u\":[" <> wrapped <> "]}]}")
+        (answers plain "get-entities" ("{:ok [{:a/u [" <> lit <> "]}]}"))
+      checkEq "a query row" ("{\"ok\":[[[" <> wrapped <> "]]]}")
+        (answers plain "query-many" ("{:ok [[[" <> lit <> "]]]}"))
+      checkEq "a pulled tree" ("{\"ok\":[[[[\"pull\",{\"a/u\":" <> wrapped <> "}]]]]}")
+        (answers plain "query-cells-many" ("{:ok [[[[:pull {:a/u " <> lit <> "}]]]]}")))
+
   , ("json: ids past 2^53 are strings when asked, and only then", do
       let big = "{:ok {:temps [[1 58047583928451072] [2 9007199254740991]] :first-seq 1 :last-seq 1 :sealed false}}"
       checkEq "as numbers" "{\"ok\":{\"temps\":[[1,58047583928451072],[2,9007199254740991]],\"first-seq\":1,\"last-seq\":1,\"sealed\":false}}"
@@ -834,7 +858,30 @@ withTmp act = do
 -- of @:khana@).  Not run when no Datalevin is set up.
 realTests :: Text -> [Test]
 realTests khana =
-  [ ("real: through JSON stdio, 3 is 3.0 for a double attribute, and ids come back as strings when asked", withTmp $ \dir -> do
+  [ ("real: a :uuid attribute through the door, in EDN and in JSON: written, queried, read, pulled and in the history", withTmp $ \dir -> do
+      let open = "{:dir " <> T.pack (show dir) <> " :schema {:a/u {:type :uuid :unique :value} :a/name {:type :string}} :config {:khana " <> khana <> "}}"
+          t = "01a21aec-c46b-7226-b63c-5ab791b7584a"
+          lit = "#uuid \"" <> t <> "\""
+          wrapped = "{\"type\":\"uuid\",\"value\":\"" <> t <> "\"}"
+          byUuid = "{:op :query-many :args {:queries [{:q \"[:find ?n :in $ ?u :where [?e :a/u ?u] [?e :a/name ?n]]\" :inputs [[:scalar " <> lit <> "]]}]}}"
+      (c1, l1) <- stdioRun open (TE.encodeUtf8 (T.unlines
+        [ "{:op :write :args {:ops [[:create [:tmp 1] :a/u " <> lit <> "] [:create [:tmp 1] :a/name \"F\"]]}}"
+        , byUuid
+        , "{:op :write :args {:ops [[:create [:tmp 1] :a/u \"" <> t <> "\"]]}}"
+        , "{:op :query-cells-many :args {:queries [{:q \"[:find (pull ?e [:a/u]) :where [?e :a/u " <> T.replace "\"" "\\\"" lit <> "]]\"}]}}" ]))
+      checkEq "exit" ExitSuccess c1
+      check ("written: " ++ T.unpack (l1 !! 0)) ("{:ok {:temps" `T.isPrefixOf` (l1 !! 0))
+      checkEq "found by the UUID" "{:ok [[[\"F\"]]]}" (l1 !! 1)
+      check ("a string is refused: " ++ T.unpack (l1 !! 2)) (":write-rejected" `T.isInfixOf` (l1 !! 2))
+      check ("pulled: " ++ T.unpack (l1 !! 3)) (lit `T.isInfixOf` (l1 !! 3))
+      (c2, l2) <- stdioRunAs (FormatJson False) open (TE.encodeUtf8 (T.unlines
+        [ "{\"op\":\"query-many\",\"args\":{\"queries\":[{\"q\":\"[:find ?u :where [_ :a/u ?u]]\"}]}}"
+        , "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",[\"tmp\",1],\"a/u\",\"" <> t <> "\"]]}}" ]))
+      checkEq "exit again" ExitSuccess c2
+      checkEq "read in JSON" ("{\"ok\":[[[" <> wrapped <> "]]]}") (l2 !! 0)
+      check ("a plain string reached the unique rule as a UUID: " ++ T.unpack (l2 !! 1)) ("unique" `T.isInfixOf` (l2 !! 1)))
+
+  , ("real: through JSON stdio, 3 is 3.0 for a double attribute, and ids come back as strings when asked", withTmp $ \dir -> do
       let open = "{:dir " <> T.pack (show dir) <> " :schema {:a/name {:type :string} :a/score {:type :double} :a/any {:type :any :card :many}} :config {:khana " <> khana <> "}}"
       (c, ls) <- stdioRunAs (FormatJson True) open (TE.encodeUtf8 (T.unlines
         [ "{\"op\":\"write\",\"args\":{\"ops\":[[\"create\",[\"tmp\",1],\"a/name\",\"F\"],[\"create\",[\"tmp\",1],\"a/score\",3],[\"create\",[\"tmp\",1],\"a/any\",1.0],[\"create\",[\"tmp\",1],\"a/any\",1]]}}"

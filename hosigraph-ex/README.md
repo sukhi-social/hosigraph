@@ -13,6 +13,9 @@ Hosi.write(db, [[:create, 5, :"post/likes", 4]], when: [[:holds, 5, :"post/likes
 Hosi.stop(db)
 ```
 
+A UUID, for an attribute of type `:uuid`, is `{:uuid, "01a21aec-c46b-7226-b63c-5ab791b7584a"}`, in
+operations, in query inputs and in answers.
+
 `write`, `write_many`, `erase` and `clean` take `timeout:` (ms or `:infinity`; 5000 if left out). When it runs out the
 call exits, and the write goes on without the caller.
 

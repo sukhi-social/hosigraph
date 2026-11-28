@@ -20,7 +20,10 @@
 --   attribute decides when the schema of @open@ names it (@:double@ makes @1@ a double; @:long@ makes @1.0@ an
 --   error from hosigraph's own check), and otherwise a number written with a fraction or an exponent is a double.
 --   An answer writes a double with a fraction, always (@1.0@).
---   To say it yourself, write @{"type":"double","value":1}@ (also @long@, @string@, @keyword@); the schema does not change that.
+--   To say it yourself, write @{"type":"double","value":1}@ (also @long@, @string@, @keyword@, @uuid@); the schema does not change that.
+-- * A UUID is @{"type":"uuid","value":"01a21aec-c46b-7226-b63c-5ab791b7584a"}@, in a request and in an answer.  Where the
+--   schema of @open@ says that an attribute is a @:uuid@, a request may write the value of that attribute as a plain
+--   string; the text of a query and its inputs have no attribute to go by, and say it in full.
 -- * An integer is a number, or a string of digits where the shape asks for an integer (and for a value
 --   of an attribute the schema says is @:long@ or @:ref@).  A number past 2^53 is not safe in every
 --   language (JavaScript rounds it), so with @idsAsStrings@ an answer writes those as strings of digits.
@@ -185,7 +188,7 @@ generic rp v = case v of
   A.Object o  -> EMap <$> mapM (\(k, x) -> (,) (EKw (bare (AK.toText k))) <$> generic (PK (AK.toText k) : rp) x) (KM.toList o)
 
 -- | A number or a string of digits that the author means as a type of their own: @{"type":"double","value":1}@.
--- The types are the names the schema of @open@ uses: @double@, @long@, @string@, @keyword@.  It is read
+-- The types are the names the schema of @open@ uses: @double@, @long@, @string@, @keyword@, @uuid@.  It is read
 -- wherever a value or a number may stand, and not where an object is a map of its own (a 'TMap', a 'TDict').
 wrapper :: A.Value -> Maybe (Text, A.Value)
 wrapper v = case v of
@@ -206,8 +209,11 @@ typed rp t x = case (t, x) of
   ("long",    _)          -> integer (PK "value" : rp) x
   ("string",  A.String s) -> Right (EStr s)
   ("keyword", A.String s) -> Right (EKw (bare s))
-  _ | t `elem` ["double", "long", "string", "keyword"] -> bad (PK "value" : rp) ("expected the value of a " <> t <> ", got " <> kind x)
-    | otherwise -> bad (PK "type" : rp) ("unknown type \"" <> t <> "\", expected one of double, long, string, keyword")
+  ("uuid",    A.String s) -> case K.parseUuid s of
+    Just (a, b) -> Right (EUuid a b)
+    Nothing     -> bad (PK "value" : rp) ("not a UUID: " <> T.take 40 s)
+  _ | t `elem` ["double", "long", "string", "keyword", "uuid"] -> bad (PK "value" : rp) ("expected the value of a " <> t <> ", got " <> kind x)
+    | otherwise -> bad (PK "type" : rp) ("unknown type \"" <> t <> "\", expected one of double, long, string, keyword, uuid")
 
 -- | Where an operation names an attribute and a value, the schema of the attribute has the say, for what the author did
 -- not say themselves: @["create", r, "a", 3]@ with @a@ a @:double@ holds 1.0, and with @a@ a @:long@ a string of digits is the
@@ -226,6 +232,7 @@ wrapByAttribute schema = go
     fixValue ty x = case (ty, x) of
       (K.TDouble, A.Number _)                -> wrap "double" x
       (K.TLong, A.String s) | isDigits s     -> wrap "long" x
+      (K.TUuid, A.String _)                  -> wrap "uuid" x
       _                                      -> go x
     wrap t x = A.object ["type" A..= (t :: Text), "value" A..= x]
     isDigits s = let b = maybe s id (T.stripPrefix "-" s) in not (T.null b) && T.all isDigit b
@@ -273,12 +280,13 @@ enc opts = go
       EFloat d  -> float d
       EStr s    -> string (if ":" `T.isPrefixOf` s then ":" <> s else s)
       EKw k     -> string (":" <> k)
+      EUuid a b -> obj [("type", string "uuid"), ("value", string (K.uuidText a b))]
       ESym s    -> string s
       EVec xs   -> arr (map generic' xs)
       EList xs  -> arr (map generic' xs)
       ESet xs   -> arr (map generic' xs)
       EMap ps   -> obj [(keyName k, generic' x) | (k, x) <- ps]
-    keyName k = case k of { EKw n -> n; EStr s -> s; _ -> T.pack (show k) }
+    keyName k = case k of { EKw n -> n; EStr s -> s; EUuid a b -> K.uuidText a b; _ -> T.pack (show k) }
     int n | joIdsAsStrings opts && abs n > 9007199254740991 = string (T.pack (show n))
           | otherwise = T.pack (show n)
     float d = let t = T.pack (show d)
@@ -292,7 +300,7 @@ enc opts = go
 shape :: Ty -> Text
 shape ty = case ty of
   TNil -> "null"; TBool -> "boolean"; TInt -> "integer"; TDouble -> "number"; TStr -> "string"
-  TKw -> "keyword string"; TAny -> "anything"; TVec _ -> "array"; TMap _ -> "object"; TDict _ -> "object"
+  TKw -> "keyword string"; TUuid -> "uuid"; TAny -> "anything"; TVec _ -> "array"; TMap _ -> "object"; TDict _ -> "object"
   TOpt t -> shape t <> " or null"; TUnion ts -> T.intercalate " or " (map shape ts)
   TEnum ns -> "one of " <> T.intercalate ", " ns; TTag _ -> "an array like [\"tag\", ...]"
 

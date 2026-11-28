@@ -13,11 +13,16 @@
 -- middle of the log, and 'readTail' refuses ('Corrupt') instead of reporting a place to cut.
 --
 -- /The format has no header, and its first four bytes are reserved./  A file that begins with the
--- four bytes @HOSI@ is not a log of this format: read as a length it would be 1.1 GiB (a record is a
--- batch, and none is that big), so no record of this format starts that way.  A later format would
--- begin with a mark that starts with these four bytes, and this code refuses such a file ('Corrupt',
--- and it is not touched).  Without the refusal, an unreadable first record looks like a torn end, and
--- the caller cuts the file there: the unsealed writes of a newer world would be thrown away.
+-- four bytes @HOSI@ is not a plain log: read as a length it would be 1.1 GiB (a record is a
+-- batch, and none is that big), so no record starts that way.  A later format begins
+-- with a mark that starts with these four bytes, and a file with a mark this code does not know is
+-- refused ('Corrupt', and it is not touched).  Without the refusal, an unreadable first record looks like
+-- a torn end, and the caller cuts the file there: the unsealed writes of a newer world would be thrown away.
+--
+-- /The UUID mark./  A log that holds a UUID begins with the eight bytes @HOSITL2\\n@; the records after
+-- the mark are as above.  The mark is put in /before/ the first record with a UUID is appended (a new file,
+-- swapped in), so a build from before UUIDs, which would read such a record as damage, refuses the file
+-- instead.  A log with no UUID has no mark, and is byte for byte what it was.
 module Hosigraph.Tail
   ( TailLog, openTail, tailPath, tailSize, appendBatch, appendBatches, truncateTail, resetTail, closeTail
   , readTail, tailFile
@@ -43,11 +48,16 @@ tailFile = "tail.log"
 reservedMark :: B.ByteString
 reservedMark = "HOSI"
 
+-- | How a log that may hold a UUID begins.
+uuidMark :: B.ByteString
+uuidMark = "HOSITL2\n"
+
 data TailLog = TailLog
   { tlPath   :: FilePath
   , tlHandle :: IORef Handle
   , tlSize   :: IORef Integer
   , tlSync   :: Bool
+  , tlMarked :: IORef Bool       -- ^ the file begins with 'uuidMark'
   }
 
 tailPath :: TailLog -> FilePath
@@ -62,8 +72,9 @@ openTail dir sync = do
   let path = dir </> tailFile
   h <- openBinaryFile path ReadWriteMode
   size <- hFileSize h
+  marked <- (== uuidMark) <$> B.hGet h (B.length uuidMark)
   hSeek h SeekFromEnd 0
-  TailLog path <$> newIORef h <*> newIORef size <*> pure sync
+  TailLog path <$> newIORef h <*> newIORef size <*> pure sync <*> newIORef marked
 
 closeTail :: TailLog -> IO ()
 closeTail tl = readIORef (tlHandle tl) >>= hClose
@@ -75,15 +86,15 @@ appendBatch tl evs = head <$> appendBatches tl [evs]
 
 -- | Append several batches with one write and one fsync.  Each batch is still its own record (so a
 -- torn end loses at most the records that were not whole, never half of a batch).  Returns the file
--- size /before/ each batch, in order: cutting back to the first one undoes all of them.
+-- size /before/ each batch, in order: cutting back to the first one undoes all of them.  (The first
+-- batch with a UUID in a log that has none puts the mark in first; the sizes are those after that.)
 appendBatches :: TailLog -> [[Event]] -> IO [Integer]
 appendBatches _ [] = pure []
 appendBatches tl batches = do
   when (any null batches) $ ioError (userError "appendBatch: empty batch")
-  let encode evs =
-        let payload = build (putU64 (evSeq (head evs)) <> putU32 (fromIntegral (length evs)) <> mconcat (map putEvent evs))
-        in build (putU32 (fromIntegral (B.length payload)) <> putU32 (crc32 payload) <> put payload)
-      records = map encode batches
+  marked <- readIORef (tlMarked tl)
+  when (not marked && any (any hasUuid) batches) $ markTail tl
+  let records = map encodeBatch batches
   before <- readIORef (tlSize tl)
   h <- readIORef (tlHandle tl)
   B.hPut h (B.concat records)
@@ -107,18 +118,41 @@ truncateTail tl size = do
 -- Written to a new file and swapped in, so a crash cannot leave half a log.
 resetTail :: TailLog -> [[Event]] -> IO ()
 resetTail tl batches = do
+  let kept   = filter (not . null) batches
+      marked = any (any hasUuid) kept
+  swapIn tl marked ([ uuidMark | marked ] ++ map encodeBatch kept)
+
+-- | Put the mark in front of the records the log has now.  A crash leaves the old log or the marked one.
+markTail :: TailLog -> IO ()
+markTail tl = do
+  h <- readIORef (tlHandle tl)
+  size <- readIORef (tlSize tl)
+  hFlush h
+  hSeek h AbsoluteSeek 0
+  old <- B.hGet h (fromIntegral size)
+  hSeek h AbsoluteSeek size
+  when (fromIntegral (B.length old) /= size) $ ioError (userError "markTail: the log is shorter than it should be")
+  swapIn tl True [uuidMark, old]
+
+-- | Write a new log with these bytes beside the old one, and put it in the old one's place.
+swapIn :: TailLog -> Bool -> [B.ByteString] -> IO ()
+swapIn tl marked pieces = do
   let tmp = tlPath tl ++ ".tmp"
-      rec evs = let payload = build (putU64 (evSeq (head evs)) <> putU32 (fromIntegral (length evs)) <> mconcat (map putEvent evs))
-                in build (putU32 (fromIntegral (B.length payload)) <> putU32 (crc32 payload) <> put payload)
-      bytes = BL.fromChunks (map rec (filter (not . null) batches))
   readIORef (tlHandle tl) >>= hClose
-  BL.writeFile tmp bytes
+  BL.writeFile tmp (BL.fromChunks pieces)
   atomicReplace tmp (tlPath tl)
   h <- openBinaryFile (tlPath tl) ReadWriteMode
   size <- hFileSize h
   hSeek h SeekFromEnd 0
   writeIORef (tlHandle tl) h
   writeIORef (tlSize tl) size
+  writeIORef (tlMarked tl) marked
+
+-- | One batch as a record of the log.
+encodeBatch :: [Event] -> B.ByteString
+encodeBatch evs =
+  let payload = build (putU64 (evSeq (head evs)) <> putU32 (fromIntegral (length evs)) <> mconcat (map putEvent evs))
+  in build (putU32 (fromIntegral (B.length payload)) <> putU32 (crc32 payload) <> put payload)
 
 -- | Parse a tail file: the good batches, and the byte offset where the good part ends
 -- (which is smaller than the file size if the end was torn).
@@ -134,10 +168,11 @@ readTail dir = do
   exists <- doesFileExist path
   if not exists then pure ([], 0) else do
     bs <- B.readFile path
-    when (reservedMark `B.isPrefixOf` bs) $
+    let start = if uuidMark `B.isPrefixOf` bs then B.length uuidMark else 0
+    when (start == 0 && reservedMark `B.isPrefixOf` bs) $
       throwIO (Corrupt (path ++ ": starts with " ++ show reservedMark ++ ", which is not a record of this format "
                         ++ "(a log written by a newer hosigraph?); not read, and not cut"))
-    let (batches, good) = go bs 0 []
+    let (batches, good) = go bs start []
     case [ p | p <- [good + 1 .. B.length bs - 8], wholeAt bs p ] of
       (p : _) -> throwIO (Corrupt (path ++ ": the record at byte " ++ show good ++ " is damaged, and a whole record follows it (at byte " ++ show p
                                    ++ "), so this is not a torn end.  Not read, and not cut: the file is as it was.  Everything before byte " ++ show good

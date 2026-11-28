@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**A world that holds a UUID cannot be opened by 0.2 or older.** A world that holds none is written as before.
+
+### New
+
+* **UUIDs:** a value (`VUuid`), an attribute type (`TUuid`, `:uuid` through the C door), `#uuid "..."` in EDN and in queries, `{"type":"uuid","value":"..."}` in JSON, `{:uuid, "..."}` in Elixir. [The guide](docs/guide.md#uuids-tuuid).
+* **`hosi` (Elixir): `write`, `write_many`, `erase` and `clean` take `timeout:`.** When it runs out the call exits, and the write goes on without the caller.
+
+### Changed (visible to a host)
+
+* **`Value` has a constructor more, `VUuid`, `ValueType` one more, `TUuid`, and `Takka.Edn.Edn` one more, `EUuid`.** Keep a catch-all case.
+* **A typed attribute refuses a UUID**, and a `TUuid` attribute refuses everything else (`WriteRejected`, before anything is logged; a wrong condition of `writeIf` is a `BadArgument`).
+* `takka` is `0.2.0.0`.
+
+### The files
+
+* `events/tail.log` begins with `HOSITL2\n` once it holds a UUID; a chunk that holds one is version 3; a manifest after a UUID was sealed is `hosi-manifest/3`.
+
 ## 0.2.0.0 (2026-11-26)
 
 **No change to the files.** What 0.1.0 wrote, every 0.1.x and 0.2.x reads (the fixture of 0.1.0 is opened by every build), and a schema that uses none of the new things is the schema it was, so its khana is not made again.

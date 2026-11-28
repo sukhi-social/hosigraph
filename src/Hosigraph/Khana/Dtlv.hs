@@ -129,9 +129,23 @@ closeDtlv d = case dtlvRunner d of
 dtlvTransact :: Dtlv -> [DtlvOp] -> IO ()
 dtlvTransact _ [] = pure ()
 dtlvTransact d ops0 = do
+  mapM_ (maybe (pure ()) (throwIO . DtlvError) . notAUuid (dtlvSchema d)) ops0
   ops   <- wordsOps d ops0
   forms <- either (throwIO . DtlvError) pure (mapM opEdn ops)
   void (runWithC True d (Just ("[" <> T.unwords forms <> "]")) ("(" <> transactFn d <> " c data) nil"))
+
+-- | A uuid attribute takes a UUID and nothing else.  This is checked before anything is sent: in Datalevin 1.2.10 a
+-- retract with a string on such an attribute stops every later write until the database is opened again.  ('Hosigraph.write'
+-- refuses such a batch before it is logged; this is for the other ways here: a log folded under another schema, say.)
+notAUuid :: Schema -> DtlvOp -> Maybe String
+notAUuid sch op = case op of
+  DAdd e a v     -> check e a v
+  DRetract e a v -> check e a v
+  where
+    check e a v = case (asType <$> M.lookup a sch, v) of
+      (Just TUuid, VUuid _ _) -> Nothing
+      (Just TUuid, _)         -> Just ("entity " ++ show e ++ ": " ++ show a ++ " holds UUIDs, and " ++ T.unpack (renderValue v) ++ " is not one")
+      _                       -> Nothing
 
 -- | With 'Words': after each fact of an attribute that has them, the fact of its words (the same kind, the same entity), so
 -- the words of a text that is replaced or taken out are replaced or taken out with it.  One round trip to the tokenizer for all of them.
@@ -797,6 +811,7 @@ ednVal v = case v of
   VBool b   -> Right (if b then "true" else "false")
   VKw k     -> Right (ednKw k)
   VTuple xs -> (\ps -> "[" <> T.unwords ps <> "]") <$> mapM (maybe (Right "nil") ednVal) xs
+  VUuid a b -> Right ("#uuid " <> ednStr (uuidText a b))
 
 -- | The attributes of a schema whose words are searched.
 fulltextAttrs :: Schema -> [Keyword]
@@ -817,6 +832,7 @@ schemaEdn sch = "{" <> T.intercalate " " [ ednKw k <> " " <> one s | (k, s) <- M
       TBool    -> Just ":db/valueType :db.type/boolean"
       TKeyword -> Just ":db/valueType :db.type/keyword"
       TRef     -> Just ":db/valueType :db.type/ref"
+      TUuid    -> Just ":db/valueType :db.type/uuid"
     card c = case c of One -> Nothing; Many -> Just ":db/cardinality :db.cardinality/many"
     uniq u = case u of
       NotUnique      -> Nothing

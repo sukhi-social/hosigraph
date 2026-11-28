@@ -137,6 +137,8 @@ validateCases =
   , ("string", TStr, EStr "", Nothing)
   , ("keyword", TKw, edn ":a/b", Nothing)
   , ("a symbol is not a keyword", TKw, edn "a", Just "expected keyword, got symbol")
+  , ("uuid", TUuid, edn "#uuid \"01a21aec-c46b-7226-b63c-5ab791b7584a\"", Nothing)
+  , ("a string is not a uuid", TUuid, edn "\"01a21aec-c46b-7226-b63c-5ab791b7584a\"", Just "expected uuid, got string")
   , ("optional, nil", TOpt TStr, ENil, Nothing)
   , ("optional, present", TOpt TStr, EStr "x", Nothing)
   , ("optional, wrong", TOpt TStr, edn "1", Just "expected string, got integer")
@@ -404,7 +406,7 @@ genNames lo hi = do
 
 genTy :: Int -> Gen Ty
 genTy d
-  | d <= 0 = elements [TNil, TBool, TInt, TDouble, TStr, TKw, TAny]
+  | d <= 0 = elements [TNil, TBool, TInt, TDouble, TStr, TKw, TUuid, TAny]
   | otherwise = frequency
       [ (4, genTy 0)
       , (1, TVec <$> genTy (d - 1))
@@ -437,6 +439,7 @@ genEdnFor ty = case ty of
   TDouble -> EFloat <$> genFinite
   TStr    -> (EStr . T.pack) <$> arbitrary
   TKw     -> EKw <$> genName
+  TUuid   -> EUuid <$> arbitrary <*> arbitrary
   TAny    -> genEdnAny 2
   TVec t  -> EVec <$> vectorOf' 4 (genEdnFor t)
   TOpt t  -> oneof [pure ENil, genEdnFor t]
@@ -458,11 +461,12 @@ genEdnFor ty = case ty of
     args <- mapM genEdnFor (variantArgs v)
     pure (EVec (EKw (variantTag v) : args))
 
--- | Any EDN that takka's reader can read (so, no tagged literals), of depth at most d.
+-- | Any EDN that takka's reader can read (so, no tagged literals but @#uuid@), of depth at most d.
 genEdnAny :: Int -> Gen Edn
 genEdnAny d = frequency $
   [ (2, pure ENil), (2, EBool <$> arbitrary), (3, EInt <$> arbitrary), (1, (EInt . (* (10 ^ (30 :: Int)))) <$> arbitrary)
-  , (2, EFloat <$> genFinite), (4, (EStr . T.pack) <$> arbitrary), (3, EKw <$> genName), (2, ESym <$> genSym) ]
+  , (2, EFloat <$> genFinite), (4, (EStr . T.pack) <$> arbitrary), (3, EKw <$> genName), (2, ESym <$> genSym)
+  , (1, EUuid <$> arbitrary <*> arbitrary) ]
   ++ [ x | d > 0, x <- [ (2, EVec <$> items), (1, EList <$> items), (1, ESet <$> items)
                        , (2, EMap <$> (vectorOf' 3 ((,) <$> genEdnAny (d - 1) <*> genEdnAny (d - 1)))) ] ]
   where items = vectorOf' 4 (genEdnAny (d - 1))
