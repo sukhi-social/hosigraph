@@ -20,6 +20,8 @@ defmodule Ecto.Hosi.StaticMulti do
     * all or nothing means the changes of the steps before a failing one were never made, so the
       `changes` of `{:error, name, value, changes}` is `%{}`
     * a stale update or delete raises `Ecto.Hosi.Error` instead of `Ecto.StaleEntryError`
+    * two steps that change one record (one of them an update) run step by step: a batch is
+      worked out from the records as they are before it
     * changesets with associations, `prepare_changes`, an optimistic lock or a prefix are not
       compiled: they run step by step
   """
@@ -46,7 +48,10 @@ defmodule Ecto.Hosi.StaticMulti do
     with true <- hosi?(meta),
          false <- Ecto.Hosi.Tx.active?(meta),
          {:ok, steps} <- plan(multi) do
-      case Ecto.Hosi.Batch.run(repo, steps, opts) do
+      case Ecto.Hosi.Batch.run(repo, steps, Keyword.put(opts, :static, true)) do
+        :not_static ->
+          :not_static
+
         {:ok, values} ->
           {:ok, values}
 
@@ -55,7 +60,7 @@ defmodule Ecto.Hosi.StaticMulti do
 
         {:error, name, :stale} ->
           raise Ecto.Hosi.Error,
-            message: "the row of step #{inspect(name)} is stale (changed or deleted meanwhile)"
+            message: "the record of step #{inspect(name)} is stale (changed or deleted meanwhile)"
 
         {:error, name, {:rejected, msg}} ->
           raise Ecto.Hosi.Error,
@@ -63,19 +68,19 @@ defmodule Ecto.Hosi.StaticMulti do
 
         {:error, name, {:foreign_key, key}} ->
           raise Ecto.Hosi.Error,
-            message: "step #{inspect(name)} violates the foreign key #{key}: rows still point at it"
+            message: "step #{inspect(name)} violates the foreign key #{key}: records still point at it"
 
-        {:error, name, {:other_facts, found}} ->
+        {:error, name, {:refused, info}} ->
           raise Ecto.Hosi.Error,
-            reason: {:other_facts, found},
-            message: "step #{inspect(name)}: " <> Ecto.Hosi.Cascade.other_facts_message(found)
+            reason: {:refused, info},
+            message: "step #{inspect(name)}: " <> Ecto.Hosi.Delete.message(meta, info)
       end
     else
       _ -> :not_static
     end
   end
 
-  defp hosi?(meta), do: match?(%{backend: _, conn: _, attrs: _}, meta)
+  defp hosi?(meta), do: match?(%{backend: _, conn: _, model: _}, meta)
 
   @doc false
   # `{:ok, write_batch steps}` or `:error`.

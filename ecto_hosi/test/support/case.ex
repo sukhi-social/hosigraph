@@ -55,7 +55,8 @@ defmodule Ecto.Hosi.Case do
         Ecto.Hosi.Fake.dump(conn()).facts
 
       _real ->
-        Ecto.Hosi.Test.Repo.datalog(%{q: "[:find ?e ?a ?v :where [?e ?a ?v]]", inputs: []})
+        # (ids up to 1 are hosigraph's own bookkeeping)
+        Ecto.Hosi.Test.Repo.datalog(%{q: "[:find ?e ?a ?v :where [?e ?a ?v] [(> ?e 1)]]", inputs: []})
         |> Enum.group_by(fn [e, a, _] -> {e, a} end, fn [_, _, v] -> v end)
     end
   end

@@ -3,14 +3,14 @@ defmodule Ecto.Hosi.TupleUniqueTest do
 
   alias Ecto.Hosi.Test.{BadTuple, Link}
 
-  @tuple :"link/uq-link_a_b_index"
+  @tuple :"hosi/uq-link_a_b_index"
 
   defp ins(attrs), do: %Link{} |> Link.changeset(attrs) |> Repo.insert()
 
   # the entities that hold this pair, asked as hosigraph's tuple value: `[?e :link/uq-... [a b]]`
   defp holders(a, b) do
     Repo.datalog(%{
-      q: "[:find ?e :in $ ?p :where [?e #{Ecto.Hosi.Attr.kw(@tuple)} ?p]]",
+      q: "[:find ?e :in $ ?p :where [?e #{Ecto.Hosi.Model.kw(@tuple)} ?p]]",
       inputs: [[:scalar, [a, b]]]
     })
     |> List.flatten()
@@ -18,7 +18,7 @@ defmodule Ecto.Hosi.TupleUniqueTest do
 
   describe "hosi_unique [...], tuple: true" do
     test "is hosigraph's tuple with unique, not a JSON text" do
-      attrs = Ecto.Hosi.Schema.build([Link])
+      attrs = Ecto.Hosi.Model.build([Link]).schema
       assert %{tuple: [:"link/a", :"link/b"], unique: :value} = attrs[@tuple]
       refute Map.has_key?(attrs[@tuple], :type)
     end
@@ -111,7 +111,14 @@ defmodule Ecto.Hosi.TupleUniqueTest do
       meta = Ecto.Adapter.lookup_meta(Repo.get_dynamic_repo()) |> Map.put(:precheck_unique, false)
 
       assert {:invalid, [unique: "link_a_b_index"]} =
-               Ecto.Adapters.Hosi.insert(meta, %{source: "link"}, [a: 4, b: 4], {:raise, [], []}, [:id], [])
+               Ecto.Adapters.Hosi.insert(
+                 meta,
+                 %{source: "link", schema: Link},
+                 ["link/a": 4, "link/b": 4],
+                 {:raise, [], []},
+                 [:id],
+                 []
+               )
 
       assert Repo.aggregate(Link, :count) == 1
     end
@@ -134,7 +141,7 @@ defmodule Ecto.Hosi.TupleUniqueTest do
     end
 
     test "the rule says what it cannot do" do
-      assert_raise ArgumentError, ~r/plain combination/, fn -> Ecto.Hosi.Derived.specs(BadTuple) end
+      assert_raise ArgumentError, ~r/plain combination/, fn -> Ecto.Hosi.Model.build([BadTuple]) end
     end
   end
 end

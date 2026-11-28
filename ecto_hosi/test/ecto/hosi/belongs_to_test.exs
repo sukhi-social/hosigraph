@@ -1,7 +1,9 @@
 defmodule Ecto.Hosi.BelongsToTest.Author do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "bt_author"
 
   schema "bt_author" do
+    field(:here, :boolean, default: true)
     field(:name, :string)
   end
 end
@@ -9,8 +11,10 @@ end
 # says nothing about what deleting its author does
 defmodule Ecto.Hosi.BelongsToTest.Book do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "bt_book"
 
   schema "bt_book" do
+    field(:here, :boolean, default: true)
     belongs_to(:author, Ecto.Hosi.BelongsToTest.Author)
   end
 end
@@ -18,11 +22,12 @@ end
 # says: keep the reference
 defmodule Ecto.Hosi.BelongsToTest.Quote do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "bt_quote"
 
-  hosi_ref :author_id, to: Ecto.Hosi.BelongsToTest.Author, on_delete: :keep
+  hosi_ref :author_id, on_delete: :keep
 
   schema "bt_quote" do
+    field(:here, :boolean, default: true)
     belongs_to(:author, Ecto.Hosi.BelongsToTest.Author)
   end
 end
@@ -30,16 +35,20 @@ end
 # the parent says it, the Ecto way
 defmodule Ecto.Hosi.BelongsToTest.Shelf do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "bt_shelf"
 
   schema "bt_shelf" do
+    field(:here, :boolean, default: true)
     has_many(:labels, Ecto.Hosi.BelongsToTest.Label, foreign_key: :shelf_id, on_delete: :delete_all)
   end
 end
 
 defmodule Ecto.Hosi.BelongsToTest.Label do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "bt_label"
 
   schema "bt_label" do
+    field(:here, :boolean, default: true)
     belongs_to(:shelf, Ecto.Hosi.BelongsToTest.Shelf)
   end
 end

@@ -5,14 +5,14 @@ defmodule Ecto.Hosi.Check do
   #   * a misspelt attribute finds nothing (`[]`), or, inside `not`, everything;
   #   * a string where a keyword is kept is a Java cast error.
   #
-  # An attribute is called misspelt only if no schema declares it, **no record has it**, and it
-  # looks like a slip: it is under a name the schemas use (`user/..`), or very close to a declared
+  # An attribute is called misspelt only if no view declares it, **no record has it**, and it
+  # looks like a slip: it is under a name the views use (`ap/..`), or very close to a declared
   # one. So a query that could find something is never refused. `Repo.datalog(query, check: false)`
   # leaves everything to hosigraph.
   #
   # A request this module cannot read is left to hosigraph too.
 
-  alias Ecto.Hosi.{Attr, Backend}
+  alias Ecto.Hosi.{Backend, Model}
 
   @close 0.9
 
@@ -26,8 +26,8 @@ defmodule Ecto.Hosi.Check do
           Enum.flat_map(Map.get(sections, :where, []), &patterns/1) ++
             Enum.flat_map(inputs.rules, &rule_patterns/1)
 
-        patterns |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.each(&known!(meta, &1))
-        Enum.each(patterns, &keyword!(meta, &1, inputs.values))
+        patterns |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.each(&known!(meta, &1, "Repo.datalog"))
+        Enum.each(patterns, &typed!(meta, &1, inputs.values))
 
       {:error, _} ->
         :ok
@@ -102,7 +102,8 @@ defmodule Ecto.Hosi.Check do
 
   ## ---- the checks
 
-  defp known!(meta, attr) do
+  @doc "Raise for an attribute that looks misspelt: `caller` is who says so."
+  def known!(meta, attr, caller) do
     declared = meta.declared
     name = Atom.to_string(attr)
 
@@ -123,8 +124,8 @@ defmodule Ecto.Hosi.Check do
           end
 
         raise ArgumentError,
-              "Repo.datalog: no schema declares :#{name} and no record has it.#{hint} " <>
-                "(ecto_hosi's check; hosigraph would answer as if no record had it. " <>
+              "#{caller}: no view declares :#{name} and no record has it.#{hint} " <>
+                "(ecto_hosi's check; hosigraph would take it as an attribute of its own. " <>
                 "check: false skips it.)"
       end
     end
@@ -144,29 +145,42 @@ defmodule Ecto.Hosi.Check do
     declared
     |> Map.keys()
     |> Enum.map(&Atom.to_string/1)
-    |> Enum.reject(&(&1 =~ ~r{/(uq-|ecto-kind\z)}))
+    |> Enum.reject(&String.starts_with?(&1, "hosi/"))
     |> Enum.map(&{&1, String.jaro_distance(&1, name)})
     |> Enum.max_by(&elem(&1, 1), fn -> nil end)
   end
 
   defp used?(meta, attr) do
-    request = %{q: "[:find ?e :where [?e #{Attr.kw(attr)} _]]", inputs: []}
+    request = %{q: "[:find ?e :where [?e #{Model.kw(attr)} _]]", inputs: []}
     meta |> Backend.query(request) |> Backend.ok!() != []
   end
 
-  defp keyword!(meta, {attr, term}, values) do
-    with %{type: :keyword} <- Map.get(meta.declared, attr),
+  # a string where a keyword or a UUID is kept
+  defp typed!(meta, {attr, term}, values) do
+    with %{type: type} when type in [:keyword, :uuid] <- Map.get(meta.declared, attr),
          string when is_binary(string) <- string_in(term, values) do
-      allowed =
-        case Map.get(Backend.keywords(meta), attr) do
-          nil -> ""
-          names -> " The values are #{names |> Map.values() |> Enum.sort() |> Enum.map_join(", ", &inspect/1)}."
-        end
-
-      raise ArgumentError,
-            "Repo.datalog: :#{attr} is a keyword attribute, and Datalog compares what is stored: " <>
-              "write :#{string}, not #{inspect(string)}.#{allowed} (hosigraph's limit)"
+      raise ArgumentError, "Repo.datalog: " <> stringly(meta, attr, type, string)
     end
+  end
+
+  defp stringly(meta, attr, :keyword, string) do
+    allowed =
+      case meta.model.attrs[attr] do
+        %{keyword: names} when names != nil ->
+          " The values are #{names |> Map.keys() |> Enum.sort() |> Enum.map_join(", ", &inspect/1)}."
+
+        _ ->
+          ""
+      end
+
+    ":#{attr} is a keyword attribute, and Datalog compares what is stored: " <>
+      "write :#{string}, not #{inspect(string)}.#{allowed} (hosigraph's limit)"
+  end
+
+  defp stringly(_meta, attr, :uuid, string) do
+    ":#{attr} is a UUID attribute, and Datalog compares what is stored: write " <>
+      "#uuid #{inspect(string)} in the text, or give {:uuid, #{inspect(string)}} as an input, not " <>
+      "a string. (hosigraph's limit)"
   end
 
   defp string_in(string, _values) when is_binary(string), do: string

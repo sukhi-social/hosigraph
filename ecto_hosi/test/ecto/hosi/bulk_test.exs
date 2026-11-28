@@ -105,37 +105,22 @@ defmodule Ecto.Hosi.BulkTest do
     end
   end
 
-  describe "schemaless insert_all" do
-    test "dumps times, maps, arrays and binaries by the registered schema" do
-      at = ~U[2026-01-02 03:04:05.000000Z]
+  describe "by name" do
+    test "nothing is written or read by name: a name says nothing about the facts" do
+      assert_raise ArgumentError, ~r/does not write by name.*no tables/s, fn ->
+        Repo.insert_all("user", [%{name: "N", email: "n@x"}])
+      end
 
-      assert {1, _} =
-               Repo.insert_all("doc", [
-                 %{meta: %{"a" => 1}, tags: ["x"], blob: <<1, 2, 255>>}
-               ])
+      assert_raise ArgumentError, ~r/does not query by name.*no tables/s, fn ->
+        Repo.all(from(u in "user", select: u.name))
+      end
 
-      assert {1, _} = Repo.insert_all("user", [%{name: "N", email: "n@x", inserted_at: at, updated_at: at}])
-      assert %{inserted_at: _} = Repo.one(from(u in User, where: u.name == "N"))
-      assert [%{meta: %{"a" => 1}, tags: ["x"], blob: <<1, 2, 255>>}] = Repo.all(Doc)
-    end
-  end
+      assert_raise ArgumentError, ~r/does not query by name/, fn ->
+        Repo.update_all("user", set: [name: "x"])
+      end
 
-  describe "schemaless insert_all defaults" do
-    test "a field the row leaves out gets the schema's default" do
-      assert {1, _} = Repo.insert_all("user", [%{name: "D", email: "d@x"}])
-      assert %{active: true, lock_version: 1} = Repo.one(from(u in User, where: u.name == "D"))
-    end
-  end
-
-  describe "values with no type to dump them" do
-    test "a time in a schemaless query, and a time without microseconds in a _usec column" do
-      at = ~N[2026-01-02 03:04:05]
-      assert {1, _} = Repo.insert_all("user", [%{name: "T", email: "t@x", inserted_at: at, updated_at: ~U[2026-01-02 03:04:05Z]}])
-
-      assert ["T"] ==
-               Repo.all(from(u in "user", where: u.inserted_at <= ^~N[2026-01-02 03:04:05.000000], select: u.name))
-
-      assert [] == Repo.all(from(u in "user", where: u.inserted_at < ^~N[2026-01-02 03:04:05], select: u.name))
+      assert_raise ArgumentError, ~r/does not query by name/, fn -> Repo.delete_all(from(u in "user")) end
+      assert facts() == %{}
     end
   end
 
@@ -150,26 +135,17 @@ defmodule Ecto.Hosi.BulkTest do
   end
 
   describe "EXISTS fragments" do
-    test "EXISTS and NOT EXISTS look at another table" do
-      a = user!(%{name: "Ada"})
-      b = user!(%{name: "Bob"})
-      Repo.insert!(%Post{title: "t", user_id: a.id})
+    test "are not offered (Datalog says them)" do
+      user!(%{name: "Ada"})
 
-      with_posts =
-        from(u in User,
-          where: fragment("EXISTS (SELECT 1 FROM post p WHERE p.user_id = ?)", u.id),
-          select: u.name
+      assert_raise ArgumentError, ~r/cannot evaluate the fragment.*Repo.datalog/s, fn ->
+        Repo.all(
+          from(u in User,
+            where: fragment("EXISTS (SELECT 1 FROM post p WHERE p.user_id = ?)", u.id),
+            select: u.name
+          )
         )
-
-      without =
-        from(u in User,
-          where: fragment("NOT EXISTS (SELECT 1 FROM post p WHERE p.user_id = ?)", u.id),
-          select: u.name
-        )
-
-      assert Repo.all(with_posts) == ["Ada"]
-      assert Repo.all(without) == ["Bob"]
-      assert b.id
+      end
     end
   end
 end

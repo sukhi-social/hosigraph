@@ -149,7 +149,7 @@ defmodule Ecto.Hosi.Tx do
     attrs =
       (Map.keys(now) ++ Map.keys(before))
       |> Enum.uniq()
-      |> Enum.reject(&match?(%{tuple: _}, Map.get(meta.attrs, &1)))
+      |> Enum.reject(&match?(%{tuple: parts} when parts != nil, Map.get(meta.model.attrs, &1)))
 
     Enum.reduce(attrs, {[], []}, fn attr, {del, add} ->
       cur = Map.get(now, attr, [])

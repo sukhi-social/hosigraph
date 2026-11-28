@@ -13,7 +13,7 @@ defmodule Ecto.Hosi.DeleteScopeTest do
 
   defp followed_user! do
     u = user!()
-    direct_write([[:create, u.id, :"follow/ecto-kind", true], [:create, u.id, :"follow/from", 7]])
+    direct_write([[:create, u.id, :"follow/is", true], [:create, u.id, :"follow/from", 7]])
     u
   end
 
@@ -26,7 +26,7 @@ defmodule Ecto.Hosi.DeleteScopeTest do
     error = assert_raise Ecto.Hosi.Error, fn -> Repo.delete(u) end
 
     assert error.message =~ "#{u.id}"
-    assert error.message =~ ":follow/ecto-kind, :follow/from"
+    assert error.message =~ ":follow/from, :follow/is"
     assert error.message =~ "ecto_hosi's limit"
     assert facts_of(u.id) == before
   end
@@ -41,18 +41,18 @@ defmodule Ecto.Hosi.DeleteScopeTest do
 
   test "once the other facts are gone, the delete goes through" do
     u = followed_user!()
-    direct_write([[:delete, u.id, :"follow/ecto-kind", true], [:delete, u.id, :"follow/from", 7]])
+    direct_write([[:delete, u.id, :"follow/is", true], [:delete, u.id, :"follow/from", 7]])
 
     assert {:ok, _} = Repo.delete(u)
     assert facts_of(u.id) == %{}
   end
 
-  test "a fact the schema no longer declares, under its own name, is still its own" do
+  test "a name that looks like the view's, but is not a field of it, is another fact" do
     u = user!()
     direct_write([[:create, u.id, :"user/left_over", "x"]])
 
-    assert {:ok, _} = Repo.delete(u)
-    assert facts_of(u.id) == %{}
+    assert_raise Ecto.Hosi.Error, ~r/:user\/left_over/, fn -> Repo.delete(u) end
+    assert Repo.get(User, u.id)
   end
 
   test "delete_all is refused as a whole" do
@@ -67,14 +67,14 @@ defmodule Ecto.Hosi.DeleteScopeTest do
   test "write_batch is refused as a whole, and names the step" do
     u = followed_user!()
 
-    assert {:error, :gone, {:other_facts, %{id: id, attributes: attributes}}} =
+    assert {:error, :gone, {:refused, %{id: id, reason: :other_facts, attributes: attributes}}} =
              Repo.write_batch(
                insert: {:new, Changeset.change(%User{}, name: "New", email: "new@x")},
                delete: {:gone, u}
              )
 
     assert id == u.id
-    assert attributes == [:"follow/ecto-kind", :"follow/from"]
+    assert attributes == [:"follow/from", :"follow/is"]
     assert Repo.aggregate(User, :count) == 1
   end
 

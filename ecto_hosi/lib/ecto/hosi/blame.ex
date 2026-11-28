@@ -4,15 +4,15 @@ defmodule Ecto.Hosi.Blame do
   # ops, so the step is found again from what the answer names: the failed `when:` conditions, or
   # the attribute and value of the unique rule. `:batch` when the answer does not tell.
 
-  alias Ecto.Hosi.{Backend, Kw}
+  alias Ecto.Hosi.Store
 
   @doc "A condition did not hold: the message is the failed conditions, as EDN."
   def conflict(meta, steps, message) do
-    kws = Backend.keywords(meta)
-
     with {:ok, failed} when is_list(failed) <- Hosi.Edn.decode(message),
          %{name: name} <-
-           Enum.find(steps, fn step -> Enum.any?(Kw.conds(kws, step.conds), &(&1 in failed)) end) do
+           Enum.find(steps, fn step ->
+             Enum.any?(Store.conds(meta.model, step.conds), &(&1 in failed))
+           end) do
       name
     else
       _ -> :batch
@@ -26,8 +26,7 @@ defmodule Ecto.Hosi.Blame do
   def rejected(meta, steps, message) do
     case Regex.run(@unique, message) do
       [_, attr, value] ->
-        kws = Backend.keywords(meta)
-        written = Enum.map(steps, &{&1.name, written(Kw.ops(kws, &1.ops))})
+        written = Enum.map(steps, &{&1.name, written(Store.ops(meta.model, &1.ops))})
         parts = parts(meta, attr)
 
         # steps that write a part of the rule, and among them those that write just this value
@@ -52,12 +51,9 @@ defmodule Ecto.Hosi.Blame do
 
   # the attributes a rule is made of: a tuple's parts, or the attribute itself
   defp parts(meta, attr) do
-    meta.derived
-    |> Map.values()
-    |> Enum.concat()
-    |> Enum.find_value([attr], fn spec ->
-      if spec.native and Atom.to_string(spec.attr) == attr,
-        do: Enum.map(spec.attrs, &Atom.to_string/1)
+    Enum.find_value(meta.model.rules, [attr], fn rule ->
+      if rule.native and Atom.to_string(rule.attr) == attr,
+        do: Enum.map(rule.attrs, &Atom.to_string/1)
     end)
   end
 

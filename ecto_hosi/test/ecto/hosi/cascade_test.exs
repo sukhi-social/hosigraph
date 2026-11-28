@@ -73,12 +73,23 @@ defmodule Ecto.Hosi.CascadeTest do
     assert length(Repo.all(Member)) == 1
   end
 
-  test "append-only rows are written, never changed" do
+  test "a final attribute is set once and not changed; a delete still removes it" do
     e = Repo.insert!(%Entry{text: "x"})
-    assert_raise ArgumentError, ~r/append-only/, fn -> e |> Ecto.Changeset.change(text: "y") |> Repo.update() end
-    assert_raise ArgumentError, ~r/append-only/, fn -> Repo.delete(e) end
-    assert_raise ArgumentError, ~r/append-only/, fn -> Repo.delete_all(Entry) end
-    assert_raise ArgumentError, ~r/append-only/, fn -> Repo.update_all(Entry, set: [text: "z"]) end
+    change = e |> Ecto.Changeset.change(text: "y")
+
+    assert_raise Ecto.Hosi.Error, ~r/:entry\/text is final/, fn -> Repo.update(change) end
+    assert_raise Ecto.Hosi.Error, ~r/final/, fn -> Repo.update_all(Entry, set: [text: "z"]) end
+    assert_raise Ecto.Hosi.Error, ~r/final/, fn -> Repo.write_batch(update: {:e, change}) end
+    assert_raise Ecto.Hosi.Error, ~r/final/, fn ->
+      Repo.update(Ecto.Changeset.change(e, text: nil))
+    end
+
     assert [%Entry{text: "x"}] = Repo.all(Entry)
+    assert {:ok, _} = Repo.delete(e)
+
+    # one that has no value yet takes its first
+    e = Repo.insert!(%Entry{})
+    assert {:ok, e} = e |> Ecto.Changeset.change(text: "first") |> Repo.update()
+    assert_raise Ecto.Hosi.Error, ~r/final/, fn -> Repo.update(Ecto.Changeset.change(e, text: "2")) end
   end
 end

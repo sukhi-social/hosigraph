@@ -21,8 +21,8 @@ defmodule Ecto.Hosi.LoudTest do
 
     test "also in not, or-join, a rule, a misspelt namespace" do
       for query <- [
-            q("[:find ?e :where [?e :user/ecto-kind true] (not [?e :user/nmae _])]"),
-            q("[:find ?e :where [?e :user/ecto-kind true] (or-join [?e] [?e :user/age 1] [?e :user/nmae _])]"),
+            q("[:find ?e :where [?e :user/is true] (not [?e :user/nmae _])]"),
+            q("[:find ?e :where [?e :user/is true] (or-join [?e] [?e :user/age 1] [?e :user/nmae _])]"),
             q("[:find ?e :in $ % :where (named ?e)]", [[:rules, "[[(named ?e) [?e :user/nmae _]]]"]]),
             q("[:find ?e :where [?e :usr/name _]]")
           ] do
@@ -59,11 +59,17 @@ defmodule Ecto.Hosi.LoudTest do
       end
     end
 
-    test "from the datalog macro" do
+    test "the datalog macro writes the field's value as it is kept" do
+      t = Repo.insert!(%Ticket{title: "a"})
       state = "open"
 
-      assert_raise ArgumentError, ~r/:open, not "open"/, fn ->
-        Repo.datalog(datalog(find: [t], where: [match(Ticket, id: t, state: ^state)]))
+      assert Repo.datalog(datalog(find: [t], where: [match(Ticket, id: t, state: ^state)])) == [[t.id]]
+      assert Repo.datalog(datalog(find: [t], where: [match(Ticket, id: t, state: "closed")])) == []
+
+      bogus = "bogus"
+
+      assert_raise ArgumentError, ~r/"bogus" is not one of the values/, fn ->
+        Repo.datalog(datalog(find: [t], where: [match(Ticket, id: t, state: ^bogus)]))
       end
     end
 
@@ -76,7 +82,8 @@ defmodule Ecto.Hosi.LoudTest do
   describe "history, erase, clean" do
     test "history takes the struct too, and says what else it cannot take" do
       u = user!()
-      assert Repo.history(u) == Repo.history(u.id)
+      assert [%{kind: :create, value: "Ada"}] = Repo.history(u).name
+      assert Enum.any?(Repo.history(u.id), &match?(%{attr: :"user/name", val: "Ada"}, &1))
 
       assert_raise ArgumentError, ~r/struct or its integer id/, fn -> Repo.history("x") end
       assert_raise ArgumentError, ~r/struct or its integer id/, fn -> Repo.history(%User{}) end
@@ -115,7 +122,7 @@ defmodule Ecto.Hosi.LoudTest do
 
         assert error.message =~ "a subquery"
         assert error.message =~ "ecto_hosi's limit"
-        assert error.message =~ ~s|Repo.datalog(%{q: "[:find ?e :where [?e :user/ecto-kind true]]"|
+        assert error.message =~ ~s|Repo.datalog(%{q: "[:find ?e :where [?e :user/is true]]"|
         refute error.message =~ "Ecto.SubQuery"
       end
     end

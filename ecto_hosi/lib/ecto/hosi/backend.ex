@@ -3,11 +3,17 @@ defmodule Ecto.Hosi.Backend do
   # The one place that talks to hosigraph. The module that answers (`Hosi`, or a test double with
   # the same functions) lives in the adapter meta as `:backend`; the connection as `:conn`.
 
+  alias Ecto.Hosi.Store
+
   def write(meta, ops, opts \\ []) do
-    # a `hosi_keyword` field is a string for Elixir and a keyword for hosigraph: made here, once
-    kws = keywords(meta)
-    ops = Ecto.Hosi.Kw.ops(kws, ops)
-    opts = Ecto.Hosi.Kw.opts(kws, opts)
+    # keywords and UUIDs get hosigraph's form here, once
+    ops = Store.ops(meta.model, ops)
+
+    opts =
+      case Keyword.fetch(opts, :when) do
+        {:ok, conds} -> Keyword.put(opts, :when, Store.conds(meta.model, conds))
+        :error -> opts
+      end
 
     if Ecto.Hosi.Tx.active?(meta) do
       Ecto.Hosi.Tx.before_write(meta, ops)
@@ -29,7 +35,7 @@ defmodule Ecto.Hosi.Backend do
 
   def timeout(meta), do: Map.get(meta, :timeout, 15_000)
 
-  @doc "One write to hosigraph, waited for as long as `timeout/1` says."
+  @doc "One write to hosigraph (values in hosigraph's form), waited for as long as `timeout/1` says."
   def send_write(meta, ops, opts \\ []) do
     timeout = timeout(meta)
 
@@ -64,14 +70,31 @@ defmodule Ecto.Hosi.Backend do
         message: "the write was saved, but reading it back timed out. Do not write it again."
   end
 
+  @doc "`{:ok, entities}`, each `%{attr => [values]}` in the adapter's form."
   def get_entities(meta, ids) do
     with {:ok, entities} <- meta.backend.get_entities(meta.conn, ids) do
-      {:ok, Enum.map(entities, &Ecto.Hosi.Kw.entity(keywords(meta), &1))}
+      {:ok, Enum.map(entities, &Store.entity(meta.model, &1))}
     end
   end
 
-  @doc "`%{attr => %{string => keyword}}` of the `hosi_keyword` fields (empty if there are none)."
-  def keywords(meta), do: Map.get(meta, :keywords, %{})
+  @doc "`[{id, entity}]` of these ids."
+  def read(_meta, []), do: []
+
+  def read(meta, ids) do
+    ids
+    |> Enum.chunk_every(500)
+    |> Enum.flat_map(fn chunk ->
+      meta |> get_entities(chunk) |> ok!() |> then(&Enum.zip(chunk, &1))
+    end)
+  end
+
+  @doc "The entity of one id (`%{}` when there is none)."
+  def read_one(meta, id) do
+    case meta |> get_entities([id]) |> ok!() do
+      [entity] -> entity
+      _ -> %{}
+    end
+  end
 
   @doc "One query; the rows of its answer."
   def query(meta, %{q: _} = req) do
@@ -87,7 +110,7 @@ defmodule Ecto.Hosi.Backend do
 
   @doc """
   `%{n => id}`: the real id each `[:tmp, n]` became, from the report of a write. Made once for a
-  write, so that finding the ids of many new rows does not walk the whole report for each one.
+  write, so that finding the ids of many new records does not walk the whole report for each one.
   """
   def temp_ids(report) do
     (Map.get(report, :temps) || [])
@@ -107,26 +130,18 @@ defmodule Ecto.Hosi.Backend do
     end
   end
 
-  @doc "A value as an op writes it: ids of other entities are `[:ref, id]` for `:ref` attributes."
+  @doc "A value as an op writes it: ids of other records are `[:ref, id]` for reference attributes."
   def wrap(meta, attr, value) do
-    case meta.attrs do
-      %{^attr => %{type: :ref}} -> [:ref, value]
+    case meta.model.attrs do
+      %{^attr => %{type: :ref}} -> ref(value)
       _ -> value
     end
   end
 
-  @doc """
-  The ops that retract everything an entity holds. A `(key, order)` tuple attribute (`hosi_tuple`)
-  is kept by hosigraph and is neither written nor retracted, so it is left out.
-  """
-  def retract_all(meta, id, entity) do
-    for {attr, vals} <- entity,
-        not match?(%{^attr => %{tuple: _}}, meta.attrs),
-        v <- vals,
-        do: [:delete, id, attr, wrap(meta, attr, v)]
-  end
+  defp ref([:ref, _] = ref), do: ref
+  defp ref(value), do: [:ref, value]
 
-  @doc "The first value of an attribute in an entity map (every attribute here has one value)."
+  @doc "The first value of an attribute in an entity map."
   def first(entity, attr) do
     case Map.get(entity, attr) do
       [v | _] -> v

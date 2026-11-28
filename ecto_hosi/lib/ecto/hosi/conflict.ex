@@ -7,14 +7,19 @@ defmodule Ecto.Hosi.Conflict do
   #     {[field, ..], [], targets}            {:replace, ..}, :replace_all, :replace_all_except
   #     {%Ecto.Query{}, params, targets}      [set: .., inc: ..] or an update query
   #
-  # `targets` is the `conflict_target:` as field names: `[:email]`, `[:a, :b]`. A row conflicts
-  # with an existing row when all the target fields are equal (a nil never conflicts, as in SQL).
+  # `targets` is the `conflict_target:` as attributes: `[:email]`, `[:a, :b]`. A row conflicts
+  # with an existing record when all the target attributes are equal (a nil never conflicts, as in
+  # SQL).
   #
-  # Looking the existing row up and writing are two steps: with the target on a `hosi_unique`
-  # field hosigraph's own `unique` is the guard against a race; without it two concurrent inserts
-  # of the same target can both succeed.
+  # A unique rule holds across every record, whichever view wrote it, so the record that holds a
+  # unique value may be one the view does not show (a tombstone keeps its ids). `:nothing` then
+  # skips the row; an action that would change that record is refused.
+  #
+  # Looking the existing record up and writing are two steps: with the target on a unique rule
+  # hosigraph's own `unique` is the guard against a race; without it two concurrent inserts of the
+  # same target can both succeed.
 
-  alias Ecto.Hosi.{Attr, Backend, Update}
+  alias Ecto.Hosi.{Backend, Change, Model, Reader, Store, Update}
 
   def check!({:raise, _, _}), do: :ok
   def check!({:nothing, _, targets}), do: targets!(targets)
@@ -90,8 +95,8 @@ defmodule Ecto.Hosi.Conflict do
         p = String.trim(p)
 
         cond do
-          m = Regex.run(~r/\Alower\((\w+)\)\z/i, p) -> {:lower, String.to_atom(Enum.at(m, 1))}
-          Regex.match?(~r/\A\w+\z/, p) -> {:plain, String.to_atom(p)}
+          m = Regex.run(~r/\Alower\(([\w\/.\-]+)\)\z/i, p) -> {:lower, String.to_atom(Enum.at(m, 1))}
+          Regex.match?(~r/\A[\w\/.\-]+\z/, p) -> {:plain, String.to_atom(p)}
           true -> :error
         end
       end
@@ -122,11 +127,11 @@ defmodule Ecto.Hosi.Conflict do
 
   defp cond1(text) do
     cond do
-      m = Regex.run(~r/\A(\w+)\s+IS\s+NOT\s+NULL\z/i, text) -> {:not_null, atom(m)}
-      m = Regex.run(~r/\A(\w+)\s+IS\s+NULL\z/i, text) -> {:null, atom(m)}
-      m = Regex.run(~r/\A(\w+)\s*=\s*'([^']*)'\z/, text) -> {:eq, atom(m), Enum.at(m, 2)}
-      m = Regex.run(~r/\A(\w+)\s*=\s*(true|false)\z/i, text) -> {:eq, atom(m), String.downcase(Enum.at(m, 2)) == "true"}
-      m = Regex.run(~r/\A(\w+)\s*=\s*(-?\d+)\z/, text) -> {:eq, atom(m), String.to_integer(Enum.at(m, 2))}
+      m = Regex.run(~r/\A([\w\/.\-]+)\s+IS\s+NOT\s+NULL\z/i, text) -> {:not_null, atom(m)}
+      m = Regex.run(~r/\A([\w\/.\-]+)\s+IS\s+NULL\z/i, text) -> {:null, atom(m)}
+      m = Regex.run(~r/\A([\w\/.\-]+)\s*=\s*'([^']*)'\z/, text) -> {:eq, atom(m), Enum.at(m, 2)}
+      m = Regex.run(~r/\A([\w\/.\-]+)\s*=\s*(true|false)\z/i, text) -> {:eq, atom(m), String.downcase(Enum.at(m, 2)) == "true"}
+      m = Regex.run(~r/\A([\w\/.\-]+)\s*=\s*(-?\d+)\z/, text) -> {:eq, atom(m), String.to_integer(Enum.at(m, 2))}
       true -> :error
     end
   end
@@ -144,74 +149,134 @@ defmodule Ecto.Hosi.Conflict do
   def targetless?(_), do: false
 
   @doc """
-  The key of a row, or nil when it has none to match (a NULL never conflicts, and a partial
-  index only holds the rows its WHERE lets in).
+  The key of a row (`[{attribute, value}]`), or nil when it has none to match (a nil never
+  conflicts, and a partial index only holds the records its WHERE lets in).
   """
-  def key(source, attrs, {_, _, targets}) when is_list(targets) and targets != [] do
-    pairs = for f <- targets, do: {Attr.attr(source, f), Keyword.get(attrs, Attr.attr(source, f))}
+  def key(_view, values, {_, _, targets}) when is_list(targets) and targets != [] do
+    pairs = for attr <- targets, do: {attr, get(values, attr)}
     if Enum.any?(pairs, fn {_, v} -> is_nil(v) end), do: nil, else: {:plain, pairs}
   end
 
-  def key(source, attrs, {_, _, {:unsafe_fragment, text}}) do
+  def key(_view, values, {_, _, {:unsafe_fragment, text}}) do
     {items, conds} = parse_fragment!(text)
-
-    items =
-      for {kind, f} <- items do
-        {kind, Attr.attr(source, f), Keyword.get(attrs, Attr.attr(source, f))}
-      end
-
-    conds = for c <- conds, do: cond_attr(source, c)
+    items = for {kind, attr} <- items, do: {kind, attr, get(values, attr)}
 
     cond do
       Enum.any?(items, fn {_, _, v} -> is_nil(v) end) -> nil
-      not Enum.all?(conds, &holds?(&1, attrs)) -> nil
+      not Enum.all?(conds, &holds?(&1, values)) -> nil
       true -> {:frag, items, conds}
     end
   end
 
-  def key(_source, _attrs, _on_conflict), do: nil
+  def key(_view, _values, _on_conflict), do: nil
 
-  defp cond_attr(source, {:null, f}), do: {:null, Attr.attr(source, f)}
-  defp cond_attr(source, {:not_null, f}), do: {:not_null, Attr.attr(source, f)}
-  defp cond_attr(source, {:eq, f, v}), do: {:eq, Attr.attr(source, f), v}
-
-  # does a row being inserted (attr => value) fall inside the partial index?
-  defp holds?({:null, a}, attrs), do: is_nil(Keyword.get(attrs, a))
-  defp holds?({:not_null, a}, attrs), do: not is_nil(Keyword.get(attrs, a))
-  defp holds?({:eq, a, v}, attrs), do: Keyword.get(attrs, a) == v
-
-  @doc "`{:conflict, id}` of the existing row this one collides with, or `:none`."
-  def find(meta, source, attrs, on_conflict) do
-    case key(source, attrs, on_conflict) do
-      nil -> :none
-      {:plain, pairs} -> lookup(meta, source, pairs)
-      {:frag, items, conds} -> lookup_frag(meta, source, items, conds)
+  defp get(values, attr) do
+    case List.keyfind(values, attr, 0) do
+      {_, v} -> v
+      nil -> nil
     end
   end
 
-  defp lookup(meta, source, pairs) do
-    vars = for {_, i} <- Enum.with_index(pairs, 1), do: "?v#{i}"
+  # does a row being inserted fall inside the partial index?
+  defp holds?({:null, a}, values), do: is_nil(get(values, a))
+  defp holds?({:not_null, a}, values), do: not is_nil(get(values, a))
+  defp holds?({:eq, a, v}, values), do: get(values, a) == v
 
-    clauses =
-      for {{attr, _}, var} <- Enum.zip(pairs, vars), do: "[?e #{Attr.kw(attr)} #{var}]"
+  @doc """
+  The existing record a row collides with: `{:conflict, id}` when the view shows it,
+  `{:elsewhere, id}` when a unique value is held by a record the view does not show, or `:none`.
+  """
+  def find(meta, view, values, on_conflict) do
+    known!(view, on_conflict)
+
+    case key(view, values, on_conflict) do
+      nil ->
+        :none
+
+      {:plain, pairs} ->
+        attrs = Enum.map(pairs, &elem(&1, 0))
+        found(meta, view, lookup(meta, view, pairs, unique?(meta, attrs)))
+
+      {:frag, items, conds} ->
+        attrs = Enum.map(items, &elem(&1, 1))
+        found(meta, view, lookup_frag(meta, view, items, conds, unique?(meta, attrs)))
+    end
+  end
+
+  # A target that names no attribute of the view would never match, and the row would be written
+  # beside the one it was to meet.
+  defp known!(view, {_, _, targets}) do
+    columns =
+      case targets do
+        {:unsafe_fragment, text} ->
+          {items, conds} = parse_fragment!(text)
+          Enum.map(items, &elem(&1, 1)) ++ Enum.map(conds, &elem(&1, 1))
+
+        list ->
+          list
+      end
+
+    # (`:id` is hosigraph's own: a new record's never meets another)
+    case Enum.reject(columns, &(&1 == :id or Map.has_key?(view.field_of, &1))) do
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError,
+              "Ecto.Adapters.Hosi: conflict_target names #{Enum.map_join(unknown, ", ", &Model.kw/1)}, " <>
+                "which #{inspect(view.module)} does not have. A column is the attribute of a field " <>
+                "(its source): #{view.field_of |> Map.keys() |> Enum.sort() |> Enum.map_join(", ", &Model.kw/1)}"
+    end
+  end
+
+  # whether the attributes of a target are held once: a unique attribute, or a rule over them
+  defp unique?(meta, [attr]) do
+    match?(%{unique: true}, meta.model.attrs[attr]) or rule_over?(meta, [attr])
+  end
+
+  defp unique?(meta, attrs), do: rule_over?(meta, attrs)
+
+  defp rule_over?(meta, attrs),
+    do: Enum.any?(meta.model.rules, &(Enum.sort(&1.attrs) == Enum.sort(attrs)))
+
+  defp found(_meta, _view, []), do: :none
+
+  defp found(meta, view, ids) do
+    records = Backend.read(meta, Enum.sort(ids))
+
+    case Enum.find(records, fn {_, entity} -> Model.member?(view, entity) end) do
+      {id, _} -> {:conflict, id}
+      nil -> {:elsewhere, hd(Enum.sort(ids))}
+    end
+  end
+
+  @doc "The refusal of an action on a record that the view does not show."
+  def elsewhere!(view, id) do
+    raise Ecto.Hosi.Error,
+      reason: {:elsewhere, id},
+      message:
+        "a unique value of this insert is held by record #{id}, which #{inspect(view.module)} " <>
+          "does not show, so on_conflict will not change it. (ecto_hosi's limit)"
+  end
+
+  # the ids that have these values. A unique target is looked for among all records; another only
+  # among those the view shows.
+  defp lookup(meta, view, pairs, unique?) do
+    vars = for {_, i} <- Enum.with_index(pairs, 1), do: "?v#{i}"
+    clauses = for {{attr, _}, var} <- Enum.zip(pairs, vars), do: "[?e #{Model.kw(attr)} #{var}]"
+    member = if unique?, do: [], else: Reader.member_clauses(meta, view, "?e")
 
     req = %{
-      q:
-        "[:find ?e :in $ #{Enum.join(vars, " ")} :where [?e #{Attr.kw(Attr.marker(source))} _] " <>
-          "#{Enum.join(clauses, " ")}]",
-      inputs: for({a, v} <- pairs, do: [:scalar, Ecto.Hosi.Kw.to_store(Backend.keywords(meta), a, v)])
+      q: "[:find ?e :in $ #{Enum.join(vars, " ")} :where #{Enum.join(clauses ++ member, " ")}]",
+      inputs: for({a, v} <- pairs, do: [:scalar, Store.out(meta.model, a, v)])
     }
 
-    case meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end) do
-      [] -> :none
-      ids -> {:conflict, Enum.min(ids)}
-    end
+    meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end)
   end
 
   # An expression / partial index. Datalog narrows by the plain columns and the WHERE; a
   # `lower(column)` is compared here, on the entities that came back.
-  defp lookup_frag(meta, source, items, conds) do
-    kws = Backend.keywords(meta)
+  defp lookup_frag(meta, view, items, conds, unique?) do
     plain = for {:plain, a, v} <- items, do: {a, v}
     lowers = for {:lower, a, v} <- items, do: {a, String.downcase(v)}
 
@@ -219,66 +284,59 @@ defmodule Ecto.Hosi.Conflict do
       conds
       |> Enum.with_index(1)
       |> Enum.map(fn
-        {{:null, a}, _} -> {"(not-join [?e] [?e #{Attr.kw(a)} _])", []}
-        {{:not_null, a}, _} -> {"[?e #{Attr.kw(a)} _]", []}
-        {{:eq, a, v}, i} -> {"[?e #{Attr.kw(a)} ?c#{i}]", [{"?c#{i}", Ecto.Hosi.Kw.to_store(kws, a, v)}]}
+        {{:null, a}, _} -> {"(not-join [?e] [?e #{Model.kw(a)} _])", []}
+        {{:not_null, a}, _} -> {"[?e #{Model.kw(a)} _]", []}
+        {{:eq, a, v}, i} -> {"[?e #{Model.kw(a)} ?c#{i}]", [{"?c#{i}", Store.out(meta.model, a, v)}]}
       end)
       |> Enum.unzip()
 
     cond_inputs = List.flatten(cond_inputs)
     pvars = for {_, i} <- Enum.with_index(plain, 1), do: "?v#{i}"
-    pclauses = for {{a, _}, var} <- Enum.zip(plain, pvars), do: "[?e #{Attr.kw(a)} #{var}]"
-    lclauses = for {a, _} <- lowers, do: "[?e #{Attr.kw(a)} _]"
+    pclauses = for {{a, _}, var} <- Enum.zip(plain, pvars), do: "[?e #{Model.kw(a)} #{var}]"
+    lclauses = for {a, _} <- lowers, do: "[?e #{Model.kw(a)} _]"
     in_vars = pvars ++ Enum.map(cond_inputs, &elem(&1, 0))
+    member = if unique?, do: [], else: Reader.member_clauses(meta, view, "?e")
+
+    # (a not-join needs a clause before it that binds ?e)
+    clauses = pclauses ++ lclauses ++ member ++ cond_clauses
 
     req = %{
-      q:
-        "[:find ?e :in $ #{Enum.join(in_vars, " ")} :where [?e #{Attr.kw(Attr.marker(source))} _] " <>
-          Enum.join(pclauses ++ lclauses ++ cond_clauses, " ") <> "]",
+      q: "[:find ?e :in $ #{Enum.join(in_vars, " ")} :where #{Enum.join(clauses, " ")}]",
       inputs:
-        for({a, v} <- plain, do: [:scalar, Ecto.Hosi.Kw.to_store(kws, a, v)]) ++
+        for({a, v} <- plain, do: [:scalar, Store.out(meta.model, a, v)]) ++
           for({_, v} <- cond_inputs, do: [:scalar, v])
     }
 
     ids = meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end)
 
-    matching =
-      if lowers == [] or ids == [] do
-        ids
-      else
-        entities = meta |> Backend.get_entities(ids) |> Backend.ok!() |> then(&Enum.zip(ids, &1))
-
-        for {id, entity} <- entities,
-            Enum.all?(lowers, fn {a, low} ->
-              case Backend.first(entity, a) do
-                v when is_binary(v) -> String.downcase(v) == low
-                _ -> false
-              end
-            end),
-            do: id
-      end
-
-    case matching do
-      [] -> :none
-      ids -> {:conflict, Enum.min(ids)}
+    if lowers == [] do
+      ids
+    else
+      for {id, entity} <- Backend.read(meta, ids),
+          Enum.all?(lowers, fn {a, low} ->
+            case Backend.first(entity, a) do
+              v when is_binary(v) -> String.downcase(v) == low
+              _ -> false
+            end
+          end),
+          do: id
     end
   end
 
-  @doc "`{ops, conds}` that apply the conflict action to the existing row `id`."
-  def ops(_meta, _source, _id, _entity, _attrs, {:nothing, _, _}), do: {[], []}
+  @doc "`{ops, conds}` that apply the conflict action to the existing record `id`."
+  def ops(_meta, _view, _id, _entity, _values, {:nothing, _, _}), do: {[], []}
 
-  def ops(meta, source, id, entity, attrs, {fields, _, _}) when is_list(fields) do
-    values = for f <- fields, do: {Attr.attr(source, f), Keyword.get(attrs, Attr.attr(source, f))}
-    values = Ecto.Hosi.Derived.extend(meta, source, id, values, fn -> entity end)
-    {ops, conds} = Update.set_ops(meta, id, entity, values)
-    {ops, [[:holds, id, Attr.marker(source), true] | conds]}
+  def ops(meta, view, id, entity, values, {attrs, _, _}) when is_list(attrs) do
+    changes = for attr <- attrs, do: {attr, get(values, attr)}
+    {ops, conds} = Change.update(meta, id, entity, changes)
+    {ops, Change.existence(meta, view, id, entity) ++ conds}
   end
 
   # The query's `^` indexes continue after the insert's own parameters, but `params` holds only
   # the query's: pad the front so an index finds its value.
-  def ops(meta, source, id, entity, _attrs, {%Ecto.Query{} = q, params, _}) do
+  def ops(meta, view, id, entity, _values, {%Ecto.Query{} = q, params, _}) do
     padded = List.duplicate(nil, offset(q.updates)) ++ params
-    Update.ops(meta, source, id, entity, q.updates, padded)
+    Update.ops(meta, view, id, entity, q.updates, padded)
   end
 
   defp offset(updates) do

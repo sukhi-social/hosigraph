@@ -8,7 +8,7 @@ defmodule Ecto.Hosi.KeywordTest do
 
   describe "a hosi_keyword field" do
     test "is a keyword in the schema hosigraph is opened with" do
-      attrs = Ecto.Hosi.Schema.build([Ticket])
+      attrs = Ecto.Hosi.Model.build([Ticket]).schema
       assert %{type: :keyword} = attrs[:"ticket/state"]
       # the other fields are what they were
       assert %{type: :string} = attrs[:"ticket/title"]
@@ -92,9 +92,8 @@ defmodule Ecto.Hosi.KeywordTest do
       assert titles(from(t in Ticket, select: t.title)) == ["b"]
     end
 
-    test "insert_all, with a schema and by table name" do
-      Repo.insert_all(Ticket, [%{title: "e", state: "closed"}])
-      Repo.insert_all("ticket", [%{title: "f", state: "pending"}])
+    test "insert_all" do
+      Repo.insert_all(Ticket, [%{title: "e", state: "closed"}, %{title: "f", state: "pending"}])
 
       assert titles(from(t in Ticket, where: t.title in ["e", "f"], select: {t.title, t.state})) ==
                [{"e", "closed"}, {"f", "pending"}]
@@ -124,11 +123,11 @@ defmodule Ecto.Hosi.KeywordTest do
 
   describe "what the schema must say" do
     test "the field has to be a string" do
-      assert_raise ArgumentError, ~r/needs a :string field/, fn -> Ecto.Hosi.Kw.build([BadKeyword]) end
+      assert_raise ArgumentError, ~r/needs a :string field/, fn -> Ecto.Hosi.Model.build([BadKeyword]) end
     end
 
     test "the values have to be plain keyword names" do
-      assert_raise ArgumentError, ~r/keyword names/, fn -> Ecto.Hosi.Kw.build([BadKeywordName]) end
+      assert_raise ArgumentError, ~r/keyword names/, fn -> Ecto.Hosi.Model.build([BadKeywordName]) end
     end
   end
 end

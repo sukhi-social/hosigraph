@@ -15,6 +15,17 @@
 * **A typed attribute refuses a UUID**, and a `TUuid` attribute refuses everything else (`WriteRejected`, before anything is logged; a wrong condition of `writeIf` is a `BadArgument`).
 * `takka` is `0.2.0.0`.
 
+### `ecto_hosi`: facts, not tables
+
+**A breaking change.** An Ecto schema is now a *view* of facts. Data written by `ecto_hosi` 0.2.0 (attributes `<schema>/<field>` and a `<schema>/ecto-kind` label) is not converted.
+
+* Every schema of a Repo is `use Ecto.Hosi.View`, and says `hosi_where` (which facts make a record show up) and `hosi_owner` (who made it). A field is the attribute its source names; nothing is put in front of it. `Ecto.Hosi.Vocabulary` declares shared attributes; rules belong to attributes.
+* **New:** an update through any view; many values (`hosi_many`); references to any record (`hosi_ref`); `Ecto.UUID` fields; `hosi_final`, `hosi_record_type`, `hosi_file`; tombstones (`hosi_tombstone`) and the delete rule; `hosi/owner` and `Repo.erase_account`; `Repo.write_facts`; `write_batch` steps with `record:`; `Repo.explain`, `Repo.facts`, `Repo.history(struct)` by field, `Repo.datalog(.., load:)`; `mix hosi.attributes`, `mix hosi.doctor`; `khana: [jvm: jar] | [dtlv: exe]`; a [guide](ecto_hosi/docs/guide.md).
+* **Gone:** `Ecto.Hosi.Schema` and `hosi_append_only` (use `hosi_final`); `to:` of `hosi_ref`; reading or writing by name (`from "name"`, `insert_all("name", ..)`); the `EXISTS (..)` fragments; `{:error, _, {:other_facts, _}}` (now `{:refused, info}`).
+* **Changed:** `Repo.highest` takes an attribute; `Repo.history(struct)` answers by field; `match` in `Ecto.Hosi.Query` asks for the view's facts and takes a field's value as Elixir has it; `Ecto.Hosi.Query.to_request/2` takes the Repo.
+* **Loud:** a Repo whose database cannot be opened does not start; writes honour `timeout:`; a delete never removes facts the view does not show; a refused batch names its step; a misspelt attribute in Datalog or in `conflict_target` raises.
+* **Fixed:** `not (x.field in ^list)` with two or more values answered records that are in the list; large `insert_all`, `update_all` and `delete_all` took quadratic time.
+
 ### The files
 
 * `events/tail.log` begins with `HOSITL2\n` once it holds a UUID; a chunk that holds one is version 3; a manifest after a UUID was sealed is `hosi-manifest/3`.

@@ -30,8 +30,8 @@ defmodule Ecto.Hosi.ListedTest do
     assert facts() |> Map.keys() |> Enum.filter(fn {_, a} -> "#{a}" =~ "unlisted/" end) == []
   end
 
-  test "a listed schema under another source is refused" do
-    assert_raise ArgumentError, ~r/"other".*:schemas/s, fn ->
+  test "a view under another source name is refused: a name does not choose facts" do
+    assert_raise ArgumentError, ~r/under the name "other".*no tables/s, fn ->
       %User{email: "a@x"} |> Ecto.put_meta(source: "other") |> Repo.insert()
     end
   end

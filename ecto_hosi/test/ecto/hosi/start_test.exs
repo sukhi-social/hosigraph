@@ -31,7 +31,7 @@ defmodule Ecto.Hosi.StartTest do
     java = System.get_env("HOSI_JAVA", "java")
 
     capture_log(fn ->
-      assert {:error, reason} = start(open: %{config: %{khana: [:jvm, java, "/nonexistent.jar"]}})
+      assert {:error, reason} = start(khana: [jvm: "/nonexistent.jar", java: java])
       assert inspect(reason) =~ "/nonexistent.jar"
     end)
   end

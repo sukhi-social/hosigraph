@@ -3,20 +3,21 @@ defmodule Ecto.Hosi.Hybrid do
   # Queries the one-schema reader cannot answer: joins, group_by, having, distinct, aggregates,
   # fragments, like. The way Datalog is comfortable with:
   #
-  #   1. The base table and the leading run of inner/cross joins are ONE Datalog query. A join is
+  #   1. The first view and the leading run of inner/cross joins are ONE Datalog query. A join is
   #      a shared variable (`[?e1 :note/account_id ?e0]`), and every part of the `where` that
   #      Datalog can say is pushed into it. What comes back are tuples of entity ids.
-  #   2. A left join, or a join after one, reads its table once, narrowed by the keys of the tuples
-  #      so far, and is joined here.
+  #   2. A left join, or a join after one, reads the records of its view once, narrowed by the keys
+  #      of the tuples so far, and is joined here.
   #   3. The WHOLE where (and the ON of every inner join) is then checked again in Elixir with SQL's
   #      meaning (`Ecto.Hosi.Eval`): the pushdown only has to be a superset, never exact. What Datalog
   #      cannot say (fragment, like, coalesce) is decided here.
   #   4. group_by, having, aggregates, distinct, order_by, offset, limit and select are done here.
   #
-  # A query that names no restricting `where` reads whole tables: write it with `Repo.datalog/1`
+  # A query that names no restricting `where` reads every record of its views: write it with
+  # `Repo.datalog/1`
   # when that matters.
 
-  alias Ecto.Hosi.{Attr, Backend, Eval, Types}
+  alias Ecto.Hosi.{Backend, Eval, Model, Reader, Store, Types}
 
   @cmp_text %{==: "=", !=: "not=", <: "<", <=: "<=", >: ">", >=: ">="}
   @flip %{==: :==, !=: :!=, <: :>, <=: :>=, >: :<, >=: :<=}
@@ -24,8 +25,8 @@ defmodule Ecto.Hosi.Hybrid do
 
   def all(meta, %Ecto.Query{} = query, params) do
     check!(query)
-    bindings = bindings(query)
-    ctx = %{meta: meta, params: params, schemas: Map.new(bindings, &{&1.ix, &1.schema})}
+    bindings = bindings(meta, query)
+    ctx = %{meta: meta, params: params, views: Map.new(bindings, &{&1.ix, &1.view})}
     span = span(bindings)
     {where, wheres} = where_parts(query)
 
@@ -63,24 +64,23 @@ defmodule Ecto.Hosi.Hybrid do
     end
   end
 
-  defp bindings(query) do
-    {from, from_schema} = source!(query.from.source)
-
+  defp bindings(meta, query) do
     [
-      %{ix: 0, source: from, schema: from_schema, qual: :from, on: nil}
+      %{ix: 0, view: view!(meta, query.from.source), qual: :from, on: nil}
       | for {j, ix} <- Enum.with_index(query.joins, 1) do
           unless j.qual in [:inner, :left, :cross] do
             unsupported("#{j.qual} join (only inner, left and cross)")
           end
 
-          {source, schema} = source!(j.source)
-          %{ix: ix, source: source, schema: schema, qual: j.qual, on: j.on.expr}
+          %{ix: ix, view: view!(meta, j.source), qual: j.qual, on: j.on.expr}
         end
     ]
   end
 
-  defp source!({source, schema}) when is_binary(source), do: {source, schema}
-  defp source!(other), do: unsupported("this query source (#{inspect(other)}), a subquery or fragment")
+  defp view!(meta, {name, _} = source) when is_binary(name), do: Reader.view!(meta, source)
+
+  defp view!(_meta, other),
+    do: unsupported("this query source (#{inspect(other)}), a subquery or fragment")
 
   # how many bindings (the base and the leading inner/cross joins) Datalog answers at once
   defp span(bindings) do
@@ -105,47 +105,80 @@ defmodule Ecto.Hosi.Hybrid do
   ## ---------------------------------------------------------------- the Datalog part
 
   defp base(meta, bindings, conjuncts, params) do
-    sources = Map.new(bindings, &{&1.ix, &1.source})
-    st = %{n: 0, inputs: [], params: params, span: length(bindings), sources: sources, kw: Backend.keywords(meta)}
+    {request, _} = base_request(meta, bindings, conjuncts, params)
+    rows = meta |> Backend.query(request) |> Backend.ok!()
+    entities = load(meta, rows |> List.flatten() |> Enum.uniq())
 
-    {clauses, st} =
-      Enum.reduce(conjuncts, {[], st}, fn c, {acc, st} ->
+    for tuple <- rows do
+      for {id, b} <- Enum.zip(tuple, bindings), into: %{} do
+        {b.ix, %{id: id, entity: Map.get(entities, id, %{})}}
+      end
+    end
+  end
+
+  # the Datalog request of the first bindings, and the conjuncts that went into it
+  defp base_request(meta, bindings, conjuncts, params) do
+    attrs_of = Map.new(bindings, &{&1.ix, &1.view})
+    st = %{
+      n: 0,
+      inputs: [],
+      params: params,
+      span: length(bindings),
+      views: attrs_of,
+      model: meta.model,
+      negated: false
+    }
+
+    {clauses, st, pushed} =
+      Enum.reduce(conjuncts, {[], st, []}, fn c, {acc, st, pushed} ->
         try do
           {cl, st2} = push(c, st)
-          {acc ++ cl, st2}
+          {acc ++ cl, st2, pushed ++ [c]}
         catch
-          {:no_push, _} -> {acc, st}
+          {:no_push, _} -> {acc, st, pushed}
         end
       end)
 
     vars = for b <- bindings, do: "?e#{b.ix}"
-    markers = for b <- bindings, do: "[?e#{b.ix} #{Attr.kw(Attr.marker(b.source))} _]"
+    members = Enum.flat_map(bindings, &Reader.member_clauses(meta, &1.view, "?e#{&1.ix}"))
     inputs = Enum.reverse(st.inputs)
     specs = Enum.map(inputs, &elem(&1, 0))
 
     q =
       "[:find #{Enum.join(vars, " ")} :in #{Enum.join(["$" | specs], " ")} " <>
-        ":where #{Enum.join(markers ++ clauses, " ")}]"
+        ":where #{Enum.join(members ++ clauses, " ")}]"
 
-    rows = meta |> Backend.query(%{q: q, inputs: Enum.map(inputs, &elem(&1, 1))}) |> Backend.ok!()
-    ids = rows |> List.flatten() |> Enum.uniq()
-    entities = load(meta, ids)
-    for tuple <- rows do
-      for {id, b} <- Enum.zip(tuple, bindings), into: %{} do
-        {b.ix, %{id: id, entity: Map.get(entities, id, %{}), source: sources[b.ix]}}
-      end
-    end
+    {%{q: q, inputs: Enum.map(inputs, &elem(&1, 1))}, pushed}
   end
 
-  defp load(_meta, []), do: %{}
+  defp load(meta, ids), do: Map.new(Backend.read(meta, ids))
 
-  defp load(meta, ids) do
-    ids
-    |> Enum.chunk_every(@chunk)
-    |> Enum.flat_map(fn chunk ->
-      meta |> Backend.get_entities(chunk) |> Backend.ok!() |> then(&Enum.zip(chunk, &1))
-    end)
-    |> Map.new()
+  @doc false
+  # What a query becomes, without running it: the first Datalog request, the joins read after it,
+  # and how much of the where went into Datalog.
+  def plan(meta, %Ecto.Query{} = query, params) do
+    check!(query)
+    bindings = bindings(meta, query)
+    span = span(bindings)
+    {where, wheres} = where_parts(query)
+    on_conj = bindings |> Enum.slice(1, span - 1) |> Enum.flat_map(&split_and(&1.on))
+    conjuncts = wheres ++ on_conj
+    {request, pushed} = base_request(meta, Enum.take(bindings, span), conjuncts, params)
+
+    joins =
+      for b <- Enum.drop(bindings, span) do
+        {equi, _} = equi(split_and(b.on), b.ix)
+        {b.view, b.qual, equi && elem(equi, 0)}
+      end
+
+    %{
+      request: request,
+      first: Enum.map(Enum.take(bindings, span), & &1.view),
+      joins: joins,
+      where: where,
+      pushed: length(pushed),
+      conjuncts: length(conjuncts)
+    }
   end
 
   # --- an expression -> clauses (throws {:no_push, _} for what Datalog cannot say)
@@ -171,36 +204,41 @@ defmodule Ecto.Hosi.Hybrid do
 
   defp push({:not, _, [{:is_nil, _, [f]}]}, st) do
     {:field, ix, field} = classify(f, st)
-    {["[?e#{ix} #{Attr.kw(attr(ix, field, st))} _]"], st}
+    {["[?e#{ix} #{Model.kw(attr(ix, field, st))} _]"], st}
   end
 
+  # (inside a not, values are text: see `Ecto.Hosi.Reader`)
   defp push({:not, _, [inner]}, st) do
-    {cl, st} = push(inner, st)
+    {cl, inside} = push(inner, %{st | negated: true})
     text = Enum.join(cl, " ")
-    {["(not-join [#{Enum.join(join_vars(text), " ")}] #{text})"], st}
+    joined = Regex.scan(~r/\?e\d+/, text) |> List.flatten() |> Enum.uniq()
+    {["(not-join [#{Enum.join(joined, " ")}] #{text})"], %{inside | negated: st.negated}}
   end
 
   defp push({:is_nil, _, [f]}, st) do
     {:field, ix, field} = classify(f, st)
-    {["(not-join [?e#{ix}] [?e#{ix} #{Attr.kw(attr(ix, field, st))} _])"], st}
+    {["(not-join [?e#{ix}] [?e#{ix} #{Model.kw(attr(ix, field, st))} _])"], st}
   end
 
   defp push({:in, _, [l, r]}, st) do
-    with {:field, ix, f} <- classify(l, st),
-         {kind, vs} when kind in [:list, :value] <- classify(r, st) do
-      case vs |> Types.unpack_list() |> List.wrap() do
-        [] ->
-          {["[(= 0 1)]"], st}
+    case {classify(l, st), classify(r, st)} do
+      {{:value, v}, {:field, ix, f}} ->
+        attr = attr(ix, f, st)
+        unless match?(%{card: :many}, st.model.attrs[attr]), do: throw({:no_push, :in})
+        {var, st} = input(:scalar, Store.out(st.model, attr, v), st)
+        {["[?e#{ix} #{Model.kw(attr)} #{var}]"], st}
 
-        vs ->
-          {var, st} = input(:coll, store(st, ix, f, vs), st)
+      {{:field, ix, f}, {kind, vs}} when kind in [:list, :value] ->
+        case vs |> Types.unpack_list() |> List.wrap() do
+          [] ->
+            {["[(= 0 1)]"], st}
 
-          if f == :id,
-            do: {["[(= ?e#{ix} #{var})]"], st},
-            else: {["[?e#{ix} #{Attr.kw(attr(ix, f, st))} #{var}]"], st}
-      end
-    else
-      _ -> throw({:no_push, :in})
+          vs ->
+            one_of(ix, f, store(st, ix, f, vs), st)
+        end
+
+      _ ->
+        throw({:no_push, :in})
     end
   end
 
@@ -214,15 +252,31 @@ defmodule Ecto.Hosi.Hybrid do
   defp push({op, _, [_, _]} = e, st) when op in [:!=, :<, :<=, :>, :>=], do: compare(e, st)
   defp push(other, _st), do: throw({:no_push, other})
 
+  # the field is one of the values
+  defp one_of(ix, f, values, %{negated: false} = st) do
+    {var, st} = input(:coll, values, st)
+
+    if f == :id,
+      do: {["[(= ?e#{ix} #{var})]"], st},
+      else: {["[?e#{ix} #{Model.kw(attr(ix, f, st))} #{var}]"], st}
+  end
+
+  # (too long to write into the query: it is only checked here, after the read)
+  defp one_of(ix, f, values, st) do
+    if length(values) > Reader.inline_limit(), do: throw({:no_push, :long_list})
+    {var, clauses, st} = field_var(ix, f, st)
+    {clauses ++ [Reader.any_of(var, values)], st}
+  end
+
   # `a.f == b.g`: the two sides share one variable, which is what a join is
   defp join_eq(i, :id, j, :id, st), do: {["[(= ?e#{i} ?e#{j})]"], st}
-  defp join_eq(i, :id, j, g, st), do: {["[?e#{j} #{Attr.kw(attr(j, g, st))} ?e#{i}]"], st}
-  defp join_eq(i, f, j, :id, st), do: {["[?e#{i} #{Attr.kw(attr(i, f, st))} ?e#{j}]"], st}
+  defp join_eq(i, :id, j, g, st), do: {["[?e#{j} #{Model.kw(attr(j, g, st))} ?e#{i}]"], st}
+  defp join_eq(i, f, j, :id, st), do: {["[?e#{i} #{Model.kw(attr(i, f, st))} ?e#{j}]"], st}
 
   defp join_eq(i, f, j, g, st) do
     var = "?j#{st.n}"
 
-    {["[?e#{i} #{Attr.kw(attr(i, f, st))} #{var}]", "[?e#{j} #{Attr.kw(attr(j, g, st))} #{var}]"],
+    {["[?e#{i} #{Model.kw(attr(i, f, st))} #{var}]", "[?e#{j} #{Model.kw(attr(j, g, st))} #{var}]"],
      %{st | n: st.n + 1}}
   end
 
@@ -246,7 +300,7 @@ defmodule Ecto.Hosi.Hybrid do
 
   defp field_vs_value(:==, ix, f, v, st) when f != :id and not is_nil(v) do
     {var, st} = input(:scalar, store(st, ix, f, v), st)
-    {["[?e#{ix} #{Attr.kw(attr(ix, f, st))} #{var}]"], st}
+    {["[?e#{ix} #{Model.kw(attr(ix, f, st))} #{var}]"], st}
   end
 
   defp field_vs_value(_op, _ix, _f, nil, _st), do: throw({:no_push, :nil_value})
@@ -257,16 +311,29 @@ defmodule Ecto.Hosi.Hybrid do
     {clauses ++ ["[(#{@cmp_text[op]} #{lv} #{var})]"], st}
   end
 
-  # a `hosi_keyword` field is compared as the keyword hosigraph keeps (a string for Elixir)
+  # a value as hosigraph keeps it for the field (a keyword, a UUID, a list kept as one text)
   defp store(_st, _ix, :id, v), do: v
-  defp store(st, ix, f, v), do: Ecto.Hosi.Kw.to_store(st.kw, attr(ix, f, st), v)
+
+  defp store(st, ix, f, vs) when is_list(vs) do
+    attr = attr(ix, f, st)
+
+    case st.model.attrs[attr] do
+      %{enc: {:array, _}, card: :one} -> throw({:no_push, {:list, attr}})
+      _ -> Store.out(st.model, attr, vs)
+    end
+  end
+
+  defp store(st, ix, f, v), do: Store.out(st.model, attr(ix, f, st), v)
 
   defp field_var(ix, :id, st), do: {"?e#{ix}", [], st}
 
   defp field_var(ix, f, st) do
     var = "?v#{st.n}"
-    {var, ["[?e#{ix} #{Attr.kw(attr(ix, f, st))} #{var}]"], %{st | n: st.n + 1}}
+    {var, ["[?e#{ix} #{Model.kw(attr(ix, f, st))} #{var}]"], %{st | n: st.n + 1}}
   end
+
+  # a value of the query: an input, or inside a `not` its text
+  defp input(:scalar, value, %{negated: true} = st), do: {Reader.literal(value), st}
 
   defp input(kind, value, st) do
     var = "?p#{st.n}"
@@ -292,22 +359,21 @@ defmodule Ecto.Hosi.Hybrid do
   defp classify(v, _st) when is_number(v) or is_binary(v) or is_boolean(v), do: {:value, v}
   defp classify(other, _st), do: throw({:no_push, other})
 
-  # the ix of a binding past the span can not appear in a pushed clause
+  # the ix of a binding past the span can not appear in a pushed clause (a field of a query
+  # expression is its attribute)
   defp attr(ix, f, %{span: span}) when ix >= span, do: throw({:no_push, {:outside, ix, f}})
-  defp attr(ix, f, st), do: Attr.attr(source_of(ix, st), f)
-  defp source_of(ix, st), do: Map.fetch!(st.sources, ix)
+  defp attr(_ix, f, _st), do: f
 
   ## ---------------------------------------------------------------- joins past the Datalog span
 
-  defp join(meta, envs, %{ix: ix, source: source, qual: qual, on: on}, ctx) do
-    marker = Attr.marker(source)
+  defp join(meta, envs, %{ix: ix, view: view, qual: qual, on: on}, ctx) do
     conj = split_and(on)
     {equi, rest} = equi(conj, ix)
 
     index =
       case equi do
-        nil -> all_rows(meta, source)
-        {f, expr} -> rows_by(meta, source, marker, f, keys(envs, expr, ctx))
+        nil -> all_rows(meta, view)
+        {f, expr} -> rows_by(meta, view, f, keys(envs, expr, ctx))
       end
 
     Enum.flat_map(envs, fn env ->
@@ -365,37 +431,36 @@ defmodule Ecto.Hosi.Hybrid do
     envs |> Enum.map(&Eval.eval(expr, &1, ctx)) |> Enum.reject(&is_nil/1) |> Enum.uniq()
   end
 
-  defp all_rows(meta, source) do
-    req = %{q: "[:find ?e :in $ :where [?e #{Attr.kw(Attr.marker(source))} _]]", inputs: []}
+  defp all_rows(meta, view) do
+    clauses = Enum.join(Reader.member_clauses(meta, view, "?e"), " ")
+    req = %{q: "[:find ?e :in $ :where #{clauses}]", inputs: []}
     ids = meta |> Backend.query(req) |> Backend.ok!() |> Enum.map(fn [id] -> id end)
     entities = load(meta, ids)
-    rows = for id <- Enum.sort(ids), do: %{id: id, entity: entities[id], source: source}
-    # no key to look up by: every row is a candidate for every tuple
-    rows
+    # no key to look up by: every record is a candidate for every tuple
+    for id <- Enum.sort(ids), do: %{id: id, entity: entities[id]}
   end
 
-  # %{key => [row]} of the rows whose `f` is one of `keys`
-  defp rows_by(_meta, _source, _marker, _f, []), do: %{}
+  # %{key => [row]} of the records whose `f` is one of `keys`
+  defp rows_by(_meta, _view, _f, []), do: %{}
 
-  defp rows_by(meta, source, marker, :id, keys) do
-    entities = load(meta, Enum.filter(keys, &is_integer/1))
-
-    for {id, entity} <- entities, Map.has_key?(entity, marker), into: %{} do
-      {id, [%{id: id, entity: entity, source: source}]}
+  defp rows_by(meta, view, :id, keys) do
+    for {id, entity} <- Backend.read(meta, Enum.filter(keys, &is_integer/1)),
+        Model.member?(view, entity),
+        into: %{} do
+      {id, [%{id: id, entity: entity}]}
     end
   end
 
-  defp rows_by(meta, source, marker, f, keys) do
-    attr = Attr.attr(source, f)
+  defp rows_by(meta, view, attr, keys) do
+    members = Enum.join(Reader.member_clauses(meta, view, "?e"), " ")
 
     pairs =
       keys
       |> Enum.chunk_every(@chunk)
       |> Enum.flat_map(fn chunk ->
         req = %{
-          q:
-            "[:find ?e ?v :in $ [?v ...] :where [?e #{Attr.kw(marker)} _] [?e #{Attr.kw(attr)} ?v]]",
-          inputs: [[:coll, chunk]]
+          q: "[:find ?e ?v :in $ [?v ...] :where #{members} [?e #{Model.kw(attr)} ?v]]",
+          inputs: [[:coll, Store.out(meta.model, attr, chunk)]]
         }
 
         meta |> Backend.query(req) |> Backend.ok!()
@@ -405,9 +470,10 @@ defmodule Ecto.Hosi.Hybrid do
 
     pairs
     |> Enum.sort()
-    |> Enum.group_by(fn [_e, v] -> v end, fn [e, _v] ->
-      %{id: e, entity: entities[e], source: source}
-    end)
+    |> Enum.group_by(
+      fn [_e, v] -> Store.back(meta.model, attr, v) end,
+      fn [e, _v] -> %{id: e, entity: entities[e]} end
+    )
   end
 
   ## ---------------------------------------------------------------- shape
@@ -442,7 +508,13 @@ defmodule Ecto.Hosi.Hybrid do
 
   # a plain field is read as Ecto should see it (a binary is kept as text); the rest is computed
   defp project({{:., _, [{:&, _, [ix]}, f]}, _, []} = expr, g, ctx) do
-    Types.read(ctx.schemas[ix], f, Eval.eval_group(expr, g, ctx))
+    value = Eval.eval_group(expr, g, ctx)
+
+    case ctx.meta.model.attrs[f] do
+      # the many values of a field (none: an empty set; a left join that found nothing: nil)
+      %{card: :many} -> value
+      _ -> Types.read(ctx.views[ix].types[f], value)
+    end
   end
 
   defp project(expr, g, ctx), do: Eval.eval_group(expr, g, ctx)
