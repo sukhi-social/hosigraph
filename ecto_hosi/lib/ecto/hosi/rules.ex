@@ -50,7 +50,7 @@ defmodule Ecto.Hosi.Rules do
     rules = env.module |> Module.get_attribute(:hosi_rules) |> Enum.reverse()
     check!(rules, env.module)
     # Rendering once checks every field name against its schema while compiling.
-    Enum.each(rules, &Goal.render_rule/1)
+    Enum.each(rules, &Goal.render_rule(&1, nil))
     escaped = Macro.escape(rules)
 
     quote do

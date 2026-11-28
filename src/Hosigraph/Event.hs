@@ -5,7 +5,7 @@
 module Hosigraph.Event
   ( HosiId, Kind(..), kindName, kindFromName
   , Event(..), Ref(..), Val(..), Op(..), Cond(..)
-  , putValue, getValue, getValueBody, putEvent, getEvent
+  , putValue, getValue, getValueBody, putEvent, getEvent, hasUuid
   , HosiError(..)
   ) where
 
@@ -90,6 +90,7 @@ putValue v = case v of
   VBool b         -> putU8 3 <> putU8 (if b then 1 else 0)
   VKw (Keyword t) -> putU8 4 <> putText t
   VTuple _        -> error "putValue: a tuple is made by the khana and never written (Hosigraph.Events.validate refuses it)"
+  VUuid hi lo     -> putU8 6 <> putU64 hi <> putU64 lo      -- (tag 5 is a chunk's dictionary reference)
 
 getValue :: Get Value
 getValue = getU8 >>= getValueBody
@@ -104,7 +105,15 @@ getValueBody tag =
     2 -> VStr <$> getText
     3 -> VBool . (/= 0) <$> getU8
     4 -> VKw . Keyword <$> getText
+    6 -> VUuid <$> getU64 <*> getU64
     _ -> failGet ("unknown value tag " ++ show tag)
+
+-- | Does an event hold a UUID?  A file that holds one says so in its format, so that a build from before UUIDs
+-- refuses the file and does not cut it or read it in part ("Hosigraph.Tail", "Hosigraph.Chunk", "Hosigraph.Manifest").
+hasUuid :: Event -> Bool
+hasUuid e = case evVal e of
+  VUuid _ _ -> True
+  _         -> False
 
 -- ---------------------------------------------------------------------------
 -- Whole events (the tail log stores them this way; chunks use a dictionary instead)

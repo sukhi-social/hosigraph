@@ -95,14 +95,19 @@ defmodule Hosi do
 
   When one does not hold nothing is written, and the answer is `{:error, {:app, :conflict, message}}`;
   the message is the conditions that failed, as EDN (`Hosi.Edn.decode/1` reads it). Read again, and try again.
+
+  `timeout:` is how long the caller waits, in ms or `:infinity` (5000 if left out); `write_many/3`,
+  `erase/3` and `clean/2` take it too. When it runs out the call exits, as `GenServer.call/3` does,
+  and the write goes on without the caller: whether it will be saved is then not known.
   """
   def write(conn, ops, opts \\ []) do
     args = %{ops: ops}
     args = if conds = Keyword.get(opts, :when), do: Map.put(args, :when, conds), else: args
-    request(conn, :write, args)
+    request(conn, :write, args, wait(opts))
   end
 
-  def write_many(conn, batches), do: request(conn, :"write-many", %{batches: batches})
+  def write_many(conn, batches, opts \\ []),
+    do: request(conn, :"write-many", %{batches: batches}, wait(opts))
   def seal(conn), do: request(conn, :seal)
   def get_entities(conn, ids), do: request(conn, :"get-entities", %{ids: ids})
 
@@ -171,14 +176,15 @@ defmodule Hosi do
   The answer has `:generation`, `:dropped`, `:recorded`, `:retracted` and `:owned` (the ids the
   `:"owned-by"` parts matched, whether or not they were erased before).
   """
-  def erase(conn, erasures), do: request(conn, :erase, %{erasures: erasures})
+  def erase(conn, erasures, opts \\ []), do: request(conn, :erase, %{erasures: erasures}, wait(opts))
 
   @doc """
   Let what `erase/2` took out go from the disk: the chunks are written again without the erased
   events, then the khana becomes a new file. `max_chunks:` limits one call (all, if left out);
   `:"records-left"` above 0 in the answer means call again. Call it when the host is quiet; writes go on meanwhile.
   """
-  def clean(conn, opts \\ []), do: request(conn, :clean, limit(opts, :max_chunks, :"max-chunks"))
+  def clean(conn, opts \\ []),
+    do: request(conn, :clean, limit(opts, :max_chunks, :"max-chunks"), wait(opts))
 
   @doc """
   Put a month nobody has read or written for `cold-after-ms` (see `open`) into one cold chunk: a
@@ -186,6 +192,8 @@ defmodule Hosi do
   `cold-after-ms`. `max_units:` limits one call to that many (kind, month) units (all, if left out).
   """
   def freeze(conn, opts \\ []), do: request(conn, :freeze, limit(opts, :max_units, :"max-units"))
+
+  defp wait(opts), do: Keyword.get(opts, :timeout, 5_000)
 
   defp limit(opts, key, wire) do
     case Keyword.get(opts, key) do

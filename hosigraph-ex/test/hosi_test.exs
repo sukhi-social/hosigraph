@@ -65,6 +65,33 @@ defmodule HosiTest do
     assert {:error, {:app, :"bad-argument", _}} = Hosi.freeze(db, max_units: 1)
   end
 
+  test "write, write_many, erase and clean wait as long as timeout: says", %{db: db} do
+    :sys.suspend(db)
+
+    for call <- [
+          fn -> Hosi.write(db, [], timeout: 50) end,
+          fn -> Hosi.write_many(db, [], timeout: 50) end,
+          fn -> Hosi.erase(db, [], timeout: 50) end,
+          fn -> Hosi.clean(db, timeout: 50) end
+        ] do
+      assert {:timeout, _} = catch_exit(call.())
+    end
+
+    :sys.resume(db)
+  end
+
+  test "a write can wait longer than the 5 second default", %{db: db} do
+    :sys.suspend(db)
+
+    spawn(fn ->
+      Process.sleep(5_500)
+      :sys.resume(db)
+    end)
+
+    # (no database here: being refused as :app is how we know the answer was waited for)
+    assert {:error, {:app, :"bad-argument", _}} = Hosi.write(db, [], timeout: 20_000)
+  end
+
   test "an address that is not the shape is said at the first request" do
     {:ok, db} = Hosi.start_link(open: %{dir: 5})
     assert {:error, {:protocol, :"bad-open", msg}} = Hosi.ping(db)

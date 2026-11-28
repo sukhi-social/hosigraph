@@ -9,8 +9,13 @@ defmodule Hosi.Edn do
       user's own, and few);
     * a vector or a list is a list; a set is a `MapSet`;
     * `##NaN`, `##Inf`, `##-Inf` are `{:float, :nan | :inf | :neg_inf}`, since the BEAM has none;
-    * a symbol is `{:symbol, "name"}`. Tagged elements (`#inst ...`) are not read.
+    * a symbol is `{:symbol, "name"}`;
+    * a UUID is `{:uuid, "01a21aec-c46b-7226-b63c-5ab791b7584a"}` (`#uuid "..."` on the wire),
+      written from either case and read back in lower case. Other tagged elements (`#inst ...`)
+      are not read.
   """
+
+  @uuid ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/
 
   @doc "EDN text for a term. Raises `ArgumentError` for what EDN here cannot say."
   @spec encode(term) :: binary
@@ -29,6 +34,10 @@ defmodule Hosi.Edn do
   defp enc(l) when is_list(l), do: [?[, l |> Enum.map(&enc/1) |> Enum.intersperse(?\s), ?]]
   defp enc(m) when is_map(m) and not is_struct(m) do
     [?{, m |> Enum.map(fn {k, v} -> [enc(k), ?\s, enc(v)] end) |> Enum.intersperse(", "), ?}]
+  end
+  defp enc({:uuid, s}) when is_binary(s) do
+    unless s =~ @uuid, do: raise(ArgumentError, "not a UUID: #{inspect(s)}")
+    ["#uuid \"", String.downcase(s), ?"]
   end
   defp enc(other), do: raise(ArgumentError, "cannot write as EDN: #{inspect(other)}")
 
@@ -85,7 +94,8 @@ defmodule Hosi.Edn do
     {name, rest} = token(r)
     if name == "", do: {:error, "empty keyword"}, else: {:ok, String.to_atom(name), rest}
   end
-  defp form(<<?#, _::binary>>), do: {:error, "tagged elements and dispatch forms are not read"}
+  defp form("#uuid" <> r), do: uuid(skip(r))
+  defp form(<<?#, _::binary>>), do: {:error, "tagged elements and dispatch forms other than #uuid are not read"}
   defp form(<<c, _::binary>> = t) when c in ?0..?9 or c in [?-, ?+] do
     {tok, rest} = token(t)
     case number(tok) do
@@ -99,6 +109,15 @@ defmodule Hosi.Edn do
       {tok, rest} -> {:ok, {:symbol, tok}, rest}
     end
   end
+
+  # what follows `#uuid`: a string that is a UUID
+  defp uuid(<<?", r::binary>>) do
+    with {:ok, s, rest} <- string(r, []) do
+      if s =~ @uuid, do: {:ok, {:uuid, String.downcase(s)}, rest}, else: {:error, "not a UUID: " <> s}
+    end
+  end
+
+  defp uuid(_), do: {:error, "#uuid wants a string"}
 
   # `nil` and friends only when the word ends there (so `nilly` stays a symbol)
   defp atom_end(t, rest, value) do

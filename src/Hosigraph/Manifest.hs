@@ -13,6 +13,10 @@
 -- (or a restart) sees either the old world or the new one, never a mix.  Chunks that
 -- exist on disk but are not listed here are not part of the world.
 --
+-- /UUIDs./  A world into whose chunks a UUID was ever sealed is written as @hosi-manifest/3@ (with an
+-- @eraseGen@, as @/2@ has), also after @clean@ has taken the last one out.  A build from before UUIDs
+-- refuses it.
+--
 -- /Erase records./  A chunk may list one more file, its erase record ('ceErase', a "Hosigraph.Erase"
 -- file in @erase/@ next to @chunks/@): the ids of that chunk that are gone.  A world that has an
 -- erase record is written as @hosi-manifest/2@, with an @eraseGen@ that only goes up; a world that
@@ -74,10 +78,11 @@ data Manifest = Manifest
   , mfNextChunk  :: Int           -- ^ counter for chunk directory names
   , mfChunks     :: [ChunkEntry]
   , mfEraseGen   :: Int           -- ^ counter for erase record names; only goes up (0: this world never had a record)
+  , mfUuid       :: Bool          -- ^ a UUID was sealed into this world (never goes back to 'False')
   } deriving (Eq, Show)
 
 emptyManifest :: Manifest
-emptyManifest = Manifest 0 0 1 [] 0
+emptyManifest = Manifest 0 0 1 [] 0 False
 
 chunkEntryHash :: [FileEntry] -> String
 chunkEntryHash fs = sha256Hex (BC.pack (concat [ feName f ++ ":" ++ feSha256 f ++ ";" | f <- fs ]))
@@ -126,23 +131,29 @@ hasEraseState m = mfEraseGen m > 0 || any (isJust . ceErase) (mfChunks m)
 
 instance ToJSON Manifest where
   toJSON m = object $
-    [ "format" .= (if hasEraseState m then "hosi-manifest/2" else "hosi-manifest/1" :: T.Text), "generation" .= mfGeneration m
+    [ "format" .= format, "generation" .= mfGeneration m
     , "sealedSeq" .= mfSealedSeq m, "nextChunk" .= mfNextChunk m, "chunks" .= mfChunks m ]
-    ++ [ "eraseGen" .= mfEraseGen m | hasEraseState m ]
+    ++ [ "eraseGen" .= mfEraseGen m | mfUuid m || hasEraseState m ]
+    where
+      format :: T.Text
+      format | mfUuid m        = "hosi-manifest/3"
+             | hasEraseState m = "hosi-manifest/2"
+             | otherwise       = "hosi-manifest/1"
 
 instance FromJSON Manifest where
   parseJSON = withObject "manifest" $ \o -> do
     fmt <- o .: "format"
-    let withGen g = Manifest <$> o .: "generation" <*> o .: "sealedSeq" <*> o .: "nextChunk" <*> o .: "chunks" <*> pure g
+    let withGen uuid g = Manifest <$> o .: "generation" <*> o .: "sealedSeq" <*> o .: "nextChunk" <*> o .: "chunks" <*> pure g <*> pure uuid
     case fmt :: T.Text of
       "hosi-manifest/1" -> do
-        m     <- withGen 0
+        m     <- withGen False 0
         stray <- o .:? "eraseGen" :: A.Parser (Maybe A.Value)
         -- we never write this: an erase record in a /1 is a file that was not written by us (or was edited)
         when (isJust stray || any (isJust . ceErase) (mfChunks m)) $
           fail "hosi-manifest/1 cannot list erase records (they belong to hosi-manifest/2)"
         pure m
-      "hosi-manifest/2" -> o .: "eraseGen" >>= withGen
+      "hosi-manifest/2" -> o .: "eraseGen" >>= withGen False
+      "hosi-manifest/3" -> o .: "eraseGen" >>= withGen True
       _                 -> fail ("unknown manifest format " ++ T.unpack fmt)
 
 -- ---------------------------------------------------------------------------

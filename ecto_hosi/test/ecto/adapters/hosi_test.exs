@@ -8,7 +8,7 @@ defmodule Ecto.Adapters.HosiTest do
   end
 
   describe "how rows are kept" do
-    test "a row is facts: a marker, one attribute per field, :ref for foreign keys" do
+    test "a record is facts: one attribute per field, :ref for foreign keys" do
       user = user!(%{score: 1.5, born: ~D[1815-12-10], balance: Decimal.new("12.50")})
       post = Repo.insert!(%Post{title: "Notes", user_id: user.id})
 
@@ -16,7 +16,7 @@ defmodule Ecto.Adapters.HosiTest do
       assert user.__meta__.state == :loaded
 
       f = facts()
-      assert f[{user.id, :"user/ecto-kind"}] == [true]
+      assert f[{user.id, :"user/is"}] == [true]
       assert f[{user.id, :"user/name"}] == ["Ada"]
       assert f[{user.id, :"user/age"}] == [36]
       assert f[{user.id, :"user/score"}] == [1.5]
@@ -31,7 +31,7 @@ defmodule Ecto.Adapters.HosiTest do
     end
 
     @tag :fake_only
-    test "the hosigraph schema is derived from the Ecto schemas" do
+    test "the hosigraph schema is derived from the views" do
       schema = Fake.dump(Ecto.Hosi.Case.conn()).open.schema
 
       assert schema[:"user/email"] == %{type: :string, unique: :value}
@@ -40,7 +40,8 @@ defmodule Ecto.Adapters.HosiTest do
       assert schema[:"user/inserted_at"] == %{type: :long}
       assert schema[:"post/user_id"] == %{type: :ref}
       assert schema[:"post/user_id"] != %{type: :long}
-      assert schema[:"user/ecto-kind"] == %{type: :boolean}
+      assert schema[:"user/is"] == %{type: :boolean}
+      assert schema[:"hosi/owner"] == %{type: :ref}
     end
 
     test "values come back as the Ecto types they were" do
@@ -114,6 +115,44 @@ defmodule Ecto.Adapters.HosiTest do
       assert names.(from(u in User, where: u.age < 30 or u.name == ^"Ada")) == ["Ada", "Bob"]
       assert names.(from(u in User, where: u.age > 30, where: u.age < 40)) == ["Ada"]
       assert names.(from(u in User, where: u.age > 100, or_where: u.name == "Eve")) == ["Eve"]
+    end
+
+    test "not, with parameters and lists: none of them" do
+      names = fn q -> q |> Repo.all() |> Enum.map(& &1.name) end
+      [one, two] = [25, 40]
+      who = "Bob"
+
+      assert names.(from(u in User, where: not (u.age == ^one))) == ["Ada", "Cy", "Eve"]
+      assert names.(from(u in User, where: u.age not in ^[one, two])) == ["Ada", "Eve"]
+      assert names.(from(u in User, where: u.age not in [25, 40])) == ["Ada", "Eve"]
+      assert names.(from(u in User, where: u.age not in ^[])) == ["Ada", "Bob", "Cy", "Eve"]
+      assert names.(from(u in User, where: not (u.age > ^one and u.name != ^who))) == ["Bob", "Eve"]
+      assert names.(from(u in User, where: not (u.age == ^one or u.age in ^[two]))) == ["Ada", "Eve"]
+      assert names.(from(u in User, where: not (u.name == ^who) and u.age > ^one)) == ["Ada", "Cy"]
+      assert names.(from(u in User, where: u.name == ^who or u.age not in ^[one])) ==
+               ["Ada", "Bob", "Cy", "Eve"]
+
+      ids = Repo.all(from(u in User, where: u.name in ["Ada", "Bob"], select: u.id))
+      assert names.(from(u in User, where: u.id not in ^ids)) == ["Cy", "Eve"]
+      assert Repo.aggregate(from(u in User, where: u.age not in ^[one, two]), :count) == 2
+    end
+
+    test "a long not-in list is checked on the records, with the same meaning" do
+      names = fn q -> q |> Repo.all() |> Enum.map(& &1.name) end
+      ages = [25, 40 | Enum.to_list(1_000..2_500)]
+
+      query = from(u in User, where: u.age not in ^ages)
+      assert names.(query) == ["Ada", "Eve"]
+      assert Repo.aggregate(query, :count) == 2
+      assert names.(from(u in User, where: u.age not in ^ages and u.name != "Eve")) == ["Ada"]
+
+      ids = Repo.all(from(u in User, where: u.name == "Ada", select: u.id)) ++ Enum.to_list(5..900)
+      assert names.(from(u in User, where: u.id not in ^ids)) == ["Bob", "Cy", "Eve"]
+
+      assert {2, _} = Repo.update_all(query, set: [active: false])
+      assert names.(from(u in User, where: u.active == false)) == ["Ada", "Eve"]
+      assert %{elixir: [checked | _]} = Repo.explain(query)
+      assert checked =~ "long not-in list"
     end
 
     test "order_by, limit, offset" do
@@ -265,11 +304,12 @@ defmodule Ecto.Adapters.HosiTest do
       user!(%{email: "race@x"})
       meta = Ecto.Adapter.lookup_meta(Repo.get_dynamic_repo()) |> Map.put(:precheck_unique, false)
 
-      assert {:invalid, [unique: "user_email_index"]} =
+      # (Ecto's own default name: the source, and the attribute the field is)
+      assert {:invalid, [unique: "user_user/email_index"]} =
                Ecto.Adapters.Hosi.insert(
                  meta,
-                 %{source: "user"},
-                 [name: "Racer", email: "race@x"],
+                 %{source: "user", schema: User},
+                 ["user/name": "Racer", "user/email": "race@x"],
                  {:raise, [], []},
                  [:id],
                  []

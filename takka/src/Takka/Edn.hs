@@ -5,9 +5,9 @@
 -- Description : A small EDN reader — enough for Datalog queries and tx-data.
 --
 -- Supported: nil, booleans, integers, floats, strings (with escapes), keywords,
--- symbols, lists, vectors, maps, sets, @;@ comments, @#_@ discard, commas as
--- whitespace.  Not supported: tagged literals (@#inst@, @#uuid@), characters,
--- ratios, namespaced-map syntax.
+-- symbols, lists, vectors, maps, sets, @#uuid "..."@, @;@ comments, @#_@ discard,
+-- commas as whitespace.  Not supported: other tagged literals (@#inst@, say),
+-- characters, ratios, namespaced-map syntax.
 --
 -- Keywords are read permissively (everything up to whitespace or a delimiter)
 -- so IRIs such as @:http://schema.org/name@ are fine.
@@ -21,10 +21,11 @@ module Takka.Edn
 import           Data.Char (chr, isDigit, isHexDigit, isSpace, digitToInt, ord)
 import           Data.Text (Text)
 import qualified Data.Text as T
+import           Data.Word (Word64)
 import           Numeric (showHex)
 import           Text.Read (readMaybe)
 
-import           Takka.Types (Keyword(..), Value(..))
+import           Takka.Types (Keyword(..), Value(..), parseUuid, uuidText)
 
 data Edn
   = ENil
@@ -38,6 +39,7 @@ data Edn
   | EList  [Edn]
   | EMap   [(Edn, Edn)]
   | ESet   [Edn]
+  | EUuid  !Word64 !Word64  -- ^ @#uuid "..."@, as the 128 bits of 'VUuid'
   deriving (Eq, Show)
 
 -- | Read exactly one form (trailing whitespace/comments allowed).
@@ -85,6 +87,7 @@ form s = case T.uncons s of
               ps <- pairUp xs
               Right (EMap ps, rest)
     '#' | Just ('{', cs') <- T.uncons cs -> ESet <$$> seqUntil '}' cs'
+        | ("uuid", rest) <- T.break isDelim cs -> uuid (skipWs rest)
         | otherwise -> Left ("unsupported tagged literal: #" ++ T.unpack (T.takeWhile (not . isDelim) cs))
     '"' -> str cs
     ')' -> Left "unexpected ')'"
@@ -98,6 +101,17 @@ form s = case T.uncons s of
     pairUp (a : b : r) = ((a, b) :) <$> pairUp r
     pairUp []          = Right []
     pairUp _           = Left "map literal must have an even number of forms"
+
+-- | What follows @#uuid@: a string that is a UUID.
+uuid :: Parser Edn
+uuid s = case T.uncons s of
+  Just ('"', cs) -> do
+    (e, rest) <- str cs
+    case e of
+      EStr t | Just (a, b) <- parseUuid t -> Right (EUuid a b, rest)
+             | otherwise -> Left ("not a UUID: " ++ T.unpack (T.take 40 t))
+      _ -> Left "#uuid wants a string"
+  _ -> Left "#uuid wants a string"
 
 seqUntil :: Char -> Parser [Edn]
 seqUntil close = go []
@@ -193,6 +207,7 @@ renderEdn e = case e of
   EVec xs   -> wrap "[" "]" xs
   EList xs  -> wrap "(" ")" xs
   ESet xs   -> wrap "#{" "}" xs
+  EUuid a b -> "#uuid \"" <> uuidText a b <> "\""
   EMap ps   -> "{" <> T.intercalate ", " [renderEdn k <> " " <> renderEdn v | (k, v) <- ps] <> "}"
   where wrap o c xs = o <> T.unwords (map renderEdn xs) <> c
 
@@ -218,6 +233,7 @@ ednToValue e = case e of
   EStr s   -> Right (VStr s)
   EBool b  -> Right (VBool b)
   EKw k    -> Right (VKw (Keyword k))
+  EUuid a b -> Right (VUuid a b)
   EVec xs  -> VTuple <$> mapM part xs
   ENil     -> Left "nil cannot be stored (omit the attribute instead)"
   _        -> Left ("not a scalar value: " ++ T.unpack (renderEdn e))

@@ -67,7 +67,7 @@ instance ToEdn Cond where
     Lacks i a v -> EVec [EKw "lacks", toEdn i, toEdn a, toEdn v]
     Unset i a   -> EVec [EKw "unset", toEdn i, toEdn a]
 
--- | By its shape: an integer, a float, a string, a boolean or a keyword; a vector of those (@nil@ for a part) is a tuple.
+-- | By its shape: an integer, a float, a string, a boolean, a keyword or a UUID; a vector of those (@nil@ for a part) is a tuple.
 instance FromEdn Value where
   fromEdn e = case e of
     EInt _   -> VInt <$> fromEdn e
@@ -75,6 +75,7 @@ instance FromEdn Value where
     EStr t   -> Right (VStr t)
     EBool b  -> Right (VBool b)
     EKw k    -> Right (VKw (Keyword k))
+    EUuid a b -> Right (VUuid a b)
     EVec xs  -> VTuple <$> mapM part xs
     _        -> Left "not a value"
     where
@@ -209,6 +210,7 @@ instance ToEdn Value where
     VBool b   -> EBool b
     VKw k     -> toEdn k
     VTuple xs -> EVec (map (maybe ENil toEdn) xs)
+    VUuid a b -> EUuid a b
 
 -- | The facts of one attribute, as the places they hold in its order: @[{:val 75 :id 1001} ...]@.
 encPlaces :: [Datom] -> Edn

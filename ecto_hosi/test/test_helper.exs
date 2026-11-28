@@ -11,11 +11,11 @@ config =
     # or, with a JDK 21 and the standalone jar: HOSI_JAR=/path/to/datalevin-standalone.jar HOSI_REAL=1 mix test
     khana =
       case System.get_env("HOSI_JAR") do
-        nil -> [:dtlv, System.fetch_env!("HOSI_DTLV")]
-        jar -> [:jvm, System.get_env("HOSI_JAVA", "java"), jar]
+        nil -> [dtlv: System.fetch_env!("HOSI_DTLV")]
+        jar -> [jvm: jar, java: System.get_env("HOSI_JAVA", "java")]
       end
 
-    base ++ [hosi: Hosi, open: %{config: %{khana: khana}}]
+    base ++ [hosi: Hosi, khana: khana]
   else
     base ++ [hosi: Ecto.Hosi.Fake]
   end
@@ -24,5 +24,5 @@ Application.put_env(:ecto_hosi, Ecto.Hosi.Test.Repo, config)
 
 # tests that look inside the stand-in only run on it; tests that need hosigraph's (missing) rules input
 # can be left out with `--exclude needs_rules_door`
-ExUnit.configure(exclude: if(real?, do: [:fake_only], else: []))
+ExUnit.configure(exclude: if(real?, do: [:fake_only], else: [:real_only]))
 ExUnit.start()

@@ -3,8 +3,13 @@ defmodule Ecto.Hosi.Fake do
   An in-memory stand-in for `Hosi`, with the same functions and the same answers as documented in
   hosigraph-ex (`{:ok, %{temps: [[n, id]]}}`, `{:error, {:app, :conflict, _}}`, `[:ref, id]` values,
   `when:` conditions, `[:rules, text]` query inputs). It exists so the adapter can be tested
-  without libhosi or Datalevin. It is NOT a model of every hosigraph rule: where this file and
-  hosigraph differ, hosigraph is right.
+  without libhosi or Datalevin.
+
+  It refuses what hosigraph refuses of the calls the adapter and a test make: an empty write, a
+  reserved or erased id, a write of a tuple, a value of the wrong type for `:long` and `:uuid`,
+  a taken unique value, and the same wrong `highest`, `highest_in` and `erase` calls. For the other
+  types it is **stricter**: hosigraph takes a number for a `:string` attribute, say, and this does
+  not. It is not a model of every rule: where this file and hosigraph differ, hosigraph is right.
   """
   use GenServer
 
@@ -16,7 +21,7 @@ defmodule Ecto.Hosi.Fake do
   def stop(conn), do: GenServer.stop(conn)
 
   def write(conn, ops, opts \\ []),
-    do: GenServer.call(conn, {:write, ops, Keyword.get(opts, :when, [])})
+    do: GenServer.call(conn, {:write, ops, Keyword.get(opts, :when, [])}, wait(opts))
 
   def get_entities(conn, ids), do: GenServer.call(conn, {:get_entities, ids})
   def query_many(conn, queries), do: GenServer.call(conn, {:query_many, queries})
@@ -28,7 +33,14 @@ defmodule Ecto.Hosi.Fake do
     do: GenServer.call(conn, {:highest, attr, limit, opts})
 
   def history(conn, id), do: GenServer.call(conn, {:history, id})
-  def erase(conn, erasures), do: GenServer.call(conn, {:erase, erasures})
+  def erase(conn, erasures, opts \\ []),
+    do: GenServer.call(conn, {:erase, erasures}, wait(opts))
+
+  @doc "Nothing is on a disk here: the report of a hosigraph with nothing left to clean."
+  def clean(conn, opts \\ []), do: GenServer.call(conn, :clean, wait(opts))
+
+  defp wait(opts), do: Keyword.get(opts, :timeout, 5_000)
+
   @doc "The opening arguments and all facts, for assertions in tests."
   def dump(conn), do: GenServer.call(conn, :dump)
 
@@ -36,11 +48,20 @@ defmodule Ecto.Hosi.Fake do
   def init(open),
     do:
       {:ok,
-       %{open: open, schema: Map.get(open, :schema, %{}), facts: %{}, events: [], next_id: 1000}}
+       %{
+         open: open,
+         schema: Map.get(open, :schema, %{}),
+         facts: %{},
+         events: [],
+         next_id: 1000,
+         erased: MapSet.new()
+       }}
 
   @impl true
   def handle_call({:write, ops, conds}, _from, st) do
-    with :ok <- check_conditions(conds, st.facts),
+    with :ok <- check_ids(conds),
+         :ok <- check_conditions(conds, st.facts),
+         :ok <- check_batch(ops, st),
          {:ok, acc} <- apply_ops(ops, st),
          :ok <- check_unique(acc.facts, st.schema) do
       temps = for {n, id} <- Enum.sort(acc.tmp), do: [n, id]
@@ -72,49 +93,151 @@ defmodule Ecto.Hosi.Fake do
   end
 
   def handle_call({:highest, attr, limit, opts}, _from, st) do
-    places =
-      for {{id, ^attr}, vals} <- st.facts, v <- vals, do: %{val: v, id: id}
+    case check_highest(st.schema, attr, limit, opts[:after]) do
+      :ok ->
+        places = for {{id, ^attr}, vals} <- st.facts, v <- vals, do: %{val: v, id: id}
+        {:reply, {:ok, page(places, limit, opts[:after])}, st}
 
-    places = Enum.sort_by(places, &{&1.val, &1.id}, :desc)
-
-    places =
-      case opts[:after] do
-        nil -> places
-        %{val: v, id: i} -> Enum.filter(places, &({&1.val, &1.id} < {v, i}))
-      end
-
-    {:reply, {:ok, Enum.take(places, limit)}, st}
+      error ->
+        {:reply, error, st}
+    end
   end
 
   def handle_call({:highest_in, attr, keys, limit, opts}, _from, st) do
-    %{tuple: [ka, oa]} = Map.fetch!(st.schema, attr)
+    case check_highest_in(st.schema, attr, keys, limit, opts[:after]) do
+      {:ok, ka, oa} ->
+        places =
+          for {{id, ^ka}, [k | _]} <- st.facts,
+              k in keys,
+              v <- Enum.take(Map.get(st.facts, {id, oa}, []), 1),
+              do: %{key: k, val: v, id: id}
 
-    places =
-      for {{id, ^ka}, [k | _]} <- st.facts, k in keys, {{^id, ^oa}, [v | _]} <- [{{id, oa}, Map.get(st.facts, {id, oa}, [])}] ,
-          v != nil,
-          do: %{key: k, val: v, id: id}
+        {:reply, {:ok, page(places, limit, opts[:after])}, st}
 
-    places = Enum.sort_by(places, &{&1.val, &1.id}, :desc)
-
-    places =
-      case opts[:after] do
-        nil -> places
-        %{val: v, id: i} -> Enum.filter(places, &({&1.val, &1.id} < {v, i}))
-      end
-
-    {:reply, {:ok, Enum.take(places, limit)}, st}
+      error ->
+        {:reply, error, st}
+    end
   end
 
   def handle_call({:history, id}, _from, st),
     do: {:reply, {:ok, Enum.filter(st.events, &(&1.id == id))}, st}
 
+  # `[:ids, ids]` and `[:"owned-by", attributes, owners]` (whatever ever had one of the owners as a
+  # value of one of the attributes); the events of what is erased go with it
   def handle_call({:erase, erasures}, _from, st) do
-    ids = for [:ids, ids] <- erasures, id <- ids, do: id
-    facts = Map.reject(st.facts, fn {{id, _}, _} -> id in ids end)
-    {:reply, {:ok, %{erased: length(ids)}}, %{st | facts: facts}}
+    named = for [:ids, ids] <- erasures, id <- ids, do: id
+
+    owned =
+      for [:"owned-by", attrs, owners] <- erasures,
+          %{kind: :create, attr: attr, val: owner, id: id} <- st.events,
+          attr in attrs,
+          owner in owners,
+          uniq: true,
+          do: id
+
+    case Enum.find(named, &(&1 <= 1)) do
+      nil ->
+        ids = MapSet.new(named ++ owned)
+        facts = Map.reject(st.facts, fn {{id, _}, _} -> id in ids end)
+        events = Enum.reject(st.events, &(&1.id in ids))
+        report = %{erased: MapSet.size(ids), owned: Enum.sort(owned)}
+        erased = MapSet.union(st.erased, ids)
+        {:reply, {:ok, report}, %{st | facts: facts, events: events, erased: erased}}
+
+      id ->
+        {:reply, bad("erase: #{id} is not an entity id"), st}
+    end
+  end
+
+  def handle_call(:clean, _from, st) do
+    report = %{rewritten: [], skipped: [], "records-left": 0, "khana-cleaned": false, "khana-rebuilt": false}
+    {:reply, {:ok, report}, st}
   end
 
   def handle_call(:dump, _from, st), do: {:reply, %{open: st.open, facts: st.facts}, st}
+
+  ## ---- what is refused before anything is looked at
+
+  # (ids up to 1 are hosigraph's own)
+  defp check_ids(conds) do
+    case Enum.find(conds, fn [_, id | _] -> is_integer(id) and id <= 1 end) do
+      nil -> :ok
+      [_, id | _] -> bad("writeIf: #{id} is not an entity id")
+    end
+  end
+
+  defp check_batch([], _st), do: bad("write: no operations")
+
+  defp check_batch(ops, st) do
+    Enum.find_value(ops, :ok, fn
+      [_, ref, attr, _] ->
+        cond do
+          match?(%{tuple: _}, st.schema[attr]) ->
+            bad("write: #{attr}: a tuple is made by the khana from its parts, and is not written")
+
+          is_integer(ref) and ref <= 1 ->
+            bad("write: #{ref} is not a valid entity id")
+
+          ref in st.erased ->
+            bad("write: #{ref} was erased")
+
+          true ->
+            nil
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp check_highest(schema, attr, limit, cursor) do
+    spec = schema[attr]
+
+    cond do
+      limit < 1 -> bad("highest: the count is #{limit}, and has to be 1 or more")
+      spec == nil -> bad("highest: #{attr} is not in the schema")
+      Map.has_key?(spec, :tuple) -> bad("highest: #{attr} is a tuple")
+      Map.get(spec, :type) in [nil, :any] -> bad("highest: #{attr} has no type")
+      cursor && not fits?(spec.type, cursor.val) -> bad("highest: the cursor's value does not fit #{attr}")
+      true -> :ok
+    end
+  end
+
+  defp check_highest_in(schema, attr, keys, limit, cursor) do
+    with %{tuple: [ka, oa]} <- schema[attr],
+         %{type: key_type} <- schema[ka],
+         %{type: :long} <- schema[oa] do
+      cond do
+        limit < 1 -> bad("highestIn: the count is #{limit}, and has to be 1 or more")
+        not Enum.all?(keys, &fits?(key_type, &1)) -> bad("highestIn: a key does not fit #{ka}")
+        cursor && not is_integer(cursor.val) -> bad("highestIn: the cursor's value is not a long")
+        true -> {:ok, ka, oa}
+      end
+    else
+      _ -> bad("highestIn: #{attr} is not a tuple of two typed attributes whose order is a long")
+    end
+  end
+
+  defp fits?(:string, v), do: is_binary(v)
+  defp fits?(type, v) when type in [:long, :ref], do: is_integer(v)
+  defp fits?(:double, v), do: is_float(v)
+  defp fits?(:boolean, v), do: is_boolean(v)
+  defp fits?(:keyword, v), do: is_atom(v) and not is_nil(v) and not is_boolean(v)
+  defp fits?(:uuid, v), do: match?({:uuid, _}, v)
+  defp fits?(_, _), do: false
+
+  # the largest value first and, among equal values, the largest id
+  defp page(places, limit, cursor) do
+    places = Enum.sort_by(places, &{&1.val, &1.id}, :desc)
+
+    places =
+      case cursor do
+        nil -> places
+        %{val: v, id: i} -> Enum.filter(places, &({&1.val, &1.id} < {v, i}))
+      end
+
+    Enum.take(places, limit)
+  end
 
   ## ---- conditions
 
@@ -128,13 +251,15 @@ defmodule Ecto.Hosi.Fake do
 
     if failed == [],
       do: :ok,
-      else: {:error, {:app, :conflict, "conditions failed: " <> inspect(failed)}}
+      # the failed conditions as EDN, as hosigraph says them
+      else: {:error, {:app, :conflict, Hosi.Edn.encode(failed)}}
   end
 
   ## ---- ops (all or nothing: a copy is changed and kept only if every op is good)
 
   defp apply_ops(ops, st) do
-    acc = %{facts: st.facts, events: [], tmp: %{}, next_id: st.next_id, seq: length(st.events)}
+    seq = st.events |> List.last(%{seq: 0}) |> Map.fetch!(:seq)
+    acc = %{facts: st.facts, events: [], tmp: %{}, next_id: st.next_id, seq: seq}
 
     Enum.reduce_while(ops, {:ok, acc}, fn op, {:ok, acc} ->
       case apply_op(op, acc, st.schema) do
@@ -167,8 +292,7 @@ defmodule Ecto.Hosi.Fake do
     end
   end
 
-  defp apply_op(other, _acc, _schema),
-    do: {:error, {:app, :"bad-argument", "not an op: " <> inspect(other)}}
+  defp apply_op(other, _acc, _schema), do: bad("not an op: " <> inspect(other))
 
   defp resolve(acc, [:tmp, n]) do
     case acc.tmp do
@@ -190,18 +314,29 @@ defmodule Ecto.Hosi.Fake do
   defp check_value(%{type: :ref}, _attr, [:ref, id]) when is_integer(id), do: {:ok, id}
 
   defp check_value(%{type: :ref}, attr, v),
-    do: bad("#{attr} is a ref, write [:ref, id] (got #{inspect(v)})")
+    do: rejected("#{attr} is a ref, write [:ref, id] (got #{inspect(v)})")
 
-  defp check_value(_spec, attr, [:ref, _]), do: bad("#{attr} is not a ref attribute")
+  defp check_value(_spec, attr, [:ref, _]), do: rejected("#{attr} is not a ref attribute")
   defp check_value(%{type: :long}, _a, v) when is_integer(v), do: {:ok, v}
   defp check_value(%{type: :string}, _a, v) when is_binary(v), do: {:ok, v}
   defp check_value(%{type: :boolean}, _a, v) when is_boolean(v), do: {:ok, v}
   defp check_value(%{type: :double}, _a, v) when is_float(v), do: {:ok, v}
   defp check_value(%{type: :keyword}, _a, v) when is_atom(v) and not is_nil(v) and not is_boolean(v), do: {:ok, v}
-  defp check_value(%{type: t}, a, v), do: bad("#{a} is #{t}, got #{inspect(v)}")
+
+  # kept in lower case, as hosigraph answers it
+  defp check_value(%{type: :uuid}, a, {:uuid, text} = v) when is_binary(text) do
+    if text =~ ~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/,
+      do: {:ok, {:uuid, String.downcase(text)}},
+      else: rejected("#{a} is uuid, got #{inspect(v)}")
+  end
+
+  defp check_value(_spec, a, {:uuid, _} = v),
+    do: rejected("#{a} is not a uuid attribute (got #{inspect(v)})")
+  defp check_value(%{type: t}, a, v), do: rejected("#{a} is #{t}, got #{inspect(v)}")
   defp check_value(_no_type, _a, v), do: {:ok, v}
 
   defp bad(msg), do: {:error, {:app, :"bad-argument", msg}}
+  defp rejected(msg), do: {:error, {:app, :"write-rejected", msg}}
 
   ## ---- unique: a value one entity holds may not be held by another
 
@@ -237,7 +372,8 @@ defmodule Ecto.Hosi.Fake do
   defp unique_error(attr, v, first, second) do
     # the words of Datalevin 1.2.10, as hosigraph passes them on
     {:app, :"write-rejected",
-     "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}
+     "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{Hosi.Edn.encode(v)}] " <>
+       "because of unique constraint: #{first}"}
   end
 
   defp check_unique_values(facts, schema) do
@@ -263,10 +399,7 @@ defmodule Ecto.Hosi.Fake do
         :ok
 
       {attr, v, first, second} ->
-        # the words of Datalevin 1.2.10, as hosigraph passes them on
-        {:error,
-         {:app, :"write-rejected",
-          "dtlv: Cannot add #datalevin/Datom [#{second} :#{attr} #{inspect(v)}] because of unique constraint: #{first}"}}
+        {:error, unique_error(attr, v, first, second)}
     end
   end
 
@@ -282,7 +415,7 @@ defmodule Ecto.Hosi.Fake.Datalog do
   # A small Datalog evaluator over `{e, attr, v}` facts: patterns, predicates, `not-join`, `or-join`,
   # rule calls (recursive ones to a fixed point), and the inputs scalar / coll / rules.
 
-  @special ["not-join", "or-join", "and"]
+  @special ["not-join", "or-join", "or", "and"]
 
   def run(%{q: text} = req, facts) do
     inputs = Map.get(req, :inputs, [])
@@ -392,6 +525,14 @@ defmodule Ecto.Hosi.Fake.Datalog do
         r <- eval_clauses(branch_clauses(branch), [Map.take(b, join)], ctx),
         uniq: true,
         do: Map.merge(b, Map.take(r, join))
+  end
+
+  # `(or ..)`: every branch binds the same variables
+  defp eval_clause([{:symbol, "or"} | branches], b, ctx) do
+    for branch <- branches,
+        r <- eval_clauses(branch_clauses(branch), [b], ctx),
+        uniq: true,
+        do: r
   end
 
   # a clause that starts with a symbol: [?e :a ?v] (a variable first) or (rule a b)

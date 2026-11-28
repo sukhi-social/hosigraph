@@ -14,12 +14,12 @@ defmodule Ecto.Hosi.NativeTest do
       for {t, n} <- [{"a", 5}, {"b", 9}, {"c", 1}, {"d", 7}],
           do: Repo.insert!(%Post{title: t, likes: n})
 
-      {page, last} = Repo.highest(Post, :likes, 2)
+      {page, last} = Repo.highest(:"post/likes", 2, load: Post)
       assert Enum.map(page, & &1.title) == ["b", "d"]
       assert %Post{} = hd(page)
       assert hd(page).likes == 9
 
-      {next, _} = Repo.highest(Post, :likes, 2, after: last)
+      {next, _} = Repo.highest(:"post/likes", 2, load: Post, after: last)
       assert Enum.map(next, & &1.title) == ["a", "c"]
     end
 
@@ -106,7 +106,7 @@ defmodule Ecto.Hosi.NativeTest do
       ada = Repo.insert!(%User{name: "Ada", email: "a@x"})
       Repo.delete!(ada)
 
-      assert {:error, :batch, :stale} =
+      assert {:error, :old, :stale} =
                Repo.write_batch(
                  insert: {:new, User.changeset(%User{}, %{name: "New", email: "n@x"})},
                  update: {:old, User.changeset(ada, %{name: "Ghost"})}
@@ -145,6 +145,7 @@ defmodule Ecto.Hosi.NativeTest do
     test "rejects what hosigraph cannot keep, with the reason" do
       defmodule BadKey do
         use Ecto.Schema
+        use Ecto.Hosi.View
         @primary_key {:id, :binary_id, autogenerate: true}
         schema "bad_key" do
           field(:x, :integer)
@@ -153,18 +154,19 @@ defmodule Ecto.Hosi.NativeTest do
 
       defmodule BadType do
         use Ecto.Schema
+        use Ecto.Hosi.View
 
         schema "bad_type" do
-          field(:data, Ecto.UUID)
+          field(:data, :duration)
         end
       end
 
       assert_raise ArgumentError, ~r/integer primary key named :id/, fn ->
-        Ecto.Hosi.Schema.build([BadKey])
+        Ecto.Hosi.Model.build([BadKey])
       end
 
-      assert_raise ArgumentError, ~r/does not support the Ecto type Ecto.UUID/, fn ->
-        Ecto.Hosi.Schema.build([BadType])
+      assert_raise ArgumentError, ~r/does not support the Ecto type :duration/, fn ->
+        Ecto.Hosi.Model.build([BadType])
       end
     end
   end

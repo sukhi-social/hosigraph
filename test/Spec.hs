@@ -16,6 +16,7 @@ import           Data.IORef
 import           Data.Int (Int64)
 import           Data.List (sort, sortOn, nub, isInfixOf, isPrefixOf, intercalate)
 import qualified Data.Map.Strict as M
+import           Data.Maybe (isJust)
 import qualified Data.Set as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -40,11 +41,11 @@ import           Hosigraph.Bin
 import           Hosigraph.BinaryFuse
 import           Hosigraph.Chunk
 import qualified Hosigraph.Erase as Erase
-import           Takka.Edn (Edn(..), readEdn, renderEdn)
+import           Takka.Edn (Edn(..), readEdn, renderEdn, ednToValue)
 import           Takka.Syntax (Amount(..), Binding(..), Clause(..), Dir(..), Pulled(..), Query(..), Term(..), clauseVars, parseQuery)
 import           Hosigraph.Id (epochMs, idMs, idRangeBetween, idSeqNo, makeId)
 import           Hosigraph.Khana (metaEntity, schemaMark, schemaMarkAttr, khanaSchema, khanaEntity, closeKhana, newKhanaRuntime, closeKhanaRuntime, openKhana, applyFacts, khanaDatoms, khanaDatomPage, compareKhanas)
-import           Takka.Types (Datom(..))
+import           Takka.Types (Datom(..), parseUuid, uuidText)
 import           Hosigraph.Khana.Repl (newDtlvRepl, stopDtlvRepl)
 import           Hosigraph.Khana.Dtlv (DtlvOp(..), Runner(..), closeDtlv, dtlvTransact, ednKw, ednStr, ednVal, openDtlv, schemaEdn, tameEdn)
 import           Hosigraph.Manifest
@@ -90,6 +91,7 @@ main = do
   case args of
     ["--hold-world", dir] -> holdWorld dir        -- a helper for the world-lock tests: not a test run
     ["--make-fixture", dir] -> makeFixture dir    -- writes test/fixtures/world-0.1.0 (see "The shape on disk is a promise"); not a test run
+    ["--make-uuid-fixture", dir] -> makeUuidFixture dir   -- writes test/fixtures/world-uuid, the same way
     _                     -> runTests
 
 -- | Run again by the world-lock test as a second process: open this world, say so, and hold it until stdin is closed.
@@ -114,10 +116,10 @@ runTests = do
   let java = maybe "java" id mjava
       tag t = map (\(n, a) -> (t ++ " " ++ n, a))
       replRun = case mexe of
-        Just exe -> tag "[dtlv-repl]" (hosiTests (KhanaDtlvRepl exe) ++ formatHosiTests (KhanaDtlvRepl exe) ++ dtlvTests (KhanaDtlvRepl exe) ++ wordsTests (KhanaDtlvRepl exe) ++ nativeTests exe ++ replTests exe)
+        Just exe -> tag "[dtlv-repl]" (hosiTests (KhanaDtlvRepl exe) ++ uuidHosiTests (KhanaDtlvRepl exe) ++ formatHosiTests (KhanaDtlvRepl exe) ++ dtlvTests (KhanaDtlvRepl exe) ++ wordsTests (KhanaDtlvRepl exe) ++ nativeTests exe ++ replTests exe)
         Nothing  -> []
       jvmRun = case mjar of
-        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ wordsTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
+        Just jar -> tag "[jvm]" (hosiTests (KhanaDatalevinJvm java jar) ++ uuidHosiTests (KhanaDatalevinJvm java jar) ++ formatHosiTests (KhanaDatalevinJvm java jar) ++ dtlvTests (KhanaDatalevinJvm java jar) ++ wordsTests (KhanaDatalevinJvm java jar) ++ jvmTests java jar)
         Nothing  -> []
       mixedRun = case (mexe, mjar) of
         (Just exe, Just jar) -> tag "[dtlv-repl+jvm]" (mixedTests exe java jar)
@@ -128,7 +130,7 @@ runTests = do
   -- HOSIGRAPH_TEST_ONLY=text runs only the tests whose name has that text in it (for trying one thing; a full run is the one that counts)
   only <- (>>= nonEmpty) <$> lookupEnv "HOSIGRAPH_TEST_ONLY"
   let wanted (name, _) = maybe True (`isInfixOf` name) only
-  results <- forM (filter wanted (pureTests ++ readCacheTests ++ worldLockTests ++ formatTests ++ dtlvRun)) $ \(name, act) -> do
+  results <- forM (filter wanted (pureTests ++ readCacheTests ++ worldLockTests ++ formatTests ++ uuidTests ++ dtlvRun)) $ \(name, act) -> do
     r <- try act
     case r of
       Right () -> putStrLn ("  ok    " ++ name) >> pure True
@@ -235,6 +237,7 @@ renderValue v = case v of
   VBool b         -> "b:" ++ (if b then "t" else "f")
   VKw (Keyword k) -> "k:" ++ T.unpack k
   VTuple _        -> error "renderValue: a tuple is never in an event"
+  VUuid a b       -> "u:" ++ T.unpack (uuidText a b)
 
 renderEvent :: E.Event -> String
 renderEvent e = unwords [ show (E.evSeq e), E.kindName (E.evKind e), show (E.evId e), attrName, renderValue (E.evVal e) ]
@@ -318,12 +321,47 @@ toVersion1 evDir month = do
       pure (entryFromInfo (ceName c) ci [ FileEntry n b h | (n, b, h) <- files ])
   writeManifest evDir mf { mfChunks = chunks }
 
+-- | Make the second fixture world, the first with UUIDs in its files: a version 2 chunk with none (October), a cold chunk
+-- of version 3 with an erase record (November), a hot chunk of version 3, @hosi-manifest/3@, and a tail that begins with
+-- the UUID mark and is not sealed.
+makeUuidFixture :: FilePath -> IO ()
+makeUuidFixture root = do
+  removePathForcibly root
+  let evDir = root </> "events"
+  (clk, clock) <- newClock oct18
+  let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+      put ev ops = Ev.withEventsLock ev (do rc <- Ev.record ev ops; Ev.commit ev rc; pure (Ev.rcTemps rc))
+      str = Lit . VStr
+      uuid n = Lit (VUuid 0x01a21aecc46b7226 (0xb63c5ab791b75800 + n))
+  ev <- Ev.openEvents cfg evDir
+  t1 <- put ev [ Create (Tmp 1) "doc/title" (str "no UUID yet") ]
+  _ <- Ev.seal ev
+  writeIORef clk nov11
+  t2 <- put ev [ Create (Tmp 1) "doc/uuid" (uuid 1), Create (Tmp 1) "doc/title" (str "one"), Create (Tmp 2) "doc/uuid" (uuid 2)
+               , Create (Tmp 2) "doc/same" (uuid 1), Create (Tmp 1) "doc/same" (uuid 1) ]
+  _ <- Ev.seal ev
+  _ <- Ev.freezeUnit ev (KCreate, (2026, 11))
+  _ <- Ev.withEventsLock ev (Ev.eraseNow ev (Erase.fromIds [t2 M.! 2]))
+  writeIORef clk dec05
+  _ <- put ev [ Create (Tmp 1) "doc/uuid" (uuid 3), Delete (Id (t1 M.! 1)) "doc/title" (str "no UUID yet") ]
+  _ <- Ev.seal ev
+  _ <- put ev [ Create (Tmp 1) "doc/uuid" (uuid 4), Create (Id (t2 M.! 1)) "doc/uuid" (uuid 5) ]
+  Ev.closeEvents ev
+  ev2 <- Ev.openEvents cfg evDir
+  events <- dumpWorld ev2
+  Ev.closeEvents ev2
+  writeFile (root </> "expected.txt") $ unlines $
+    "# What world-uuid shows: the events, in order (made by --make-uuid-fixture, read back)." : [ "event " ++ l | l <- events ]
+
 -- | The fixture, copied to a place of its own (opening a world writes to it).
 withFixture :: (FilePath -> IO a) -> IO a
-withFixture act = withTmp $ \tmp -> do
-  there <- doesDirectoryExist fixtureDir
-  unless there $ throwIO (userError (fixtureDir ++ " is not here: run the tests from the package directory"))
-  copyDir fixtureDir (tmp </> "w")
+withFixture = withFixtureAt fixtureDir
+
+withFixtureAt :: FilePath -> (FilePath -> IO a) -> IO a
+withFixtureAt from act = withTmp $ \tmp -> do
+  there <- doesDirectoryExist from
+  unless there $ throwIO (userError (from ++ " is not here: run the tests from the package directory"))
+  copyDir from (tmp </> "w")
   act (tmp </> "w")
 
 expectedLines :: FilePath -> IO [String]
@@ -443,6 +481,278 @@ formatHosiTests be =
       sayAll h2
       m <- getEntity h2 gus
       check "...and Gus is still there after the reopen" (M.member "person/name" m)
+      closeHosi h2)
+  ]
+
+-- ---------------------------------------------------------------------------
+-- UUIDs
+
+-- | Two UUIDv7s, the first made earlier.
+u1, u2 :: Value
+u1 = VUuid 0x01a21aecc46b7226 0xb63c5ab791b7584a
+u2 = VUuid 0x01a21aecc46c7000 0x8000000000000001
+
+uuidMarkBytes :: B.ByteString
+uuidMarkBytes = "HOSITL2\n"
+
+uuidTests :: [Test]
+uuidTests =
+  [ ("uuid format: the world with UUIDs that was saved is read as it was written, and verifies; it has what it says (versions 2 and 3, a cold chunk, an erase record, manifest/3, a marked tail)", withFixtureAt ("test" </> "fixtures" </> "world-uuid") $ \dir -> do
+      let evDir = dir </> "events"
+      expected <- expectedLines dir
+      raw <- B.readFile (evDir </> manifestFile)
+      check "hosi-manifest/3" ("\"hosi-manifest/3\"" `B.isInfixOf` raw)
+      mf <- readManifest evDir
+      versions <- forM (mfChunks mf) $ \c -> B.take 4 . B.drop 8 <$> B.readFile (evDir </> "chunks" </> ceName c </> chunkDataFile)
+      checkEq "chunk versions" [B.pack [0, 0, 0, 2], B.pack [0, 0, 0, 3]] (sort (nub versions))
+      check "a cold chunk" (any ((== "cold") . ceTier) (mfChunks mf))
+      check "an erase record" (any (isJust . ceErase) (mfChunks mf))
+      check "a marked tail" . (uuidMarkBytes `B.isPrefixOf`) =<< B.readFile (evDir </> tailFile)
+      ev <- Ev.openEvents Ev.defaultEventsConfig evDir
+      got <- dumpWorld ev
+      checkEq "the events" [ drop 6 l | l <- expected, take 6 l == "event " ] got
+      (readable, problems) <- Ev.withEventsLock ev (Ev.verifyEvents ev)
+      checkEq "verify: no problems" (True, []) (readable, problems)
+      Ev.closeEvents ev)
+
+  , ("uuid: the text is read in either case and written in lower case; what is not a UUID is refused; a query holds one", do
+      let text = "01a21aec-c46b-7226-b63c-5ab791b7584a"
+      checkEq "written" text (uuidText 0x01a21aecc46b7226 0xb63c5ab791b7584a)
+      checkEq "read, upper case" (Just (0x01a21aecc46b7226, 0xb63c5ab791b7584a)) (parseUuid (T.toUpper text))
+      checkEq "EDN" (Right u1) (readEdn ("#uuid \"" <> text <> "\"") >>= ednToValue)
+      checkEq "EDN with no space" (Right u1) (readEdn ("#uuid\"" <> text <> "\"") >>= ednToValue)
+      checkEq "EDN written" (Right ("#uuid \"" <> text <> "\"")) (renderEdn <$> readEdn ("#uuid \"" <> T.toUpper text <> "\""))
+      checkEq "inside a vector" (Right (VTuple [Just u1, Nothing])) (readEdn ("[#uuid \"" <> text <> "\" nil]") >>= ednToValue)
+      forM_ [ "#uuid \"nope\"", "#uuid 5", "#uuid", "#uuid \"01a21aec-c46b-7226-b63c-5ab791b7584\""
+            , "#uuid \"01a21aecc46b7226b63c5ab791b7584a\"", "#uuid \"{01a21aec-c46b-7226-b63c-5ab791b7584a}\""
+            , "#uuid \"01a21aec-c46b-7226-b63c-5ab791b7584g\"", "#uuidx \"01a21aec-c46b-7226-b63c-5ab791b7584a\""
+            , "#inst \"2026-11-28\"" ] $ \bad ->
+        check ("refused: " ++ T.unpack bad) (either (const True) (const False) (readEdn bad))
+      q <- either (throwIO . userError) pure (readEdn ("[:find ?e :where [?e :doc/uuid #uuid \"" <> text <> "\"]]") >>= parseQuery)
+      check "the query holds the value" (u1 `elem` [ v | CPattern _ _ (TConst v) <- qWhere q ]))
+
+  , ("uuid: text round-trips, and values sort as their texts do (QuickCheck)", prop 500 $ \(a, b, c, d) ->
+      parseUuid (uuidText a b) === Just (a, b)
+        .&&. compare (VUuid a b) (VUuid c d) === compare (uuidText a b) (uuidText c d))
+
+  , ("uuid: an event keeps it in the tail log's bytes", do
+      let ev = E.Event 7 KCreate 1001 "doc/uuid" u1
+      checkEq "round trip" (Right ev) (runGet E.getEvent (build (E.putEvent ev)) 0)
+      checkEq "17 bytes: a tag and two words" 17 (B.length (build (E.putValue u1))))
+
+  , ("uuid chunk: a chunk that holds one is version 3 and reads back, hot and cold; one that holds none is version 2; version 1 takes none", withTmp $ \dir -> do
+      let plain = [ E.Event s KCreate (fromIntegral s) "n" (VInt (fromIntegral s)) | s <- [1 .. 20] ]
+          mixed = plain ++ [ E.Event 21 KCreate 21 "u" u1, E.Event 22 KCreate 22 "u" u2 ]
+                        ++ [ E.Event s KCreate (fromIntegral s) "same" u1 | s <- [23 .. 220] ]       -- worth a dictionary entry
+          versionOf d = B.take 4 . B.drop 8 <$> B.readFile (d </> chunkDataFile)
+          sorted = sortOn (\e -> (evId e, evAttr e, evSeq e))
+      _ <- writeChunk (dir </> "plain") 7 KCreate (2026, 11) plain
+      checkEq "no UUID: version 2" (B.pack [0, 0, 0, 2]) =<< versionOf (dir </> "plain")
+      forM_ [("hot", writeChunk), ("cold", writeColdChunk)] $ \(name, write') -> do
+        _ <- write' (dir </> name) 7 KCreate (2026, 11) mixed
+        checkEq (name ++ ": version 3") (B.pack [0, 0, 0, 3]) =<< versionOf (dir </> name)
+        cr <- openChunkReader (dir </> name)
+        checkEq (name ++ ": every event comes back") (sorted mixed) =<< readChunkEvents cr
+        found <- lookupInChunk cr 22
+        checkEq (name ++ ": a lookup finds its UUID") (Star [ E.Event 22 KCreate 22 "u" u2 ]) found
+      r <- try (writeChunkVersion 1 (dir </> "old") 7 KCreate (2026, 11) mixed)
+      check "version 1 refuses" (case r of Left (BadArgument _) -> True; _ -> False))
+
+  , ("uuid tail: a log with none has no mark; the first UUID puts the mark in front of what was there; a rollback keeps the mark; the log reads back", withTmp $ \dir -> do
+      let ev n v = E.Event n KCreate 10 "a" v
+          b1 = [ev 1 (VInt 1)]
+          b2 = [ev 2 (VStr "two")]
+          b3 = [ev 3 u1]
+          b4 = [ev 4 u2]
+          path = dir </> tailFile
+          batchesOf = fst <$> readTail dir
+          -- (the file is read between uses of the log: this process cannot read it while it holds it open to write)
+          onLog act = bracket (openTail dir False) closeTail act
+      _ <- onLog (\tl -> appendBatches tl [b1, b2])
+      before <- B.readFile path
+      check "no mark yet" (not ("HOSI" `B.isPrefixOf` before))
+      [start3] <- onLog (\tl -> appendBatches tl [b3])
+      marked <- B.readFile path
+      check "the mark is first" (uuidMarkBytes `B.isPrefixOf` marked)
+      checkEq "the old records follow it, unchanged" before (B.take (B.length before) (B.drop 8 marked))
+      checkEq "the size before the batch counts the mark" (fromIntegral (B.length before + 8)) start3
+      checkEq "all three" [b1, b2, b3] =<< batchesOf
+      onLog (\tl -> truncateTail tl start3)                                      -- the batch is taken back
+      checkEq "the mark stays, the batch is gone" (B.append uuidMarkBytes before) =<< B.readFile path
+      checkEq "two" [b1, b2] =<< batchesOf
+      -- appended and taken back in one go, as a refused write is
+      onLog $ \tl -> do
+        [s3] <- appendBatches tl [b3]
+        truncateTail tl s3
+      _ <- onLog (\tl -> appendBatches tl [b3])
+      [start4] <- onLog (\tl -> appendBatches tl [b4])                            -- a log opened marked is known to be
+      whole <- B.readFile path
+      checkEq "one mark only" 1 (length [ () | i <- [0 .. B.length whole - 8], uuidMarkBytes `B.isPrefixOf` B.drop i whole ])
+      checkEq "all four" ([b1, b2, b3, b4], fromIntegral (B.length whole)) =<< readTail dir
+      -- a torn end behind a mark is cut as any other
+      B.writeFile path (B.take (B.length whole - 3) whole)
+      checkEq "the last is torn: the first three, and the good part ends where it began (the mark counted)" ([b1, b2, b3], start4) =<< readTail dir
+      -- damage in the middle is refused
+      let flipAt n bs = B.concat [B.take n bs, B.singleton (B.index bs n `xor` 0xff), B.drop (n + 1) bs]
+      B.writeFile path (flipAt 20 whole)
+      r <- try (readTail dir)
+      check "damage in the middle: Corrupt" (case r of Left (Corrupt _) -> True; _ -> False)
+      -- starting over: the mark is there only if a kept batch holds a UUID
+      B.writeFile path whole
+      onLog (\tl -> resetTail tl [b1, b2])
+      checkEq "no UUID kept: no mark" before =<< B.readFile path
+      onLog $ \tl -> resetTail tl [b1, b2] >> void (appendBatches tl [b3])
+      check "...and it comes back with the next UUID" . (uuidMarkBytes `B.isPrefixOf`) =<< B.readFile path
+      onLog (\tl -> resetTail tl [b4])
+      check "a kept UUID: marked" . (uuidMarkBytes `B.isPrefixOf`) =<< B.readFile path
+      checkEq "reads back" [b4] =<< batchesOf
+      onLog (\tl -> resetTail tl [])
+      checkEq "an empty log is empty" B.empty =<< B.readFile path)
+
+  , ("uuid world: sealed, it is hosi-manifest/3 and stays so after erase, clean and freeze; a world with none stays /1", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = Ev.defaultEventsConfig { Ev.ecClock = clock }
+          put ev ops = Ev.withEventsLock ev (Ev.record ev ops >>= \rc -> Ev.commit ev rc >> pure (Ev.rcTemps rc))
+          format = do
+            raw <- B.readFile (dir </> manifestFile)
+            pure [ f | f <- ["/1", "/2", "/3" :: String], BC.pack ("\"hosi-manifest" ++ f ++ "\"") `B.isInfixOf` raw ]
+      ev <- Ev.openEvents cfg dir
+      a <- (M.! 1) <$> put ev [Create (Tmp 1) "n" (Lit (VInt 1))]
+      _ <- Ev.seal ev
+      checkEq "no UUID: /1" ["/1"] =<< format
+      b <- (M.! 1) <$> put ev [Create (Tmp 1) "u" (Lit u1)]
+      checkEq "unsealed: the manifest has not changed" ["/1"] =<< format
+      Ev.closeEvents ev
+      check "...and the log is marked" . (uuidMarkBytes `B.isPrefixOf`) =<< B.readFile (dir </> tailFile)
+      ev1 <- Ev.openEvents cfg dir                                             -- an unsealed UUID is read again
+      checkEq "history from the log" [u1] . map evVal =<< Ev.history ev1 b
+      _ <- Ev.seal ev1
+      checkEq "sealed: /3" ["/3"] =<< format
+      checkEq "history from the chunk" [u1] . map evVal =<< Ev.history ev1 b
+      checkEq "the log is empty" 0 =<< getFileSize (dir </> tailFile)
+      _ <- Ev.withEventsLock ev1 (Ev.eraseNow ev1 (Erase.fromIds [b]))
+      _ <- Ev.rewriteErased ev1 maxBound
+      checkEq "the UUID is gone, the world stays /3" ["/3"] =<< format
+      checkEq "the other entity is there" [VInt 1] . map evVal =<< Ev.history ev1 a
+      Ev.closeEvents ev1
+      ev2 <- Ev.openEvents cfg dir
+      (ok, problems) <- Ev.withEventsLock ev2 (Ev.verifyEvents ev2)
+      checkEq "verify" (True, []) (ok, problems)
+      Ev.closeEvents ev2
+      mf <- readManifest dir
+      check "read back as it was written" (mfUuid mf))
+  ]
+
+uuidSchema :: Schema
+uuidSchema = M.fromList
+  [ ("doc/uuid",  identity (attr TUuid))
+  , ("doc/other", attr TUuid)
+  , ("doc/many",  many (attr TUuid))
+  , ("doc/title", attr TString) ]
+
+uuidHosiTests :: KhanaBackend -> [Test]
+uuidHosiTests be =
+  [ ("uuid: write, read, query, pull, newest first, a unique value, writeIf, delete; the same after seal, reopen and a rebuilt khana", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          text = "01a21aec-c46b-7226-b63c-5ab791b7584a"
+          byLiteral h = query h ("[:find ?t :where [?e :doc/uuid #uuid \"" <> text <> "\"] [?e :doc/title ?t]]") []
+          byInput h = query h "[:find ?t :in $ ?u :where [?e :doc/uuid ?u] [?e :doc/title ?t]]" [InScalar u1]
+      h <- openHosiWith cfg dir uuidSchema
+      r <- write h [ Create (Tmp 1) "doc/uuid" (Lit u1), Create (Tmp 1) "doc/title" (Lit (VStr "one"))
+                   , Create (Tmp 2) "doc/uuid" (Lit u2), Create (Tmp 2) "doc/title" (Lit (VStr "two"))
+                   , Create (Tmp 1) "doc/many" (Lit u1), Create (Tmp 1) "doc/many" (Lit u2)
+                   , Create (Tmp 2) "doc/free" (Lit u1) ]                      -- an attribute with no type takes one
+      let one = wrTemps r M.! 1; two = wrTemps r M.! 2
+      m <- getEntity h one
+      checkEq "read" (Just [u1]) (M.lookup "doc/uuid" m)
+      checkEq "many" (Just [u1, u2]) (sort <$> M.lookup "doc/many" m)
+      checkEq "a literal in the query" [[VStr "one"]] =<< byLiteral h
+      checkEq "an input" [[VStr "one"]] =<< byInput h
+      checkEq "a collection input" [[VStr "one"], [VStr "two"]] . sort
+        =<< query h "[:find ?t :in $ [?u ...] :where [?e :doc/uuid ?u] [?e :doc/title ?t]]" [InColl [u2, u1]]
+      checkEq "answers hold UUIDs" [[u1], [u2]] . sort =<< query h "[:find ?u :where [_ :doc/uuid ?u]]" []
+      cells <- queryCells h "[:find (pull ?e [:doc/uuid]) :in $ ?u :where [?e :doc/uuid ?u]]" [InScalar u2]
+      checkEq "pull" [[CPull (PEntity [("doc/uuid", PScalar u2)])]] cells
+      checkEq "newest first" [(u2, two), (u1, one)] . map (\d -> (dV d, dE d)) =<< highest h "doc/uuid" Nothing 5
+      checkEq "the next page" [(u1, one)] . map (\d -> (dV d, dE d)) =<< highest h "doc/uuid" (Just (u2, two)) 5
+      dup <- try (write h [Create (Tmp 1) "doc/uuid" (Lit u1)])
+      check "the same UUID twice is refused" (case dup of Left (WriteRejected _) -> True; _ -> False)
+      ok <- writeIf h [Holds one "doc/uuid" u1] [Create (Id one) "doc/other" (Lit u2)]
+      check "writeIf that holds" (either (const False) (const True) ok)
+      no <- writeIf h [Holds one "doc/uuid" u2] [Create (Id one) "doc/title" (Lit (VStr "no"))]
+      checkEq "writeIf that does not" (Left [Holds one "doc/uuid" u2]) (either Left (const (Right ())) no)
+      badCond <- try (writeIf h [Holds one "doc/uuid" (VStr text)] [Create (Id one) "doc/title" (Lit (VStr "no"))])
+      check "a condition with a string is a BadArgument" (case badCond of Left (BadArgument _) -> True; _ -> False)
+      _ <- write h [Delete (Id one) "doc/many" (Lit u1)]
+      checkEq "deleted" (Just [u2]) . M.lookup "doc/many" =<< getEntity h one
+      _ <- seal h
+      checkEq "after seal" [[VStr "one"]] =<< byInput h
+      checkEq "verify" [] =<< verify h
+      closeHosi h
+      h2 <- openHosiWith cfg dir uuidSchema
+      checkEq "after a reopen" [[VStr "one"]] =<< byLiteral h2
+      rebuildKhana h2
+      checkEq "after a rebuilt khana" [[VStr "one"]] =<< byInput h2
+      checkEq "history" [u1] . map evVal . filter ((== "doc/uuid") . evAttr) =<< history h2 one
+      _ <- erase h2 [EraseIds [one]]
+      checkEq "erased" [] =<< byInput h2
+      _ <- clean h2 defaultCleanOptions
+      checkEq "the other is there after clean" [[u2]] =<< query h2 "[:find ?u :where [_ :doc/uuid ?u]]" []
+      checkEq "verify" [] =<< verify h2
+      closeHosi h2)
+
+  , ("uuid: a wrong value is refused before it reaches the log or the khana, in write and in writeMany, for create and for delete; the next write is taken", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          str = VStr "01a21aec-c46b-7226-b63c-5ab791b7584a"
+          refused what act = do
+            before <- getFileSize (dir </> "events" </> tailFile)
+            r <- try act
+            check (what ++ ": WriteRejected") (case r of Left (WriteRejected _) -> True; _ -> False)
+            checkEq (what ++ ": nothing was logged") before =<< getFileSize (dir </> "events" </> tailFile)
+          good h t = write h [Create (Tmp 1) "doc/title" (Lit (VStr t))]
+      h <- openHosiWith cfg dir uuidSchema
+      one <- (M.! 1) . wrTemps <$> write h [Create (Tmp 1) "doc/uuid" (Lit u1)]
+      forM_ [ ("create a string", Create (Id one) "doc/other" (Lit str))
+            , ("create a number", Create (Id one) "doc/other" (Lit (VInt 5)))
+            , ("create a reference", Create (Id one) "doc/other" (RefTo (Id one)))
+            , ("delete with a string", Delete (Id one) "doc/uuid" (Lit str))
+            , ("delete with a reference", Delete (Id one) "doc/uuid" (RefTo (Id one)))
+            , ("a UUID on a string attribute", Create (Id one) "doc/title" (Lit u1)) ] $ \(what, op) -> do
+        refused what (write h [op])
+        _ <- good h (T.pack what)
+        pure ()
+      -- writeMany: the refused batch in its place, the others written
+      rs <- writeMany h [ [Create (Tmp 1) "doc/title" (Lit (VStr "a"))]
+                        , [Delete (Id one) "doc/uuid" (Lit str)]
+                        , [Create (Tmp 1) "doc/title" (Lit (VStr "b"))] ]
+      checkEq "which went in" [True, False, True] (map (either (const False) (const True)) rs)
+      check "the refusal is WriteRejected" (case rs !! 1 of Left (WriteRejected _) -> True; _ -> False)
+      onlyBad <- writeMany h [ [Create (Id one) "doc/other" (Lit str)] ]
+      checkEq "all refused" [False] (map (either (const False) (const True)) onlyBad)
+      _ <- good h "after"
+      checkEq "the UUID is as it was" (Just [u1]) . M.lookup "doc/uuid" =<< getEntity h one
+      -- a query with a string against the attribute fails, and the database goes on taking writes
+      q <- try (query h "[:find ?e :in $ ?u :where [?e :doc/uuid ?u]]" [InScalar str])
+      check "a string is not read as a UUID in a query" (either (\(_ :: SomeException) -> True) null q)
+      _ <- good h "still"
+      checkEq "verify" [] =<< verify h
+      closeHosi h)
+
+  , ("uuid: a world folded under another schema is not opened under one whose attribute is a uuid and holds strings; nothing is touched", withTmp $ \dir -> do
+      (_, clock) <- newClock nov11
+      let cfg = (backendCfg be) { hcClock = clock }
+          loose = M.insert "doc/other" (attr TString) uuidSchema
+      h <- openHosiWith cfg dir loose
+      one <- (M.! 1) . wrTemps <$> write h [Create (Tmp 1) "doc/other" (Lit (VStr "01a21aec-c46b-7226-b63c-5ab791b7584a"))]
+      _ <- write h [Delete (Id one) "doc/other" (Lit (VStr "01a21aec-c46b-7226-b63c-5ab791b7584a"))]
+      closeHosi h
+      r <- try (openHosiWith cfg dir uuidSchema)
+      check "SchemaRefused" (case r of Left (SchemaRefused _) -> True; _ -> False)
+      case r of Right h' -> closeHosi h'; Left _ -> pure ()
+      h2 <- openHosiWith cfg dir loose
+      checkEq "the old schema still opens it" [] =<< verify h2
       closeHosi h2)
   ]
 
@@ -973,7 +1283,7 @@ pureTests =
         (Erase.decode (sealed ("HOSIERS1" <> build (putVar 1 <> putVar (fromIntegral (maxBound :: Int64)) <> putVar 0)))))
 
   , ("manifest: with no erase record nothing changes (hosi-manifest/1, no new key); a record makes it /2; both read back as they were", withTmp $ \dir -> do
-      let plain   = Manifest 3 7 4 [manifestChunk] 0
+      let plain   = Manifest 3 7 4 [manifestChunk] 0 False
           withRec = plain { mfChunks = [manifestChunk { ceErase = Just manifestRecord }], mfEraseGen = 1 }
           emptied = plain { mfEraseGen = 1 }                   -- the record is gone again, the counter is not
           onDisk m = writeManifest dir m >> B.readFile (dir </> manifestFile)
@@ -991,8 +1301,8 @@ pureTests =
       checkEq "reads back" emptied =<< readManifest dir)
 
   , ("manifest: a /1 that lists a record or a counter, a /2 without its counter, and a format from the future are refused", withTmp $ \dir -> do
-      let withRec = Manifest 3 7 4 [manifestChunk { ceErase = Just manifestRecord }] 1
-          emptied = Manifest 3 7 4 [manifestChunk] 1
+      let withRec = Manifest 3 7 4 [manifestChunk { ceErase = Just manifestRecord }] 1 False
+          emptied = Manifest 3 7 4 [manifestChunk] 1 False
           refused what m edit = do
             writeManifest dir m
             resignManifest dir edit
@@ -1006,7 +1316,7 @@ pureTests =
       refused "a /1 with a counter" emptied toV1
       refused "a /2 without its counter" withRec (swapBytes "eraseGen" "eraseGeX")
       -- the same refusal is what a build that knows only /1 does with a /2: it reads the format first
-      refused "a format from the future" withRec (swapBytes "hosi-manifest/2" "hosi-manifest/3")
+      refused "a format from the future" withRec (swapBytes "hosi-manifest/2" "hosi-manifest/4")
       -- and a change nobody signed is still refused, as before
       writeManifest dir withRec
       bs <- B.readFile (dir </> manifestFile)

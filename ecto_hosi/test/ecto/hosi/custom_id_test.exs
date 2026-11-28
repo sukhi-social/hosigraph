@@ -76,7 +76,7 @@ defmodule Ecto.Hosi.CustomIdTest do
     c = crate("f")
     p = parcel(c, 1)
 
-    assert {[got], _} = Repo.highest(Parcel, :rank, 1)
+    assert {[got], _} = Repo.highest(:"parcel/rank", 1, load: Parcel)
     assert {got.id, got.crate_id} == {p.id, c.id}
   end
 end

@@ -89,6 +89,8 @@ The entity ID of the khana is a signed 64-bit number, so 63 bits is the limit.
 To make IDs that never collide across nodes (room for distribution), the ID needs node bits or random bits. There are no spare bits.
 One option: a 12-bit sequence and 9 bits for the node. Phase 0 ("ID scheme") must decide this.
 
+A UUID is now a value (`TUuid`), so a host can give its records a UUID of its own (UUIDv7, say) beside the ID. That does not change the ID, and does not answer this question.
+
 ## (Extra) What the tests check
 
 * MPHF: any set of different keys maps one-to-one to [0,n) (QuickCheck, 300 runs); a serialization round trip; 50,000 keys (the shape of real IDs).

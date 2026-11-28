@@ -1,11 +1,37 @@
+# Most tests are about what Ecto asks of an adapter, and keep each schema's facts apart: the
+# field `name` of `use Ecto.Hosi.Test.Table, "user"` is the attribute `user/name`, and the fact
+# `user/is` (the field `here`) says which records are users. Views that share attributes are in
+# `views_test.exs`.
+defmodule Ecto.Hosi.Test.Table do
+  @moduledoc false
+
+  defmacro __using__(name) do
+    quote do
+      use Ecto.Hosi.View
+      @field_source_mapper Ecto.Hosi.Test.Table.mapper(unquote(name))
+      hosi_where here: true
+      hosi_owner :nobody
+    end
+  end
+
+  def mapper(name) do
+    fn
+      :id -> :id
+      :here -> String.to_atom(name <> "/is")
+      field -> String.to_atom("#{name}/#{field}")
+    end
+  end
+end
+
 defmodule Ecto.Hosi.Test.User do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "user"
   import Ecto.Changeset
 
   hosi_unique :email
 
   schema "user" do
+    field(:here, :boolean, default: true)
     field(:name, :string)
     field(:email, :string)
     field(:age, :integer)
@@ -32,12 +58,14 @@ end
 
 defmodule Ecto.Hosi.Test.Post do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "post"
   import Ecto.Changeset
 
   hosi_tuple :user_id, :inserted_at
+  hosi_ref :user_id, on_delete: :keep
 
   schema "post" do
+    field(:here, :boolean, default: true)
     field(:title, :string)
     field(:likes, :integer, default: 0)
     belongs_to(:user, Ecto.Hosi.Test.User)
@@ -50,9 +78,11 @@ end
 
 defmodule Ecto.Hosi.Test.Doc do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "doc"
   import Ecto.Changeset
 
   schema "doc" do
+    field(:here, :boolean, default: true)
     field(:meta, :map)
     field(:tags, {:array, :string})
     field(:items, {:array, :map})
@@ -65,8 +95,10 @@ end
 
 defmodule Ecto.Hosi.Test.Follow do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "follow"
 
   schema "follow" do
+    field(:here, :boolean, default: true)
     field(:from, :integer)
     field(:to, :integer)
   end
@@ -106,13 +138,14 @@ end
 
 defmodule Ecto.Hosi.Test.Pair do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "pair"
   import Ecto.Changeset
 
   hosi_unique [:a, :b], name: "pair_a_b_index"
   hosi_unique :email, lower: [:email], where: [null: [:domain]], name: "pair_local_email_index"
 
   schema "pair" do
+    field(:here, :boolean, default: true)
     field(:a, :integer)
     field(:b, :integer)
     field(:email, :string)
@@ -129,14 +162,19 @@ end
 
 defmodule Ecto.Hosi.Test.Team do
   use Ecto.Schema
-  schema("team", do: field(:name, :string))
+  use Ecto.Hosi.Test.Table, "team"
+  schema "team" do
+    field(:here, :boolean, default: true)
+    field(:name, :string)
+  end
 end
 
 defmodule Ecto.Hosi.Test.Member do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
-  hosi_ref :team_id, to: Ecto.Hosi.Test.Team, on_delete: :cascade
+  use Ecto.Hosi.Test.Table, "member"
+  hosi_ref :team_id, on_delete: :cascade
   schema "member" do
+    field(:here, :boolean, default: true)
     field(:name, :string)
     belongs_to(:team, Ecto.Hosi.Test.Team)
   end
@@ -144,9 +182,10 @@ end
 
 defmodule Ecto.Hosi.Test.Item do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
-  hosi_ref :member_id, to: "member", on_delete: :cascade
+  use Ecto.Hosi.Test.Table, "item"
+  hosi_ref :member_id, on_delete: :cascade
   schema "item" do
+    field(:here, :boolean, default: true)
     field(:name, :string)
     belongs_to(:member, Ecto.Hosi.Test.Member)
   end
@@ -154,10 +193,11 @@ end
 
 defmodule Ecto.Hosi.Test.Note do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
-  hosi_ref :team_id, to: "team", on_delete: :nilify
+  use Ecto.Hosi.Test.Table, "note"
+  hosi_ref :team_id, on_delete: :nilify
   hosi_unique [:team_id, :name], name: "note_team_name_index"
   schema "note" do
+    field(:here, :boolean, default: true)
     field(:name, :string)
     belongs_to(:team, Ecto.Hosi.Test.Team)
   end
@@ -165,18 +205,22 @@ end
 
 defmodule Ecto.Hosi.Test.Seat do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
-  hosi_ref :team_id, to: "team", on_delete: :restrict, name: "seat_team_fk"
+  use Ecto.Hosi.Test.Table, "seat"
+  hosi_ref :team_id, on_delete: :restrict, name: "seat_team_fk"
   schema "seat" do
+    field(:here, :boolean, default: true)
     belongs_to(:team, Ecto.Hosi.Test.Team)
   end
 end
 
 defmodule Ecto.Hosi.Test.Entry do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
-  hosi_append_only()
-  schema "entry", do: field(:text, :string)
+  use Ecto.Hosi.Test.Table, "entry"
+  hosi_final :text
+  schema "entry" do
+    field(:here, :boolean, default: true)
+    field(:text, :string)
+  end
 end
 
 defmodule Ecto.Hosi.Test.Joiner do
@@ -185,7 +229,7 @@ end
 
 defmodule Ecto.Hosi.Test.Ticket do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "ticket"
   import Ecto.Changeset
 
   # Elixir sees "open", hosigraph keeps :open
@@ -193,6 +237,7 @@ defmodule Ecto.Hosi.Test.Ticket do
   hosi_unique :slug
 
   schema "ticket" do
+    field(:here, :boolean, default: true)
     field(:title, :string)
     field(:slug, :string)
     field(:state, :string, default: "open")
@@ -208,13 +253,14 @@ end
 
 defmodule Ecto.Hosi.Test.Link do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "link"
   import Ecto.Changeset
 
   # the pair is hosigraph's own tuple, not a JSON text in a derived attribute
   hosi_unique [:a, :b], tuple: true, name: "link_a_b_index"
 
   schema "link" do
+    field(:here, :boolean, default: true)
     field(:a, :integer)
     field(:b, :integer)
     field(:note, :string)
@@ -230,33 +276,36 @@ end
 # not given to the Repo: schemas that must be refused
 defmodule Ecto.Hosi.Test.BadKeyword do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "bad_keyword"
 
   hosi_keyword :n, ["a", "b"]
 
   schema "bad_keyword" do
+    field(:here, :boolean, default: true)
     field(:n, :integer)
   end
 end
 
 defmodule Ecto.Hosi.Test.BadKeywordName do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "bad_keyword_name"
 
   hosi_keyword :n, ["fine", "not fine/at all"]
 
   schema "bad_keyword_name" do
+    field(:here, :boolean, default: true)
     field(:n, :string)
   end
 end
 
 defmodule Ecto.Hosi.Test.BadTuple do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "bad_tuple"
 
   hosi_unique [:a, :b], tuple: true, lower: [:b]
 
   schema "bad_tuple" do
+    field(:here, :boolean, default: true)
     field(:a, :string)
     field(:b, :string)
   end
@@ -276,22 +325,47 @@ end
 
 defmodule Ecto.Hosi.Test.Crate do
   use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "crate"
 
   @primary_key {:id, Ecto.Hosi.Test.Shifted, read_after_writes: true}
   schema "crate" do
+    field(:here, :boolean, default: true)
     field(:label, :string)
   end
 end
 
 defmodule Ecto.Hosi.Test.Parcel do
   use Ecto.Schema
-  use Ecto.Hosi.Schema
+  use Ecto.Hosi.Test.Table, "parcel"
 
   hosi_tuple :crate_id, :rank
+  hosi_ref :crate_id, on_delete: :keep
 
   @primary_key {:id, Ecto.Hosi.Test.Shifted, read_after_writes: true}
   schema "parcel" do
+    field(:here, :boolean, default: true)
     field(:rank, :integer)
     belongs_to(:crate, Ecto.Hosi.Test.Crate, type: Ecto.Hosi.Test.Shifted)
+  end
+end
+
+# not in the test Repo's `:schemas`
+defmodule Ecto.Hosi.Test.Unlisted do
+  use Ecto.Schema
+
+  schema "unlisted" do
+    field(:name, :string)
+  end
+end
+
+# a narrower look at the rows of "user", with no rules of its own
+defmodule Ecto.Hosi.Test.UserName do
+  use Ecto.Schema
+  use Ecto.Hosi.Test.Table, "user"
+
+  schema "user" do
+    field(:here, :boolean, default: true)
+    field(:name, :string)
+    field(:email, :string)
   end
 end

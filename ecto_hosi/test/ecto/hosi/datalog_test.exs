@@ -91,24 +91,26 @@ defmodule Ecto.Hosi.DatalogTest do
           rules: Rules
         )
 
-      %{q: q, inputs: inputs} = Ecto.Hosi.Query.to_request(query)
+      %{q: q, inputs: inputs} = Ecto.Hosi.Query.to_request(query, Repo)
 
       assert q =~ ~r/^\[:find \?b :in \$ \[\?__p\d+ \.\.\.\] \?__p\d+ % :where /
       assert [[:coll, [1, 2]], [:scalar, 1], [:rules, rules]] = inputs
       assert is_binary(rules)
 
+      # a match asks for the facts that make a record show up in the view, then for its own
       assert rules =~
-               "[(reachable ?__h0 ?__h1) [?__e0 :follow/from ?__h0] [?__e0 :follow/to ?__h1]]"
+               "[(reachable ?__h0 ?__h1) [?__e0 :follow/is true] [?__e0 :follow/from ?__h0] " <>
+                 "[?__e0 :follow/to ?__h1]]"
 
       assert rules =~ "(reachable ?b ?__h1)"
-      assert rules =~ "(not-join [?__h0] [?__e1 :follow/to ?__h0])"
+      assert rules =~ "(not-join [?__h0] [?__e1 :follow/is true] [?__e1 :follow/to ?__h0])"
       assert rules =~ "[(< ?__h0 ?__h1)]"
     end
 
     test "without rules there is no % and no rules input" do
       query = datalog(find: [x], where: [match(Follow, from: x)])
-      assert %{q: q, inputs: []} = Ecto.Hosi.Query.to_request(query)
-      assert q == "[:find ?x :in $ :where [?__e0 :follow/from ?x]]"
+      assert %{q: q, inputs: []} = Ecto.Hosi.Query.to_request(query, Repo)
+      assert q == "[:find ?x :in $ :where [?__e0 :follow/is true] [?__e0 :follow/from ?x]]"
     end
   end
 
@@ -131,6 +133,36 @@ defmodule Ecto.Hosi.DatalogTest do
       assert Enum.map(rows, fn [_, n] -> n end) == ["Ada", "Cy"]
       assert [[id, _] | _] = rows
       assert Repo.get!(User, id).name == "Ada"
+    end
+
+    test "values inside a not: one, a list, none" do
+      for {name, age} <- [{"Ada", 36}, {"Bob", 25}, {"Cy", 40}] do
+        Repo.insert!(%User{name: name, age: age, email: "#{name}@x"})
+      end
+
+      young = 25
+      ages = [25, 40]
+
+      assert datalog_rows(
+               datalog(find: [n], where: [match(User, id: u, name: n), not match(User, id: u, age: ^young)])
+             ) == [["Ada"], ["Cy"]]
+
+      assert datalog_rows(
+               datalog(find: [n], where: [match(User, id: u, name: n), not match(User, id: u, age: ^ages)])
+             ) == [["Ada"]]
+
+      none = []
+
+      assert datalog_rows(
+               datalog(find: [n], where: [match(User, id: u, name: n), not match(User, id: u, age: ^none)])
+             ) == [["Ada"], ["Bob"], ["Cy"]]
+
+      assert datalog_rows(datalog(find: [n], where: [match(User, name: n, age: a), not (a > ^young)])) ==
+               [["Bob"]]
+
+      assert_raise ArgumentError, ~r/needs a variable/, fn ->
+        datalog_rows(datalog(find: [n], where: [match(User, name: n), not match(User, age: ^young)]))
+      end
     end
 
     test "a raw request is passed through" do

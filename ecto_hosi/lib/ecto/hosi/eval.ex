@@ -5,10 +5,10 @@ defmodule Ecto.Hosi.Eval do
   # re-check the whole `where` of a query whose candidates Datalog fetched, and to compute the
   # parts Datalog does not: fragments, like, aggregates, coalesce.
   #
-  # An env is `%{binding_index => row | nil}`; a row is `%{id:, entity:, source:}` (nil: a left
-  # join that found nothing). Values are as stored (already dumped), as are the query's params.
+  # An env is `%{binding_index => row | nil}`; a row is `%{id:, entity:}` (nil: a left join that
+  # found nothing). Values are in the adapter's form (already dumped), as are the query's params.
 
-  alias Ecto.Hosi.{Attr, Backend, Types}
+  alias Ecto.Hosi.{Backend, Types}
 
   @cmp [:==, :!=, :<, :<=, :>, :>=]
   @aggs [:count, :sum, :min, :max, :avg]
@@ -22,7 +22,7 @@ defmodule Ecto.Hosi.Eval do
 
   ## ------------------------------------------------------------ one row
 
-  def eval({{:., _, [{:&, _, [ix]}, f]}, _, []}, env, _ctx), do: field(env, ix, f)
+  def eval({{:., _, [{:&, _, [ix]}, f]}, _, []}, env, ctx), do: field(env, ix, f, ctx)
   def eval({:^, _, [ix]}, _env, ctx), do: Enum.at(ctx.params, ix)
   def eval({:^, _, [ix, len]}, _env, ctx), do: Enum.slice(ctx.params, ix, len)
   def eval(%Ecto.Query.Tagged{value: v}, env, ctx), do: eval(v, env, ctx)
@@ -75,7 +75,8 @@ defmodule Ecto.Hosi.Eval do
 
   def eval({agg, _, args} = e, _env, _ctx) when agg in @aggs and is_list(args) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi: the aggregate #{Macro.to_string(e)} is not valid here"
+          "Ecto.Adapters.Hosi: the aggregate #{Macro.to_string(e)} is not valid here " <>
+            "(ecto_hosi's limit)"
   end
 
   def eval(v, _env, _ctx)
@@ -84,7 +85,7 @@ defmodule Ecto.Hosi.Eval do
 
   def eval(other, _env, _ctx) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)}; " <>
+          "Ecto.Adapters.Hosi cannot evaluate #{Macro.to_string(other)} (ecto_hosi's limit); " <>
             "use Repo.datalog/1 for it"
   end
 
@@ -140,11 +141,19 @@ defmodule Ecto.Hosi.Eval do
 
   ## ------------------------------------------------------------ parts
 
-  defp field(env, ix, f) do
+  defp field(env, ix, f, ctx) do
     case Map.get(env, ix) do
-      nil -> nil
-      %{id: id} when f == :id -> id
-      %{entity: entity, source: source} -> Backend.first(entity, Attr.attr(source, f))
+      nil ->
+        nil
+
+      %{id: id} when f == :id ->
+        id
+
+      %{entity: entity} ->
+        case ctx.meta.model.attrs[f] do
+          %{card: :many} -> entity |> Map.get(f, []) |> Enum.sort()
+          _ -> Backend.first(entity, f)
+        end
     end
   end
 
@@ -208,22 +217,12 @@ defmodule Ecto.Hosi.Eval do
     json_text(v, key)
   end
 
-  defp run_fragment("NOT EXISTS (SELECT 1 FROM " <> rest, args, ctx),
-    do: not run_fragment("EXISTS (SELECT 1 FROM " <> rest, args, ctx)
-
-  defp run_fragment("EXISTS (SELECT 1 FROM " <> rest, [v], ctx) do
-    case Regex.run(~r/\A(\w+) (\w+) WHERE \2\.(\w+) = \?\)\z/, rest) do
-      [_, table, _alias, column] -> exists?(ctx.meta, table, column, v)
-      _ -> unsupported_fragment("EXISTS (SELECT 1 FROM " <> rest)
-    end
-  end
-
   defp run_fragment(text, _args, _ctx), do: unsupported_fragment(text)
 
   defp unsupported_fragment(text) do
     raise ArgumentError,
-          "Ecto.Adapters.Hosi cannot evaluate the fragment #{inspect(text)}; " <>
-            "use Repo.datalog/1 for it"
+          "Ecto.Adapters.Hosi cannot evaluate the fragment #{inspect(text)} " <>
+            "(ecto_hosi's limit); use Repo.datalog/1 for it"
   end
 
   # A map is kept as JSON text; `->>` reads one key as text.
@@ -241,20 +240,5 @@ defmodule Ecto.Hosi.Eval do
       _ ->
         nil
     end
-  end
-
-  defp exists?(_meta, _table, _column, nil), do: false
-
-  defp exists?(meta, table, column, value) do
-    attr = Attr.attr(table, column)
-    value = Ecto.Hosi.Kw.to_store(Backend.keywords(meta), attr, value)
-
-    req = %{
-      q:
-        "[:find ?e :in $ ?v :where [?e #{Attr.kw(Attr.marker(table))} _] [?e #{Attr.kw(attr)} ?v]]",
-      inputs: [[:scalar, value]]
-    }
-
-    meta |> Backend.query(req) |> Backend.ok!() |> Kernel.!=([])
   end
 end

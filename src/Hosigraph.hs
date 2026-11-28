@@ -93,6 +93,7 @@ import           Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import           Data.IORef
+import           Data.Maybe (listToMaybe, mapMaybe)
 import qualified Data.Text as T
 import           Data.Time.Clock (UTCTime)
 import           Data.Word
@@ -369,8 +370,10 @@ write h ops = E.withEventsLock (hEvents h) (writeLocked h ops)
 -- 'writeMany' has no conditions: a later batch may depend on what an earlier one did.
 writeIf :: Hosi -> [Cond] -> [Op] -> IO (Either [Cond] WriteReport)
 writeIf h conds ops = E.withEventsLock (hEvents h) $ do
-  forM_ conds $ \c -> when (condId c <= 1) $
-    throwIO (BadArgument ("writeIf: " ++ show (condId c) ++ " is not an entity id"))
+  forM_ conds $ \c -> do
+    when (condId c <= 1) $
+      throwIO (BadArgument ("writeIf: " ++ show (condId c) ++ " is not an entity id"))
+    forM_ (condProblem (hSchema h) c) $ throwIO . BadArgument . ("writeIf: " ++)
   failed <- failedConds h conds
   if null failed then Right <$> writeLocked h ops else pure (Left failed)
 
@@ -396,6 +399,7 @@ failedConds h conds = do
 -- | 'write' without taking the lock (the caller holds it).
 writeLocked :: Hosi -> [Op] -> IO WriteReport
 writeLocked h ops = do
+  forM_ (batchProblem (hSchema h) ops) $ throwIO . WriteRejected
   rec <- E.record ev ops
   conn <- readIORef (hKhana h)
   applied <- try (applyEvents conn (rcEvents rec))
@@ -427,7 +431,10 @@ reportOf rec sealed = WriteReport (rcTemps rec) (evSeq (head (rcEvents rec))) (e
 --   acknowledged, so the recovery at open is as for 'write'.
 writeMany :: Hosi -> [[Op]] -> IO [Either HosiError WriteReport]
 writeMany h opss = E.withEventsLock ev $ do
-  recs <- E.recordMany ev opss
+  -- a batch the types refuse is not logged at all; the others go on without it
+  let checked = [ maybe (Right ops) (Left . WriteRejected) (batchProblem (hSchema h) ops) | ops <- opss ]
+  recorded <- E.recordMany ev [ ops | Right ops <- checked ]
+  let recs = inPlace checked recorded
   case [ r | Right r <- recs ] of
     [] -> pure [ Left e | Left e <- recs ]
     good -> do
@@ -450,6 +457,38 @@ writeMany h opss = E.withEventsLock ev $ do
   where
     ev = hEvents h
     sameRec a b = rcSizeBefore a == rcSizeBefore b
+    inPlace (Left e : cs) rs       = Left e : inPlace cs rs
+    inPlace (Right _ : cs) (r : rs) = r : inPlace cs rs
+    inPlace _ _                    = []
+
+-- | What is wrong with a batch by the types of the schema, as far as UUIDs go: an attribute of type 'TUuid' takes a UUID
+-- and nothing else, and a UUID goes into no other typed attribute.  (An attribute with no type takes either.)  The other
+-- types are the khana's to check.  This one is checked before the batch is logged: a string that reached a uuid attribute
+-- of the khana as a retraction would stop all its later writes.
+batchProblem :: Schema -> [Op] -> Maybe String
+batchProblem sch ops = listToMaybe (mapMaybe problem ops)
+  where
+    problem op = case op of
+      Create _ a v -> written a v
+      Delete _ a v -> written a v
+    written a (Lit v)   = uuidProblem sch a v
+    written a (RefTo _) = case asType <$> M.lookup a sch of
+      Just TUuid -> Just (show a ++ " holds UUIDs, and a reference is not one")
+      _          -> Nothing
+
+condProblem :: Schema -> Cond -> Maybe String
+condProblem sch c = case c of
+  Holds _ a v -> uuidProblem sch a v
+  Lacks _ a v -> uuidProblem sch a v
+  Unset _ _   -> Nothing
+
+uuidProblem :: Schema -> Keyword -> Value -> Maybe String
+uuidProblem sch a v = case (asType <$> M.lookup a sch, v) of
+  (Just TUuid, VUuid _ _) -> Nothing
+  (Just TUuid, _)         -> Just (show a ++ " holds UUIDs, and " ++ T.unpack (renderValue v) ++ " is not one")
+  (Just TAny, _)          -> Nothing
+  (Just t, VUuid _ _)     -> Just (show a ++ " is a " ++ show t ++ " attribute, and " ++ T.unpack (renderValue v) ++ " is a UUID")
+  _                       -> Nothing
 
 -- | Freeze the tail into hot chunks: one chunk per (kind, creation month of the entity).
 -- Returns 'Nothing' if the tail is empty.
@@ -681,7 +720,7 @@ highest h a cur n = do
 valueFits :: ValueType -> Value -> Bool
 valueFits t v = case (t, v) of
   (TString, VStr _) -> True; (TLong, VInt _) -> True; (TRef, VInt _) -> True
-  (TDouble, VDouble _) -> True; (TBool, VBool _) -> True; (TKeyword, VKw _) -> True
+  (TDouble, VDouble _) -> True; (TBool, VBool _) -> True; (TKeyword, VKw _) -> True; (TUuid, VUuid _ _) -> True
   _ -> False
 
 -- | Like 'highest', for the facts of some keys only: "the newest @n@ of the notes of these authors".

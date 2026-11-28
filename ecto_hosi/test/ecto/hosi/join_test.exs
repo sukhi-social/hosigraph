@@ -176,9 +176,10 @@ defmodule Ecto.Hosi.JoinTest do
       assert ada_id < bob_id
     end
 
-    test "a schemaless query on a table name" do
-      assert [{"Ada", 36}] ==
-               Repo.all(from(u in "user", where: u.name == "Ada", select: {u.name, u.age}))
+    test "a query by name is refused: there are no tables" do
+      assert_raise ArgumentError, ~r/does not query by name.*no tables/s, fn ->
+        Repo.all(from(u in "user", where: u.name == "Ada", select: {u.name, u.age}))
+      end
     end
 
     test "coalesce and exists-style lookups", %{cy: cy} do

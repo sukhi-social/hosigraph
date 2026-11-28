@@ -83,6 +83,7 @@ attrSchema (EKw k, s) = do
     EKw "boolean" -> Right TBool
     EKw "keyword" -> Right TKeyword
     EKw "ref"     -> Right TRef
+    EKw "uuid"    -> Right TUuid
     _             -> Left "bad :type"
   c <- case field "card" s of
     ENil        -> Right One

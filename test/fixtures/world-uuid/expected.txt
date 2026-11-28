@@ -1,0 +1,9 @@
+# What world-uuid shows: the events, in order (made by --make-uuid-fixture, read back).
+event 1 create 52546240512000000 doc/title s:"no UUID yet"
+event 2 create 56894894899200000 doc/uuid u:01a21aec-c46b-7226-b63c-5ab791b75801
+event 3 create 56894894899200000 doc/title s:"one"
+event 6 create 56894894899200000 doc/same u:01a21aec-c46b-7226-b63c-5ab791b75801
+event 7 create 61243549286400000 doc/uuid u:01a21aec-c46b-7226-b63c-5ab791b75803
+event 8 delete 52546240512000000 doc/title s:"no UUID yet"
+event tail 9 create 61243549286400001 doc/uuid u:01a21aec-c46b-7226-b63c-5ab791b75804
+event tail 10 create 56894894899200000 doc/uuid u:01a21aec-c46b-7226-b63c-5ab791b75805

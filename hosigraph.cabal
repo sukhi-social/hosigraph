@@ -25,6 +25,13 @@ extra-source-files:
   test/fixtures/world-0.1.0/events/chunks/**/*.bin
   test/fixtures/world-0.1.0/events/chunks/**/*.idx
   test/fixtures/world-0.1.0/events/erase/*.bin
+  test/fixtures/world-uuid/expected.txt
+  test/fixtures/world-uuid/events/manifest
+  test/fixtures/world-uuid/events/tail.log
+  test/fixtures/world-uuid/events/chunks/**/*.hosi
+  test/fixtures/world-uuid/events/chunks/**/*.bin
+  test/fixtures/world-uuid/events/chunks/**/*.idx
+  test/fixtures/world-uuid/events/erase/*.bin
 
 common shared
   default-language: GHC2021
